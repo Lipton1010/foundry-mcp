@@ -1,0 +1,22 @@
+node_modules/
+
+# Local hub configuration (world ids, optional token)
+server/config.json
+.env
+.env.*
+
+# Never commit Foundry exports or world data
+exports/
+local/
+*.export.json
+*settings*.json
+fvtt-*.json
+*.db
+worlds/
+
+# Tool caches and agent state
+graft/
+.cache/
+.claude/
+.codex/
+*.log
