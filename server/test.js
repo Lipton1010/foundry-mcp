@@ -11,6 +11,7 @@ import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { WebSocket as NodeWebSocket } from 'ws';
 
 const PORT = 30199; // no token, small log buffer
 const TOKEN_PORT = 30198; // token required
@@ -75,7 +76,8 @@ globalThis.game = {
 globalThis.canvas = { scene: null };
 globalThis.window = new EventTarget();
 globalThis.location = { origin: ORIGIN };
-const NodeWebSocket = globalThis.WebSocket;
+// The browser's WebSocket, played by the `ws` client (Node 20 has none built in),
+// which also lets the test set the Origin header a browser would send.
 const moduleSockets = [];
 globalThis.WebSocket = class extends NodeWebSocket {
   constructor(url) {
