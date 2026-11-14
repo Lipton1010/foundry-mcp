@@ -4,23 +4,27 @@
 // Run with: npm test   (takes about 40 s because it waits out real reconnects)
 
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { WebSocket as NodeWebSocket } from 'ws';
+import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 
 const PORT = 30199; // no token, small log buffer
 const TOKEN_PORT = 30198; // token required
 const BARE_PORT = 30197; // no token, eval disabled, nothing connected: stands in for an impostor hub
-const FRESH_PORT = 30196; // no configuration at all
+const FRESH_PORT = 30196; // a config copied from the example: no token, no worlds, world-readable
+const FAKE_PORT = 30195; // a hand-rolled hub that knows the token but sends an unsigned command
 const TOKEN = 'correct-horse-battery';
 const ORIGIN = 'http://localhost:30000';
 const tmp = mkdtempSync(join(tmpdir(), 'foundry-mcp-test-'));
 const freshConfig = join(tmp, 'config.json');
+writeFileSync(freshConfig, '{ "worlds": [] }');
+chmodSync(freshConfig, 0o644);
 
 function startHub(env) {
   const base = { ...process.env };
@@ -36,7 +40,7 @@ const hubs = [
   startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_LOG_LIMIT: 60 }),
   startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: TOKEN }),
   startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
-  startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: undefined }),
+  startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
 ];
 
 async function mcp(method, params, { headers = {}, port = PORT, httpMethod = 'POST' } = {}) {
@@ -56,6 +60,7 @@ const callTool = async (name, args = {}, options) => (await mcp('tools/call', { 
 const payload = (result) => JSON.parse(result.content[0].text);
 const evalCode = async (code, extra = {}, options) => payload(await callTool('foundry_eval', { code, ...extra }, options));
 const getLogs = async (args = {}) => payload(await callTool('foundry_logs', args));
+const getLogsFrom = async (options) => payload(await callTool('foundry_logs', { limit: 1 }, options));
 const toolNames = async (options) => (await mcp('tools/list', {}, options)).result.tools.map((t) => t.name);
 
 // --- Stub the slice of Foundry and the browser the module touches.
@@ -71,7 +76,7 @@ globalThis.game = {
   version: '14.370',
   actors: Object.assign(new Map([['a1', actor]]), { getName: () => actor }),
   items: new Map(), scenes: Object.assign(new Map(), { active: null }), macros: new Map(), journal: new Map(),
-  modules: [{ id: 'foundry-mcp', version: '0.3.0', active: true }],
+  modules: [{ id: 'foundry-mcp', version: '0.4.0', active: true }],
 };
 globalThis.canvas = { scene: null };
 globalThis.window = new EventTarget();
@@ -90,25 +95,31 @@ let copies = 0;
 async function startModule(url, token) {
   settings['foundry-mcp.url'] = url;
   settings['foundry-mcp.token'] = token;
-  await import(`../foundry-mcp/scripts/bridge.js?copy=${++copies}`);
+  // A real second instance needs a second file: Node reuses the module for a URL that differs only by query.
+  const copy = join(tmp, `bridge-${++copies}.mjs`);
+  copyFileSync(new URL('../foundry-mcp/scripts/bridge.js', import.meta.url), copy);
+  const registered = hooks.ready;
+  await import(pathToFileURL(copy).href);
+  assert.notEqual(hooks.ready, registered, 'a separate module instance was loaded');
   hooks.init();
   hooks.ready();
   await sleep(600);
 }
 // A hand-rolled socket for playing a second tab, a hostile page, or a client with the wrong token.
-function rawSocket(port, origin, token) {
+// `firstMessage` replaces the hello; `claimedWorld` is what a relay would rewrite the hello to say.
+const sign = (key, text) => createHmac('sha256', key).update(text).digest();
+const bindingOf = (hello, hubNonce) => [hello.nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
+function rawSocket(port, origin, token, { firstMessage, claimedWorld } = {}) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
-  const sign = (text) => createHmac('sha256', token ?? '').update(text).digest('hex');
+  const hello = { protocol: 4, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc' };
   return new Promise((resolve) => {
-    ws.addEventListener('open', () =>
-      ws.send(JSON.stringify({ hello: { protocol: 3, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc' } }))
-    );
+    ws.addEventListener('open', () => ws.send(firstMessage ?? JSON.stringify({ hello: { ...hello, world: claimedWorld ?? hello.world } })));
     ws.addEventListener('message', (event) => {
       const msg = JSON.parse(event.data);
       if (msg.challenge) {
-        const hubKnowsToken = msg.challenge.proof === createHmac('sha256', TOKEN).update(`hub:abc:${msg.challenge.nonce}`).digest('hex');
-        assert.ok(hubKnowsToken, 'the hub proves it knows the token');
-        ws.send(JSON.stringify({ proof: sign(`module:abc:${msg.challenge.nonce}`) }));
+        const expected = sign(TOKEN, `hub\n${bindingOf({ ...hello, world: claimedWorld ?? hello.world }, msg.challenge.nonce)}`).toString('hex');
+        assert.equal(msg.challenge.proof, expected, 'the hub proves it knows the token');
+        ws.send(JSON.stringify({ proof: sign(token ?? '', `module\n${bindingOf(hello, msg.challenge.nonce)}`).toString('hex') }));
       } else resolve({ ws, outcome: msg.welcome ? 'welcomed' : 'other' });
     });
     ws.addEventListener('close', (event) => resolve({ outcome: 'closed', code: event.code }));
@@ -126,7 +137,18 @@ const check = async (name, fn) => {
 };
 
 try {
-  await sleep(1500);
+  // Wait until every hub answers instead of guessing how long start-up takes.
+  for (const port of [PORT, TOKEN_PORT, BARE_PORT, FRESH_PORT]) {
+    for (let tries = 0; ; tries++) {
+      try {
+        await fetch(`http://127.0.0.1:${port}/`);
+        break;
+      } catch (error) {
+        if (tries > 100) throw new Error(`hub on port ${port} did not start`, { cause: error });
+        await sleep(100);
+      }
+    }
+  }
   await import('../foundry-mcp/scripts/bridge.js');
   hooks.init();
 
@@ -244,12 +266,24 @@ try {
 
   await check('credentials are redacted before leaving the browser, in logs and in eval output', async () => {
     const before = (await getLogs()).lastSeq;
-    const secrets =
-      'login failed password=hunter22 api_key: "abc123" Authorization: Bearer abcdefgh12345678 cobalt-token=zzz999 ' +
-      'https://example.test/hook?user=bob&token=qwerty123&x=1 Token Goblin is fine';
-    const expected =
-      'login failed password=[redacted] api_key: "[redacted]" Authorization: [redacted] [redacted] cobalt-token=[redacted] ' +
-      'https://example.test/hook?user=bob&token=[redacted]&x=1 Token Goblin is fine';
+    const secrets = [
+      'login failed password=hunter22 api_key: "abc123" cobalt-token=zzz999 token=plain123 Token Goblin is fine',
+      'https://example.test/hook?user=bob&token=qwerty123&x=1',
+      'Authorization: Bearer abcdefgh12345678',
+      'Authorization: Basic dXNlcjpwYXNzd29yZA==',
+      'Cookie: session=abc123; refresh=anotherSecret456',
+      '{"token":"abcdefghijklmnopqrstuvwxyzABCDEF","name":"kept","apiKey":"k-123"}',
+      'sent with Bearer abcdefgh12345678 ok',
+    ].join('\n');
+    const expected = [
+      'login failed password=[redacted] api_key: "[redacted]" cobalt-token=[redacted] token=[redacted] Token Goblin is fine',
+      'https://example.test/hook?user=bob&token=[redacted]&x=1',
+      'Authorization: [redacted]',
+      'Authorization: [redacted]',
+      'Cookie: [redacted]',
+      '{"token":"[redacted]","name":"kept","apiKey":"[redacted]"}',
+      'sent with Bearer [redacted] ok',
+    ].join('\n');
     console.error(secrets);
     console.warn('blob ' + 'A1b2'.repeat(12));
     console.warn('jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl');
@@ -274,13 +308,31 @@ try {
     assert.deepEqual(limited.entries.map((e) => e.text), ['second warning']);
   });
 
-  await check('a repeating error collapses into one entry with a count', async () => {
+  await check('a repeating error collapses into one entry with a count, but not across different sources', async () => {
     const before = (await getLogs()).lastSeq;
-    for (let i = 0; i < 5; i++) console.warn('same thing again');
+    const again = () => console.warn('same thing again');
+    for (let i = 0; i < 5; i++) again();
+    await evalCode(`console.warn('same thing again');`); // same text, but from evaluated code
     await sleep(200);
     const logs = await getLogs({ since: before });
-    assert.equal(logs.entries.length, 1);
-    assert.equal(logs.entries[0].count, 5);
+    assert.deepEqual(logs.entries.map((e) => [e.count, e.fromEval]), [[5, false], [1, true]]);
+  });
+
+  await check('huge results and chatty code are cut down in the browser', async () => {
+    const reply = await evalCode(`
+      for (let i = 0; i < 500; i++) console.log('line ' + i);
+      return 'done';`);
+    assert.equal(reply.result, 'done');
+    assert.equal(reply.logs.length, 200);
+    assert.equal(reply.logsDropped, 300);
+    // The hub caps the reply at 80,000 characters and says how much it cut off,
+    // which reveals how much the browser sent. Unbounded, each of these is about a million characters.
+    const sentChars = async (code) => {
+      const text = (await callTool('foundry_eval', { code })).content[0].text;
+      return 80_000 + Number(text.match(/truncated (\d+) chars/)[1]);
+    };
+    assert.ok((await sentChars(`return 'x'.repeat(1_000_000);`)) < 450_000, 'long strings are cut');
+    assert.ok((await sentChars(`return Array.from({ length: 100_001 }, (_, i) => 100_000 + i);`)) < 600_000, 'long lists are cut');
   });
 
   await check('a flood is rate-limited in the browser and the buffer stays bounded', async () => {
@@ -314,6 +366,20 @@ try {
 
   await check('a page from another origin cannot pose as Foundry', async () => {
     assert.equal((await rawSocket(PORT, 'https://evil.example')).outcome, 'rejected');
+  });
+
+  await check('malformed socket messages close that socket and leave the hub running', async () => {
+    for (const firstMessage of ['not json', '{"hello":{"world":{"toString":null}}}', '{"hello":null}', '[]', '{"hello":{"world":"w"}}']) {
+      const { outcome } = await Promise.race([rawSocket(PORT, ORIGIN, undefined, { firstMessage }), sleep(1500).then(() => ({ outcome: 'ignored' }))]);
+      assert.ok(['closed', 'ignored'].includes(outcome), `${firstMessage} -> ${outcome}`);
+    }
+    assert.equal((await evalCode('return 7')).result, 7);
+  });
+
+  await check('clients that open with an MCP initialize handshake are served', async () => {
+    const init = await mcp('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+    assert.equal(init.result.serverInfo.name, 'foundry');
+    assert.match(init.result.instructions, /foundry_status first/);
   });
 
   await check('logs survive a Foundry disconnect, stay readable, and are bounded by markers', async () => {
@@ -371,9 +437,44 @@ try {
     assert.match((await callTool('foundry_status', {}, bearer(TOKEN))).content[0].text, /not connected/);
   });
 
+  await check('a relay cannot change the world the module reported', async () => {
+    // The proof is computed over "test-world", but the hello that reaches the hub says otherwise.
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { claimedWorld: 'another-world' }), { outcome: 'closed', code: 4003 });
+  });
+
   await check('a module with the token proves itself, checks the hub, and then works', async () => {
     await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, TOKEN);
     assert.equal((await evalCode('return 40 + 2', {}, bearer(TOKEN))).result, 42);
+    // Signed commands keep working in sequence, and the hub token is scrubbed from output.
+    const reply = await evalCode(`console.log('leaked ${TOKEN} here'); return 'second';`, {}, bearer(TOKEN));
+    assert.equal(reply.result, 'second');
+    assert.deepEqual(reply.logs, [{ level: 'log', text: 'leaked [redacted] here' }]);
+  });
+
+  await check('a module refuses a command the hub did not sign', async () => {
+    // A stand-in hub that completes the handshake honestly, then sends an unsigned command,
+    // as something sitting between the module and the real hub would.
+    const fake = new WebSocketServer({ port: FAKE_PORT, host: '127.0.0.1' });
+    const closed = new Promise((resolve) => {
+      fake.on('connection', (ws) => {
+        let hello;
+        ws.on('close', (code) => resolve(code));
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data);
+          if (msg.hello) {
+            hello = msg.hello;
+            ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof: sign(TOKEN, `hub\n${bindingOf(hello, 'hubnonce')}`).toString('hex') } }));
+          } else if (msg.proof) {
+            ws.send(JSON.stringify({ welcome: true }));
+            ws.send(JSON.stringify({ id: 'x', method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
+          }
+        });
+      });
+    });
+    await startModule(`ws://127.0.0.1:${FAKE_PORT}/foundry`, TOKEN);
+    assert.equal(await closed, 4003);
+    assert.equal(globalThis.injected, undefined);
+    fake.close();
   });
 
   await check('a module with a token refuses a hub that cannot prove it knows the token', async () => {
@@ -387,15 +488,62 @@ try {
     assert.deepEqual(await toolNames({ port: BARE_PORT }), ['foundry_status', 'foundry_logs']);
   });
 
-  await check('a hub started with no configuration creates a token and requires it', async () => {
-    assert.ok(existsSync(freshConfig));
+  await check('a hub whose config has no token creates one, protects the file, and runs code nowhere by default', async () => {
     const generated = JSON.parse(readFileSync(freshConfig, 'utf8')).token;
     assert.ok(generated.length >= 32);
+    // The config was world-readable before the token was added (0644), as a copied example would be.
+    if (process.platform !== 'win32') assert.equal(statSync(freshConfig).mode & 0o077, 0, 'config is private after the token is written');
+    const auth = { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } };
     assert.equal((await mcp('tools/list', {}, { port: FRESH_PORT })).status, 401);
-    assert.equal((await toolNames({ port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } })).length, 3);
-    // With no worlds configured, even an authenticated call cannot run code.
-    const result = await callTool('foundry_status', {}, { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } });
+    assert.equal((await toolNames(auth)).length, 3);
+    // An authenticated module in a world, with nothing on the allowlist: connected, but no code runs.
+    await startModule(`ws://127.0.0.1:${FRESH_PORT}/foundry`, generated);
+    assert.equal((await getLogsFrom(auth)).connected, true);
+    const refused = await callTool('foundry_eval', { code: 'globalThis.ranAnyway = true; return 1' }, auth);
+    assert.match(refused.content[0].text, /not on this hub's allowlist/);
+    assert.equal(globalThis.ranAnyway, undefined);
+    const result = await callTool('foundry_status', {}, auth);
     assert.equal(result.isError, true);
+  });
+
+  await check('a configuration with a wrong type stops the hub instead of weakening it', async () => {
+    const start = (name, content, env = {}) => {
+      const file = join(tmp, name);
+      if (content !== undefined) writeFileSync(file, content);
+      const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
+      const run = spawnSync(process.execPath, ['index.js'], {
+        cwd: import.meta.dirname,
+        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: '30193', ...env },
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      return { status: run.status, stderr: run.stderr };
+    };
+    for (const [name, content, expected] of [
+      ['eval-string.json', '{ "token": "", "allowEval": "false" }', /"allowEval" must be true or false/],
+      ['token-null.json', '{ "token": null }', /"token" must be text/],
+      ['token-short.json', '{ "token": "abc" }', /too short/],
+      ['limit.json', '{ "token": "", "logLimit": "not-a-number" }', /"logLimit" must be/],
+      ['worlds.json', '{ "token": "", "worlds": "my-world" }', /"worlds" must be a list/],
+      ['broken.json', '{ not json', /Cannot read/],
+    ]) {
+      const run = start(name, content);
+      assert.equal(run.status, 1, name);
+      assert.match(run.stderr, expected, name);
+    }
+    assert.match(start('env.json', '{ "token": "" }', { FOUNDRY_MCP_ALLOW_EVAL: 'maybe' }).stderr, /"allowEval" must be true or false/);
+    assert.match(start('env.json', undefined, { FOUNDRY_MCP_PORT: 'abc' }).stderr, /"port" must be/);
+  });
+
+  await check('code that outlives its timeout still counts against the limit, in the browser', async () => {
+    // Sixteen calls that never finish and ignore the abort signal. This runs last: those slots stay taken.
+    const stuck = await Promise.all(
+      Array.from({ length: 16 }, () => callTool('foundry_eval', { code: 'await new Promise(() => {});', timeoutMs: 1000 }, bearer(TOKEN)))
+    );
+    assert.ok(stuck.every((r) => /Timed out/.test(r.content[0].text)));
+    const next = await callTool('foundry_eval', { code: 'return 1' }, bearer(TOKEN));
+    assert.equal(next.isError, true);
+    assert.match(next.content[0].text, /still running in Foundry/);
   });
 
   console.log(`\nALL ${passed} CHECKS PASSED (simulated Foundry)`);

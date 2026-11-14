@@ -8,7 +8,7 @@
 
 import { createServer } from 'node:http';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { McpServer } from '@modelcontextprotocol/server';
@@ -20,34 +20,70 @@ import * as z from 'zod/v4';
 // FOUNDRY_MCP_* environment variables override it.
 
 const configFile = process.env.FOUNDRY_MCP_CONFIG ?? join(import.meta.dirname, 'config.json');
-const fileConfig = existsSync(configFile) ? JSON.parse(readFileSync(configFile, 'utf8')) : {};
+const fail = (message) => {
+  console.error(`[foundry-mcp] ${message}`);
+  process.exit(1);
+};
+let fileConfig = {};
+if (existsSync(configFile)) {
+  try {
+    fileConfig = JSON.parse(readFileSync(configFile, 'utf8'));
+  } catch (error) {
+    fail(`Cannot read ${configFile}: ${error.message}`);
+  }
+  if (!fileConfig || typeof fileConfig !== 'object' || Array.isArray(fileConfig)) fail(`${configFile} must contain a JSON object.`);
+}
+const env = (name) => process.env[`FOUNDRY_MCP_${name}`];
 const list = (text) => text?.split(',').map((s) => s.trim()).filter(Boolean);
-const flag = (text) => (text === undefined ? undefined : !['0', 'false', 'no', ''].includes(text.toLowerCase()));
+
+// A wrong type must never quietly weaken a protection ("allowEval": "false"
+// is a truthy string), so every value is checked before anything is used.
+const config = {
+  port: env('PORT') !== undefined ? Number(env('PORT')) : (fileConfig.port ?? 30123),
+  // World ids this hub may run code in. Empty means none; "*" means any.
+  worlds: list(env('WORLDS')) ?? fileConfig.worlds ?? [],
+  // Browser origins allowed to connect as Foundry. Browsers cannot forge
+  // Origin, so this keeps other web pages from posing as the Foundry tab.
+  origins: list(env('ORIGINS')) ?? fileConfig.origins ?? ['http://localhost:30000', 'http://127.0.0.1:30000'],
+  token: env('TOKEN') ?? fileConfig.token,
+  // false removes foundry_eval, leaving clients able to read status and logs only.
+  allowEval: env('ALLOW_EVAL') !== undefined ? { true: true, false: false }[env('ALLOW_EVAL').toLowerCase()] : (fileConfig.allowEval ?? true),
+  logLimit: env('LOG_LIMIT') !== undefined ? Number(env('LOG_LIMIT')) : (fileConfig.logLimit ?? 1000),
+};
+const isStrings = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item);
+if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) fail('"port" must be a whole number from 1 to 65535.');
+if (!isStrings(config.worlds)) fail('"worlds" must be a list of world ids, for example ["my-test-world"].');
+if (!isStrings(config.origins)) fail('"origins" must be a list of page origins, for example ["http://localhost:30000"].');
+if (typeof config.allowEval !== 'boolean') fail('"allowEval" must be true or false (not in quotes).');
+if (!Number.isInteger(config.logLimit) || config.logLimit < 1) fail('"logLimit" must be a whole number of at least 1.');
+if (config.token !== undefined && typeof config.token !== 'string') {
+  fail('"token" must be text in quotes. Delete the line to have a new token generated, or use "" to run without one.');
+}
+if (config.token && config.token.length < 16) fail('"token" is too short to be safe. Delete the line to have one generated.');
 
 // The shared secret. Unset means "make one": a hub nobody configured should not
 // be open to every program and every account on the computer. An explicit
 // empty string turns authentication off.
-let token = process.env.FOUNDRY_MCP_TOKEN ?? fileConfig.token;
-const tokenGenerated = token === undefined;
+const tokenGenerated = config.token === undefined;
 if (tokenGenerated) {
-  token = randomBytes(24).toString('base64url');
-  writeFileSync(configFile, `${JSON.stringify({ ...fileConfig, token }, null, 2)}\n`, { mode: 0o600 });
+  config.token = randomBytes(24).toString('base64url');
+  try {
+    writeFileSync(configFile, `${JSON.stringify({ ...fileConfig, token: config.token }, null, 2)}\n`, { mode: 0o600 });
+  } catch (error) {
+    fail(`Cannot save a new token to ${configFile}: ${error.message}`);
+  }
+}
+if (config.token && existsSync(configFile)) {
+  // The mode above only applies to a file being created. A config copied from
+  // the example is usually world-readable, so tighten it (no effect on Windows).
+  try {
+    chmodSync(configFile, 0o600);
+  } catch {
+    // Not fatal: the file may belong to someone else or sit on a filesystem without modes.
+  }
 }
 
-const config = {
-  port: Number(process.env.FOUNDRY_MCP_PORT ?? fileConfig.port ?? 30123),
-  // World ids this hub may run code in. Empty means none; "*" means any.
-  worlds: list(process.env.FOUNDRY_MCP_WORLDS) ?? fileConfig.worlds ?? [],
-  // Browser origins allowed to connect as Foundry. Browsers cannot forge
-  // Origin, so this keeps other web pages from posing as the Foundry tab.
-  origins: list(process.env.FOUNDRY_MCP_ORIGINS) ?? fileConfig.origins ?? ['http://localhost:30000', 'http://127.0.0.1:30000'],
-  token: String(token),
-  // false removes foundry_eval, leaving clients able to read status and logs only.
-  allowEval: flag(process.env.FOUNDRY_MCP_ALLOW_EVAL) ?? fileConfig.allowEval ?? true,
-  logLimit: Number(process.env.FOUNDRY_MCP_LOG_LIMIT ?? fileConfig.logLimit ?? 1000),
-};
-
-const MODULE_PROTOCOL = 3; // bump together with PROTOCOL in foundry-mcp/scripts/bridge.js
+const MODULE_PROTOCOL = 4; // bump together with PROTOCOL in foundry-mcp/scripts/bridge.js
 const MAX_RESULT_CHARS = 80_000;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_PENDING = 16; // evaluations in flight at once, across all clients
@@ -56,9 +92,24 @@ const HANDSHAKE_MS = 10_000;
 const worldAllowed = (world) => config.worlds.includes('*') || config.worlds.includes(world);
 const digest = (text) => createHash('sha256').update(String(text ?? '')).digest();
 const secretEquals = (given, expected) => timingSafeEqual(digest(given), digest(expected));
-// Proof that a side knows the token, bound to both sides' fresh nonces so it
-// cannot be replayed. The token itself never crosses the socket.
-const proof = (role, moduleNonce, hubNonce) => createHmac('sha256', config.token).update(`${role}:${moduleNonce}:${hubNonce}`).digest('hex');
+// Proof that a side knows the token. It covers both sides' fresh nonces, so it
+// cannot be replayed, and everything the module said about itself, so a relay
+// in the middle cannot change the reported world. The token never crosses the socket.
+const hmac = (key, text) => createHmac('sha256', key).update(text).digest();
+const binding = (ws) => [ws.moduleNonce, ws.hubNonce, ws.hello.protocol, ws.hello.world, ws.hello.core, ws.hello.system, ws.hello.session].join('\n');
+const proof = (role, ws) => hmac(config.token, `${role}\n${binding(ws)}`).toString('hex');
+
+// Commands to the module. With a token, each carries a sequence number and a
+// signature under a key derived for this connection, so nothing sitting
+// between hub and module can insert, replay or alter one.
+function sendCommand(ws, id, method, code = '') {
+  const message = { id, method, ...(method === 'eval' ? { params: { code } } : {}) };
+  if (ws.sessionKey) {
+    message.seq = ++ws.sent;
+    message.mac = hmac(ws.sessionKey, `${message.seq}\n${method}\n${id}\n${code}`).toString('hex');
+  }
+  ws.send(JSON.stringify(message));
+}
 
 // ------------------------------------------------------------------------ logs
 // Warnings and errors pushed by the module, kept in memory only. They outlive
@@ -71,12 +122,16 @@ let evicted = 0;
 function addLog(entry) {
   const last = logs.at(-1);
   const sameAsLast =
-    last && ['world', 'session', 'level', 'source', 'text'].every((key) => last[key] === entry[key]) && last.packages.join() === entry.packages.join();
+    last &&
+    ['world', 'session', 'level', 'source', 'text', 'fromEval'].every((key) => last[key] === entry[key]) &&
+    last.packages.join() === entry.packages.join() &&
+    last.stack.join() === entry.stack.join();
   if (sameAsLast) {
     // A repeating error (a render loop, say) becomes one entry with a count.
     last.count += 1;
     last.lastTime = entry.time;
     last.seq = ++lastSeq;
+    if (entry.droppedBefore) last.droppedBefore = (last.droppedBefore ?? 0) + entry.droppedBefore;
     return;
   }
   logs.push({ seq: ++lastSeq, count: 1, ...entry });
@@ -163,36 +218,40 @@ function callFoundry(code, timeoutMs = 30_000) {
       pending.delete(id);
       // JavaScript cannot be stopped from outside; this only aborts the
       // `signal` the code was given, for code that chooses to honour it.
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ id, method: 'cancel' }));
+      if (ws.readyState === ws.OPEN) sendCommand(ws, id, 'cancel');
       reject(new Error(`Timed out after ${timeoutMs} ms. The code may still be running in Foundry; only code that checks \`signal.aborted\` stops.`));
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
-    ws.send(JSON.stringify({ id, method: 'eval', params: { code } }));
+    sendCommand(ws, id, 'eval', code);
   });
 }
 
 function onFoundryConnection(ws) {
   ws.isAlive = true;
+  ws.sent = 0;
   ws.on('pong', () => (ws.isAlive = true));
+  // Without a listener, a malformed or oversized frame would take the whole hub down.
+  ws.on('error', () => ws.terminate());
   const handshake = setTimeout(() => foundry?.ws !== ws && ws.close(4000, 'Handshake not completed in time'), HANDSHAKE_MS);
   ws.on('message', (data) => {
-    let msg;
+    // Anything from the socket is untrusted until proven otherwise, and even
+    // then must never be able to crash the hub.
     try {
-      msg = JSON.parse(data);
+      const msg = JSON.parse(data);
+      if (!msg || typeof msg !== 'object') return;
+      if (foundry?.ws !== ws) return onHandshakeMessage(ws, msg); // nothing else is accepted until the handshake is done
+      if (msg.log) {
+        if (worldAllowed(foundry.hello.world)) addFoundryLog(foundry.hello, msg.log);
+        return;
+      }
+      const request = pending.get(msg.id);
+      if (!request) return;
+      pending.delete(msg.id);
+      clearTimeout(request.timer);
+      request.resolve(msg);
     } catch {
-      return;
+      ws.close(4002, 'Malformed message');
     }
-    if (!msg || typeof msg !== 'object') return;
-    if (foundry?.ws !== ws) return onHandshakeMessage(ws, msg); // nothing else is accepted until the handshake is done
-    if (msg.log) {
-      if (worldAllowed(foundry.hello.world)) addFoundryLog(foundry.hello, msg.log);
-      return;
-    }
-    const request = pending.get(msg.id);
-    if (!request) return;
-    pending.delete(msg.id);
-    clearTimeout(request.timer);
-    request.resolve(msg);
   });
   ws.on('close', () => {
     clearTimeout(handshake);
@@ -213,20 +272,21 @@ function onFoundryConnection(ws) {
 function onHandshakeMessage(ws, msg) {
   if (msg.hello && !ws.hello) {
     const { hello } = msg;
-    ws.hello = {
-      world: String(hello.world),
-      core: String(hello.core),
-      system: String(hello.system),
-      session: String(hello.session ?? ''),
-      protocol: hello.protocol ?? 1,
-    };
+    // Exact, short strings only: these values are signed and logged.
+    const short = (value) => typeof value === 'string' && value.length <= 200;
+    if (!hello || typeof hello !== 'object' || ![hello.world, hello.core, hello.system, hello.session, hello.nonce].every(short)) {
+      return ws.close(4002, 'Malformed hello (is the module out of date?)');
+    }
+    ws.hello = { world: hello.world, core: hello.core, system: hello.system, session: hello.session, protocol: Number(hello.protocol) || 0 };
     if (!config.token) return register(ws);
-    ws.moduleNonce = String(hello.nonce ?? '');
+    ws.moduleNonce = hello.nonce;
     ws.hubNonce = randomBytes(16).toString('hex');
-    return ws.send(JSON.stringify({ challenge: { nonce: ws.hubNonce, proof: proof('hub', ws.moduleNonce, ws.hubNonce) } }));
+    return ws.send(JSON.stringify({ challenge: { nonce: ws.hubNonce, proof: proof('hub', ws) } }));
   }
-  if (msg.proof !== undefined && ws.hubNonce) {
-    if (!secretEquals(msg.proof, proof('module', ws.moduleNonce, ws.hubNonce))) return ws.close(4003, 'Hub token missing or wrong');
+  if (msg.proof !== undefined && ws.hubNonce && !ws.proofSeen) {
+    ws.proofSeen = true; // one attempt per connection
+    if (!secretEquals(msg.proof, proof('module', ws))) return ws.close(4003, 'Hub token missing or wrong');
+    ws.sessionKey = hmac(config.token, `session\n${binding(ws)}`);
     return register(ws);
   }
 }
@@ -255,7 +315,8 @@ async function runTool(code, timeoutMs) {
   try {
     const reply = await callFoundry(code, timeoutMs);
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
-    return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, logSeq }) }], isError: !reply.ok };
+    const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
+    return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, logSeq }) }], isError: !reply.ok };
   } catch (error) {
     return { content: [{ type: 'text', text: error.message }], isError: true };
   }
@@ -270,7 +331,7 @@ const INSTRUCTIONS =
   'warnings and errors raised from that call onward.';
 
 function buildMcpServer() {
-  const server = new McpServer({ name: 'foundry', version: '0.3.0' }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: 'foundry', version: '0.4.0' }, { instructions: INSTRUCTIONS });
 
   server.registerTool(
     'foundry_status',

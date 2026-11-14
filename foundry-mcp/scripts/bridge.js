@@ -4,7 +4,7 @@
 // need to change.
 
 const MODULE_ID = 'foundry-mcp';
-const PROTOCOL = 3; // bump together with MODULE_PROTOCOL in server/index.js
+const PROTOCOL = 4; // bump together with MODULE_PROTOCOL in server/index.js
 const SESSION = Math.random().toString(36).slice(2, 10); // identifies this page load
 const EVAL_SOURCE = 'foundry-mcp-eval.js'; // name evaluated code gets in stack traces
 const LOOPBACK = ['127.0.0.1', 'localhost', '[::1]'];
@@ -55,13 +55,17 @@ function connect() {
     return;
   }
   const token = game.settings.get(MODULE_ID, 'token').trim();
+  hubToken = token;
   const nonce = randomHex();
-  let hubProven = false; // with a token set, the hub must prove it knows it before we obey it
+  const hello = { protocol: PROTOCOL, session: SESSION, world: game.world.id, core: game.version, system: game.system.id, nonce };
+  // What both proofs cover: the nonces and what we said about ourselves, so a
+  // relay in the middle cannot change the world id we reported.
+  const binding = (hubNonce) => [nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
+  let sessionKey = null; // with a token: set once the hub has proved it knows it; signs every command after that
+  let received = 0; // commands seen, for the hub's signed sequence number
   const refuse = (reason) => ws.close(4003, reason);
   const ws = new WebSocket(url.href);
-  ws.addEventListener('open', () => {
-    send({ hello: { protocol: PROTOCOL, session: SESSION, world: game.world.id, core: game.version, system: game.system.id, nonce } }, ws);
-  });
+  ws.addEventListener('open', () => send({ hello }, ws));
   ws.addEventListener('message', async (event) => {
     let msg;
     try {
@@ -69,24 +73,39 @@ function connect() {
     } catch {
       return;
     }
+    if (!msg || typeof msg !== 'object') return;
     if (msg.challenge && socket !== ws) {
       if (!token) return refuse('the hub requires a token; paste it into the "Hub token" module setting');
       if (!globalThis.crypto?.subtle) return refuse('token checks need a secure page (open Foundry via localhost or https)');
-      const expected = await hmac(token, `hub:${nonce}:${msg.challenge.nonce}`);
-      if (msg.challenge.proof !== expected) return refuse('whatever answered at the hub address does not know the token');
-      hubProven = true;
-      return send({ proof: await hmac(token, `module:${nonce}:${msg.challenge.nonce}`) }, ws);
+      const hubNonce = String(msg.challenge.nonce);
+      if (msg.challenge.proof !== toHex(await hmac(token, `hub\n${binding(hubNonce)}`))) {
+        return refuse('whatever answered at the hub address does not know the token');
+      }
+      sessionKey = await hmac(token, `session\n${binding(hubNonce)}`);
+      return send({ proof: toHex(await hmac(token, `module\n${binding(hubNonce)}`)) }, ws);
     }
     if (msg.welcome && socket !== ws) {
-      if (token && !hubProven) return refuse('whatever answered at the hub address did not ask for the token');
+      if (token && !sessionKey) return refuse('whatever answered at the hub address did not ask for the token');
       console.log(`${MODULE_ID} | connected to MCP hub`);
       socket = ws;
       for (const entry of backlog.splice(0)) send({ log: entry });
       return;
     }
     if (socket !== ws) return; // obey nothing until the handshake is complete
+    if (msg.method !== 'eval' && msg.method !== 'cancel') return;
+    if (sessionKey) {
+      // Every command must carry the next sequence number and the hub's signature,
+      // so nothing between us and the hub can insert, replay or alter one.
+      const expected = ++received;
+      const signed = `${expected}\n${msg.method}\n${msg.id}\n${msg.params?.code ?? ''}`;
+      if (msg.seq !== expected || msg.mac !== toHex(await hmac(sessionKey, signed))) {
+        return refuse('a command arrived that the hub did not sign');
+      }
+    }
     if (msg.method === 'cancel') return running.get(msg.id)?.abort();
-    if (msg.method !== 'eval') return;
+    if (running.size >= MAX_RUNNING) {
+      return send({ id: msg.id, ok: false, error: { message: `${MAX_RUNNING} evaluations are still running in Foundry; code that timed out keeps running. Reload the world to clear them.` }, logs: [] }, ws);
+    }
     const controller = new AbortController();
     running.set(msg.id, controller);
     const reply = await evaluate(msg.params?.code, controller.signal);
@@ -98,23 +117,27 @@ function connect() {
   // The hub may not be running, or may restart: keep retrying quietly. Retry
   // slowly when the connection was refused (another GM tab, token trouble).
   ws.addEventListener('close', (event) => {
-    if (socket === ws) socket = null;
+    if (socket === ws) {
+      socket = null;
+      for (const controller of running.values()) controller.abort(); // nobody is waiting for these any more
+    }
     if (event.code >= 4000) console.log(`${MODULE_ID} | not connected: ${event.reason}`);
     setTimeout(connect, event.code >= 4000 ? 30_000 : 5000);
   });
 }
 
+const MAX_RUNNING = 16; // evaluations that have not finished, including ones the hub gave up on
 const running = new Map(); // evaluation id -> AbortController
+let hubToken = ''; // kept so it can be scrubbed from anything logged
 
-function randomHex() {
-  return [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
+const toHex = (bytes) => [...new Uint8Array(bytes)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+const randomHex = () => toHex(crypto.getRandomValues(new Uint8Array(16)));
 
+// HMAC-SHA256. `key` is the token text, or the bytes of a derived session key.
 async function hmac(key, text) {
   const encode = (value) => new TextEncoder().encode(value);
-  const cryptoKey = await crypto.subtle.importKey('raw', encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const signature = await crypto.subtle.sign('HMAC', cryptoKey, encode(text));
-  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  const cryptoKey = await crypto.subtle.importKey('raw', typeof key === 'string' ? encode(key) : key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return crypto.subtle.sign('HMAC', cryptoKey, encode(text));
 }
 
 function send(message, ws = socket) {
@@ -132,12 +155,16 @@ function send(message, ws = socket) {
 // to stop; this only helps code that checks it.
 async function evaluate(code, signal) {
   const logs = [];
+  logs.dropped = 0;
   captures.add(logs);
+  // Once the hub has given up on this call nobody will read its console output.
+  signal.addEventListener('abort', () => captures.delete(logs));
+  const withLogs = (reply) => (logs.dropped ? { ...reply, logs, logsDropped: logs.dropped } : { ...reply, logs });
   try {
     const result = await new AsyncFunction('signal', `${code}\n//# sourceURL=${EVAL_SOURCE}`)(signal);
-    return { ok: true, result: serialize(result), logs };
+    return withLogs({ ok: true, result: serialize(result) });
   } catch (error) {
-    return { ok: false, error: { name: error?.name, message: error?.message ?? String(error), stack: error?.stack }, logs };
+    return withLogs({ ok: false, error: { name: error?.name, message: error?.message ?? String(error), stack: error?.stack } });
   } finally {
     captures.delete(logs);
   }
@@ -150,6 +177,7 @@ async function evaluate(code, signal) {
 const captures = new Set(); // console output of evaluations in flight
 const backlog = []; // entries waiting for a hub connection
 const BACKLOG_LIMIT = 200;
+const CAPTURE_LIMIT = 200; // console lines returned by one evaluation; the rest are counted
 const RATE_LIMIT = 100; // entries per second; the rest are counted, not kept
 let windowStart = 0;
 let windowCount = 0;
@@ -160,7 +188,10 @@ for (const level of ['log', 'warn', 'error']) {
   console[level] = (...args) => {
     try {
       // Other modules log during an evaluation too, so this output is redacted like the rest.
-      for (const logs of captures) logs.push({ level, text: redact(args.map((arg) => formatLogArg(arg, true)).join(' ').slice(0, 8000)) });
+      for (const logs of captures) {
+        if (logs.length >= CAPTURE_LIMIT) logs.dropped += 1;
+        else logs.push({ level, text: redact(args.map((arg) => formatLogArg(arg, true)).join(' ').slice(0, 8000)) });
+      }
       if (level !== 'log') {
         const error = args.find((arg) => arg instanceof Error);
         record(level, 'console', args.map((arg) => formatLogArg(arg, false)).join(' '), error?.stack ?? new Error().stack);
@@ -224,10 +255,17 @@ function describeStack(stack) {
 }
 
 // Best-effort removal of credentials before a log line leaves the browser.
+// "token" alone is only treated as a credential in `token=...` or as a quoted
+// key, because in a tabletop tool "Token: Goblin" is ordinary text.
 function redact(text) {
+  if (hubToken) text = text.split(hubToken).join('[redacted]');
   return text
-    .replace(/\b(bearer\s+)[\w.~+/=-]{8,}/gi, '$1[redacted]') // before the next rule, which would stop at "Bearer"
-    .replace(/\b(pass(?:word|wd)|secret|api[-_ ]?key|cookie|authorization|(?:access|auth|api|refresh|session|cobalt)[-_ ]?token)(\s*["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
+    // Header values run to the end of the line: "Authorization: Basic ...", "Cookie: a=1; b=2".
+    .replace(/\b((?:proxy-)?authorization|(?:set-)?cookie)(["']?\s*[:=]\s*)[^\n]+/gi, '$1$2[redacted]')
+    .replace(/\b(bearer\s+)[\w.~+/=-]{8,}/gi, '$1[redacted]')
+    // JSON-style: any quoted key that names a credential, such as {"token":"..."} or 'apiKey': '...'.
+    .replace(/(["'][\w-]*(?:token|secret|password|passwd|api[-_]?key)[\w-]*["']\s*:\s*["'])[^"']+/gi, '$1[redacted]')
+    .replace(/\b(pass(?:word|wd)|secret|api[-_ ]?key|(?:access|auth|api|refresh|session|cobalt)[-_ ]?token|token(?==))(\s*["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
     .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
     .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]')
     .replace(/\b[A-Za-z0-9_+=-]{40,}\b/g, '[redacted]');
@@ -250,13 +288,20 @@ function formatLogArg(arg, withStack) {
 
 function serialize(value) {
   const ancestors = new WeakSet();
-  let budget = 50_000;
+  let budget = 50_000; // values of any kind
+  let chars = 400_000; // text across all strings; the hub cuts replies far below this anyway
   const walk = (v, depth) => {
+    if (--budget < 0) return '[Truncated]';
     if (v === undefined) return null;
     if (typeof v === 'function') return `[Function ${v.name}]`;
     if (typeof v === 'bigint') return v.toString();
+    if (typeof v === 'string') {
+      const kept = v.length > chars ? `${v.slice(0, chars)}[Truncated ${v.length - chars} chars]` : v;
+      chars = Math.max(0, chars - v.length);
+      return kept;
+    }
     if (v === null || typeof v !== 'object') return v;
-    if (v instanceof Error) return { name: v.name, message: v.message, stack: v.stack };
+    if (v instanceof Error) return walk({ name: v.name, message: v.message, stack: v.stack }, depth + 1);
     if (v instanceof Date) return v.toISOString();
     if (typeof v.toObject === 'function') {
       try {
@@ -269,13 +314,28 @@ function serialize(value) {
     if (v === null || typeof v !== 'object') return v;
     if (ancestors.has(v)) return '[Circular]';
     if (depth > 12) return '[MaxDepth]';
-    if (--budget < 0) return '[Truncated]';
     ancestors.add(v);
     let out;
-    if (Array.isArray(v)) out = v.map((item) => walk(item, depth + 1));
-    else {
+    // Stop visiting once the budget is spent, so a huge collection costs no more than a small one.
+    if (Array.isArray(v)) {
+      out = [];
+      for (const item of v) {
+        if (budget <= 0) {
+          out.push(`[Truncated ${v.length - out.length} more items]`);
+          break;
+        }
+        out.push(walk(item, depth + 1));
+      }
+    } else {
       out = {};
-      for (const key of Object.keys(v)) out[key] = walk(v[key], depth + 1);
+      for (const key in v) {
+        if (!Object.hasOwn(v, key)) continue;
+        if (budget <= 0) {
+          out['[Truncated]'] = 'more keys omitted';
+          break;
+        }
+        out[key] = walk(v[key], depth + 1);
+      }
     }
     ancestors.delete(v);
     return out;

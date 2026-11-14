@@ -37,7 +37,7 @@ No arguments. Call it first.
     "core": "14.370", "system": "dnd5e", "systemTitle": "Dungeons & Dragons Fifth Edition", "systemVersion": "6.0.6",
     "user": "Gamemaster", "activeScene": "Tavern", "viewedScene": "Tavern",
     "counts": { "actors": 58, "items": 20, "scenes": 49, "macros": 92, "journal": 98 },
-    "activeModules": ["foundry-mcp@0.3.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.11"],
+    "activeModules": ["foundry-mcp@0.4.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.11"],
     "windowVisibility": "visible"
   },
   "logs": [],
@@ -67,7 +67,9 @@ return { hp: actor.system.attributes?.hp?.value, flag: actor.getFlag('world', 'c
 - A thrown error comes back as `error` with its stack, and line numbers refer to `foundry-mcp-eval.js`, your code.
 - `signal` is an `AbortSignal` that fires when the call times out. **A timeout does not stop the code**; only code
   that checks `signal.aborted` stops early.
-- At most 16 evaluations run at once across all clients.
+- `logs` holds at most 200 lines per call; `logsDropped` counts the rest.
+- At most 16 evaluations can be unfinished at once, across all clients. Code that outlived its timeout still
+  counts, so after 16 stuck calls nothing more runs until the world is reloaded.
 
 ### `foundry_logs`
 
@@ -109,10 +111,11 @@ example.
    ```
 2. **Make a test world.** In Foundry's setup screen, duplicate your world's folder under `Data/worlds` (or create a
    new world). Never point this at a campaign you cannot restore.
-3. **Configure the hub.** Copy `server/config.example.json` to `server/config.json` and replace `my-test-world-id`
+3. **Configure the hub.** Still in the `server` folder, copy `config.example.json` to `config.json` and replace `my-test-world-id`
    with the test world's id (its folder name under `Data/worlds`). With no worlds listed the hub refuses to run code.
 4. **Start the hub** with `npm start` and leave it running. On first start it generates a token and saves it in
-   `config.json` as `"token"`.
+   `config.json` as `"token"`. A value of the wrong type in `config.json` stops the hub with a message rather than
+   being guessed at.
 5. **Install the module.** Copy or link the `foundry-mcp` folder into Foundry's `Data/modules` folder, then restart
    Foundry so it sees the module. On Windows a junction keeps it in step with your checkout:
    ```
@@ -192,8 +195,9 @@ Behaviour worth knowing:
 - **Levels.** Many modules report real failures as warnings (midi-qol logs a failing on-use macro with
   `console.warn`), so do not filter to `error` only.
 - **Privacy.** Only warnings and errors are kept, never ordinary `console.log` output. Values that look like
-  credentials (`password=`, `api_key:`, bearer tokens, `?token=` in URLs, JWTs, long opaque strings) are replaced
-  with `[redacted]` in the browser, in log entries and in the `logs` of `foundry_eval`. This is best effort. Log text
+  credentials (`password=`, `api_key:`, `token=`, quoted keys such as `"token": "..."`, `Authorization` and
+  `Cookie` headers, bearer tokens, `?token=` in URLs, JWTs, long opaque strings, and the hub token itself) are
+  replaced with `[redacted]` in the browser, in log entries and in the `logs` of `foundry_eval`. This is best effort. Log text
   is otherwise whatever your modules print, which can include actor, item and user names. Logs from worlds that are
   not on the allowlist are discarded.
 - **Not captured.** `console.log/info/debug` outside an evaluation, notifications created with `console: false`,
@@ -242,11 +246,12 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - The token handshake with the real module: the correct token connects, a wrong token is refused, and a hub reached
   without the bearer token answers 401.
 
-### Tested in simulation only (`npm test`, 29 checks)
+### Tested in simulation only (`npm test`, 36 checks)
 
-Serialization, timeouts and the abort signal, the concurrency cap, flood limits and retention, origin, Host and
-method checks, a second GM tab, the world allowlist, a module refusing a hub that cannot prove it knows the token,
-`allowEval: false`, and token generation on first start.
+Serialization and its size limits, timeouts and the abort signal, the concurrency caps, flood limits and retention,
+origin, Host and method checks, malformed socket messages, a second GM tab, the world allowlist (including an empty
+one), a relay altering the reported world, a module refusing an unsigned command or a hub that cannot prove it knows
+the token, configuration validation, `allowEval: false`, and token generation with file permissions.
 
 ### Not tested
 
@@ -266,10 +271,10 @@ method checks, a second GM tab, the world allowlist, a module refusing a hub tha
 
 ## Development
 
-`npm test` in `server` takes about 40 seconds. `PROTOCOL` in `foundry-mcp/scripts/bridge.js` and `MODULE_PROTOCOL`
+`npm test` in `server` takes about 45 seconds. `PROTOCOL` in `foundry-mcp/scripts/bridge.js` and `MODULE_PROTOCOL`
 in `server/index.js` must be bumped together whenever the messages between them change. CI runs the tests on Linux
 and Windows with Node 20 and 24.
 
 ## License
 
-No license has been chosen yet, so all rights are reserved for now.
+[MIT](LICENSE).

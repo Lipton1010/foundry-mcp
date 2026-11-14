@@ -2,7 +2,7 @@
   "id": "foundry-mcp",
   "title": "Foundry MCP",
   "description": "Connects a GM's Foundry session to a local MCP server so coding agents (Claude Code, Codex) can read and change the world. Enable it only in worlds you want an agent to control.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "compatibility": {
     "minimum": "14",
     "verified": "14.370",
@@ -16,5 +16,6 @@
   ],
   "esmodules": [
     "scripts/bridge.js"
-  ]
+  ],
+  "license": "MIT"
 }
