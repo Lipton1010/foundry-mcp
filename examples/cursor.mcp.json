@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "foundry": {
+      "url": "http://127.0.0.1:30123/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:FOUNDRY_MCP_TOKEN}"
+      }
+    }
+  }
+}

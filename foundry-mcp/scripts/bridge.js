@@ -4,7 +4,7 @@
 // need to change.
 
 const MODULE_ID = 'foundry-mcp';
-const PROTOCOL = 2; // bump together with MODULE_PROTOCOL in server/index.js
+const PROTOCOL = 3; // bump together with MODULE_PROTOCOL in server/index.js
 const SESSION = Math.random().toString(36).slice(2, 10); // identifies this page load
 const EVAL_SOURCE = 'foundry-mcp-eval.js'; // name evaluated code gets in stack traces
 const LOOPBACK = ['127.0.0.1', 'localhost', '[::1]'];
@@ -26,7 +26,7 @@ Hooks.once('init', () => {
   });
   game.settings.register(MODULE_ID, 'token', {
     name: 'Hub token (optional)',
-    hint: 'Only needed if the hub was started with a token. Stored in this browser. Reload after changing.',
+    hint: 'The "token" value from the hub\'s config.json. Leave empty only if the hub runs without one. Stored in this browser. Reload after changing.',
     scope: 'client',
     config: true,
     type: String,
@@ -54,21 +54,13 @@ function connect() {
     console.log(`${MODULE_ID} | not connecting: the hub address must be a ws:// address on 127.0.0.1 or localhost`);
     return;
   }
+  const token = game.settings.get(MODULE_ID, 'token').trim();
+  const nonce = randomHex();
+  let hubProven = false; // with a token set, the hub must prove it knows it before we obey it
+  const refuse = (reason) => ws.close(4003, reason);
   const ws = new WebSocket(url.href);
   ws.addEventListener('open', () => {
-    ws.send(
-      JSON.stringify({
-        hello: {
-          protocol: PROTOCOL,
-          session: SESSION,
-          world: game.world.id,
-          user: game.user.name,
-          core: game.version,
-          system: game.system.id,
-          token: game.settings.get(MODULE_ID, 'token'),
-        },
-      })
-    );
+    send({ hello: { protocol: PROTOCOL, session: SESSION, world: game.world.id, core: game.version, system: game.system.id, nonce } }, ws);
   });
   ws.addEventListener('message', async (event) => {
     let msg;
@@ -77,25 +69,52 @@ function connect() {
     } catch {
       return;
     }
-    if (msg.welcome) {
+    if (msg.challenge && socket !== ws) {
+      if (!token) return refuse('the hub requires a token; paste it into the "Hub token" module setting');
+      if (!globalThis.crypto?.subtle) return refuse('token checks need a secure page (open Foundry via localhost or https)');
+      const expected = await hmac(token, `hub:${nonce}:${msg.challenge.nonce}`);
+      if (msg.challenge.proof !== expected) return refuse('whatever answered at the hub address does not know the token');
+      hubProven = true;
+      return send({ proof: await hmac(token, `module:${nonce}:${msg.challenge.nonce}`) }, ws);
+    }
+    if (msg.welcome && socket !== ws) {
+      if (token && !hubProven) return refuse('whatever answered at the hub address did not ask for the token');
       console.log(`${MODULE_ID} | connected to MCP hub`);
       socket = ws;
       for (const entry of backlog.splice(0)) send({ log: entry });
       return;
     }
+    if (socket !== ws) return; // obey nothing until the handshake is complete
+    if (msg.method === 'cancel') return running.get(msg.id)?.abort();
     if (msg.method !== 'eval') return;
-    const reply = await evaluate(msg.params?.code);
+    const controller = new AbortController();
+    running.set(msg.id, controller);
+    const reply = await evaluate(msg.params?.code, controller.signal);
+    running.delete(msg.id);
     if (!send({ id: msg.id, ...reply }, ws)) {
       send({ id: msg.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] }, ws);
     }
   });
   // The hub may not be running, or may restart: keep retrying quietly. Retry
-  // slowly when the hub turned us away (another GM tab, wrong token).
+  // slowly when the connection was refused (another GM tab, token trouble).
   ws.addEventListener('close', (event) => {
     if (socket === ws) socket = null;
-    if (event.code >= 4000) console.log(`${MODULE_ID} | hub refused the connection: ${event.reason}`);
+    if (event.code >= 4000) console.log(`${MODULE_ID} | not connected: ${event.reason}`);
     setTimeout(connect, event.code >= 4000 ? 30_000 : 5000);
   });
+}
+
+const running = new Map(); // evaluation id -> AbortController
+
+function randomHex() {
+  return [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function hmac(key, text) {
+  const encode = (value) => new TextEncoder().encode(value);
+  const cryptoKey = await crypto.subtle.importKey('raw', encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, encode(text));
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function send(message, ws = socket) {
@@ -109,11 +128,13 @@ function send(message, ws = socket) {
 
 // ----------------------------------------------------------------- evaluation
 
-async function evaluate(code) {
+// `signal` aborts if the hub gives up waiting. Nothing can force running code
+// to stop; this only helps code that checks it.
+async function evaluate(code, signal) {
   const logs = [];
   captures.add(logs);
   try {
-    const result = await new AsyncFunction(`${code}\n//# sourceURL=${EVAL_SOURCE}`)();
+    const result = await new AsyncFunction('signal', `${code}\n//# sourceURL=${EVAL_SOURCE}`)(signal);
     return { ok: true, result: serialize(result), logs };
   } catch (error) {
     return { ok: false, error: { name: error?.name, message: error?.message ?? String(error), stack: error?.stack }, logs };
@@ -138,7 +159,8 @@ for (const level of ['log', 'warn', 'error']) {
   const original = console[level];
   console[level] = (...args) => {
     try {
-      for (const logs of captures) logs.push({ level, text: args.map((arg) => formatLogArg(arg, true)).join(' ') });
+      // Other modules log during an evaluation too, so this output is redacted like the rest.
+      for (const logs of captures) logs.push({ level, text: redact(args.map((arg) => formatLogArg(arg, true)).join(' ').slice(0, 8000)) });
       if (level !== 'log') {
         const error = args.find((arg) => arg instanceof Error);
         record(level, 'console', args.map((arg) => formatLogArg(arg, false)).join(' '), error?.stack ?? new Error().stack);
@@ -206,6 +228,7 @@ function redact(text) {
   return text
     .replace(/\b(bearer\s+)[\w.~+/=-]{8,}/gi, '$1[redacted]') // before the next rule, which would stop at "Bearer"
     .replace(/\b(pass(?:word|wd)|secret|api[-_ ]?key|cookie|authorization|(?:access|auth|api|refresh|session|cobalt)[-_ ]?token)(\s*["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
+    .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
     .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]')
     .replace(/\b[A-Za-z0-9_+=-]{40,}\b/g, '[redacted]');
 }

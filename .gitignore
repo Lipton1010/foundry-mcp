@@ -20,3 +20,11 @@ graft/
 .claude/
 .codex/
 *.log
+
+# Project-level MCP client configs (may hold the hub token); see examples/ for templates
+.cursor/
+.agents/
+/opencode.json
+/opencode.jsonc
+.mcp.json
+.vscode/

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "foundry": {
+        "type": "remote",
+        "url": "http://127.0.0.1:30123/mcp",
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:FOUNDRY_MCP_TOKEN}"
+        }
+      }
+    }
+  }
+}

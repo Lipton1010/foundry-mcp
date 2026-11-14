@@ -1,34 +1,48 @@
-// End-to-end checks without Foundry: starts the hub, loads the real module
-// script against stubbed Foundry globals, and calls the tools over MCP HTTP.
+// End-to-end checks without Foundry: starts hubs, loads the real module script
+// against stubbed Foundry globals, and calls the tools over MCP HTTP.
 // Everything here is simulated; see README "Verifying against a real world".
-// Run with: npm test   (takes about 25 s because it waits out real reconnects)
+// Run with: npm test   (takes about 40 s because it waits out real reconnects)
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { request } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-const PORT = 30199;
-const TOKEN_PORT = 30198;
+const PORT = 30199; // no token, small log buffer
+const TOKEN_PORT = 30198; // token required
+const BARE_PORT = 30197; // no token, eval disabled, nothing connected: stands in for an impostor hub
+const FRESH_PORT = 30196; // no configuration at all
+const TOKEN = 'correct-horse-battery';
 const ORIGIN = 'http://localhost:30000';
+const tmp = mkdtempSync(join(tmpdir(), 'foundry-mcp-test-'));
+const freshConfig = join(tmp, 'config.json');
 
 function startHub(env) {
+  const base = { ...process.env };
+  for (const key of Object.keys(base)) if (key.startsWith('FOUNDRY_MCP_')) delete base[key];
   return spawn(process.execPath, ['index.js'], {
     cwd: import.meta.dirname,
     // Point at a config file that does not exist so a local config.json is never read.
-    env: { ...process.env, FOUNDRY_MCP_CONFIG: 'none.json', FOUNDRY_MCP_WORLDS: 'test-world', ...env },
+    env: { ...base, FOUNDRY_MCP_CONFIG: join(tmp, 'none.json'), FOUNDRY_MCP_WORLDS: 'test-world', ...env },
     stdio: 'inherit',
   });
 }
 const hubs = [
-  startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_LOG_LIMIT: 60 }),
-  startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: 'correct-horse' }),
+  startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_LOG_LIMIT: 60 }),
+  startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: TOKEN }),
+  startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
+  startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: undefined }),
 ];
 
-async function mcp(method, params, headers = {}, port = PORT) {
+async function mcp(method, params, { headers = {}, port = PORT, httpMethod = 'POST' } = {}) {
   const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
-    method: 'POST',
+    method: httpMethod,
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    body: httpMethod === 'POST' ? JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) : undefined,
   });
   const text = await response.text();
   if (!response.ok) return { status: response.status, text };
@@ -36,10 +50,12 @@ async function mcp(method, params, headers = {}, port = PORT) {
   const json = text.startsWith('{') ? text : text.split('\n').find((line) => line.startsWith('data:')).slice(5);
   return JSON.parse(json);
 }
-const callTool = async (name, args = {}) => (await mcp('tools/call', { name, arguments: args })).result;
+const bearer = (token) => ({ headers: { authorization: `Bearer ${token}` }, port: TOKEN_PORT });
+const callTool = async (name, args = {}, options) => (await mcp('tools/call', { name, arguments: args }, options)).result;
 const payload = (result) => JSON.parse(result.content[0].text);
-const evalCode = async (code, extra = {}) => payload(await callTool('foundry_eval', { code, ...extra }));
+const evalCode = async (code, extra = {}, options) => payload(await callTool('foundry_eval', { code, ...extra }, options));
 const getLogs = async (args = {}) => payload(await callTool('foundry_logs', args));
+const toolNames = async (options) => (await mcp('tools/list', {}, options)).result.tools.map((t) => t.name);
 
 // --- Stub the slice of Foundry and the browser the module touches.
 const hooks = {};
@@ -54,7 +70,7 @@ globalThis.game = {
   version: '14.370',
   actors: Object.assign(new Map([['a1', actor]]), { getName: () => actor }),
   items: new Map(), scenes: Object.assign(new Map(), { active: null }), macros: new Map(), journal: new Map(),
-  modules: [{ id: 'foundry-mcp', version: '0.2.0', active: true }],
+  modules: [{ id: 'foundry-mcp', version: '0.3.0', active: true }],
 };
 globalThis.canvas = { scene: null };
 globalThis.window = new EventTarget();
@@ -67,17 +83,36 @@ globalThis.WebSocket = class extends NodeWebSocket {
     moduleSockets.push(this);
   }
 };
-// A raw socket for playing a second tab or a hostile page.
-function rawSocket(port, origin, hello) {
+// Loads another copy of the real module script, as a second browser tab would.
+let copies = 0;
+async function startModule(url, token) {
+  settings['foundry-mcp.url'] = url;
+  settings['foundry-mcp.token'] = token;
+  await import(`../foundry-mcp/scripts/bridge.js?copy=${++copies}`);
+  hooks.init();
+  hooks.ready();
+  await sleep(600);
+}
+// A hand-rolled socket for playing a second tab, a hostile page, or a client with the wrong token.
+function rawSocket(port, origin, token) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
+  const sign = (text) => createHmac('sha256', token ?? '').update(text).digest('hex');
   return new Promise((resolve) => {
-    ws.addEventListener('open', () => hello && ws.send(JSON.stringify({ hello })));
-    ws.addEventListener('message', (event) => resolve({ ws, outcome: 'welcomed', message: JSON.parse(event.data) }));
+    ws.addEventListener('open', () =>
+      ws.send(JSON.stringify({ hello: { protocol: 3, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc' } }))
+    );
+    ws.addEventListener('message', (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.challenge) {
+        const hubKnowsToken = msg.challenge.proof === createHmac('sha256', TOKEN).update(`hub:abc:${msg.challenge.nonce}`).digest('hex');
+        assert.ok(hubKnowsToken, 'the hub proves it knows the token');
+        ws.send(JSON.stringify({ proof: sign(`module:abc:${msg.challenge.nonce}`) }));
+      } else resolve({ ws, outcome: msg.welcome ? 'welcomed' : 'other' });
+    });
     ws.addEventListener('close', (event) => resolve({ outcome: 'closed', code: event.code }));
     ws.addEventListener('error', () => resolve({ outcome: 'rejected' }));
   });
 }
-const hello = { protocol: 2, session: 's', world: 'test-world', user: 'x', core: '14', system: 'y' };
 const fixture = await import('./test-fixtures/modules/fake-automation/scripts/workflow.js');
 globalThis.fakeAutomation = fixture;
 
@@ -89,10 +124,11 @@ const check = async (name, fn) => {
 };
 
 try {
-  await sleep(1000);
+  await sleep(1500);
   await import('../foundry-mcp/scripts/bridge.js');
   hooks.init();
 
+  // ------------------------------------------------------------ basic tools
   await check('tools refuse politely while Foundry is not connected', async () => {
     const result = await callTool('foundry_status');
     assert.equal(result.isError, true);
@@ -117,8 +153,7 @@ try {
   });
 
   await check('lists the three tools', async () => {
-    const tools = (await mcp('tools/list', {})).result.tools.map((t) => t.name);
-    assert.deepEqual(tools, ['foundry_status', 'foundry_eval', 'foundry_logs']);
+    assert.deepEqual(await toolNames(), ['foundry_status', 'foundry_eval', 'foundry_logs']);
   });
 
   await check('status reports world and system without assuming dnd5e', async () => {
@@ -145,11 +180,27 @@ try {
     assert.deepEqual(reply.result, { big: '10', when: '1970-01-01T00:00:00.000Z', set: [1], self: '[Circular]' });
   });
 
-  await check('eval times out without hanging the hub', async () => {
-    const result = await callTool('foundry_eval', { code: `await new Promise(() => {});`, timeoutMs: 1000 });
+  await check('a timeout returns promptly and aborts the signal given to the code', async () => {
+    const result = await callTool('foundry_eval', {
+      code: `await new Promise((resolve) => signal.addEventListener('abort', resolve)); globalThis.sawAbort = true;`,
+      timeoutMs: 1000,
+    });
     assert.match(result.content[0].text, /Timed out/);
+    await sleep(200);
+    assert.equal((await evalCode('return globalThis.sawAbort === true')).result, true);
   });
 
+  await check('concurrent evaluations are answered separately and capped', async () => {
+    const replies = await Promise.all(
+      Array.from({ length: 17 }, (_, i) => callTool('foundry_eval', { code: `await new Promise((r) => setTimeout(r, 800)); return ${i};` }))
+    );
+    const refused = replies.filter((r) => r.isError);
+    assert.equal(refused.length, 1);
+    assert.match(refused[0].content[0].text, /already running/);
+    assert.deepEqual(replies.filter((r) => !r.isError).map((r) => payload(r).result), Array.from({ length: 16 }, (_, i) => i));
+  });
+
+  // -------------------------------------------------------------------- logs
   await check('an error logged after eval returned is found with since=logSeq and marked fromEval', async () => {
     const reply = await evalCode(`setTimeout(() => console.error('late', new Error('late failure')), 100); return 'returned';`);
     assert.equal(reply.result, 'returned');
@@ -189,16 +240,21 @@ try {
     ]);
   });
 
-  await check('credentials are redacted before leaving the browser', async () => {
+  await check('credentials are redacted before leaving the browser, in logs and in eval output', async () => {
     const before = (await getLogs()).lastSeq;
-    console.error('login failed password=hunter22 api_key: "abc123" Authorization: Bearer abcdefgh12345678 cobalt-token=zzz999 Token Goblin is fine');
+    const secrets =
+      'login failed password=hunter22 api_key: "abc123" Authorization: Bearer abcdefgh12345678 cobalt-token=zzz999 ' +
+      'https://example.test/hook?user=bob&token=qwerty123&x=1 Token Goblin is fine';
+    const expected =
+      'login failed password=[redacted] api_key: "[redacted]" Authorization: [redacted] [redacted] cobalt-token=[redacted] ' +
+      'https://example.test/hook?user=bob&token=[redacted]&x=1 Token Goblin is fine';
+    console.error(secrets);
     console.warn('blob ' + 'A1b2'.repeat(12));
+    console.warn('jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl');
     await sleep(200);
-    const texts = (await getLogs({ since: before })).entries.map((e) => e.text);
-    assert.deepEqual(texts, [
-      'login failed password=[redacted] api_key: "[redacted]" Authorization: [redacted] [redacted] cobalt-token=[redacted] Token Goblin is fine',
-      'blob [redacted]',
-    ]);
+    assert.deepEqual((await getLogs({ since: before })).entries.map((e) => e.text), [expected, 'blob [redacted]', 'jwt [redacted]']);
+    const reply = await evalCode(`console.log(${JSON.stringify(secrets)}); return 1;`);
+    assert.deepEqual(reply.logs, [{ level: 'log', text: expected }]);
   });
 
   await check('level, text and limit filters work; console.log is not retained', async () => {
@@ -238,27 +294,24 @@ try {
     assert.ok(logs.entries.at(-1).droppedBefore >= 200, 'the next entry says how many were dropped');
   });
 
+  // ------------------------------------------------------- access and origins
   await check('a second GM tab is turned away while the first is connected', async () => {
-    assert.deepEqual(await rawSocket(PORT, ORIGIN, hello), { outcome: 'closed', code: 4001 });
+    assert.deepEqual(await rawSocket(PORT, ORIGIN), { outcome: 'closed', code: 4001 });
   });
 
-  await check('a web page cannot call the MCP endpoint', async () => {
-    assert.equal((await mcp('tools/list', {}, { origin: 'https://evil.example' })).status, 403);
+  await check('a web page cannot call the MCP endpoint, and only POST is served', async () => {
+    assert.equal((await mcp('tools/list', {}, { headers: { origin: 'https://evil.example' } })).status, 403);
+    assert.equal((await mcp('tools/list', {}, { headers: { origin: 'null' } })).status, 403);
+    assert.equal((await mcp('tools/list', {}, { httpMethod: 'GET' })).status, 405);
+    // DNS rebinding: the request reaches loopback but names another host. fetch cannot fake Host, so go lower.
+    const rebound = await new Promise((resolve) =>
+      request({ host: '127.0.0.1', port: PORT, path: '/mcp', method: 'POST', headers: { host: 'attacker.example' } }, (res) => resolve(res.statusCode)).end('{}')
+    );
+    assert.equal(rebound, 403);
   });
 
   await check('a page from another origin cannot pose as Foundry', async () => {
-    assert.equal((await rawSocket(PORT, 'https://evil.example', hello)).outcome, 'rejected');
-  });
-
-  await check('with a hub token set, MCP calls and the module both need it', async () => {
-    assert.equal((await mcp('tools/list', {}, {}, TOKEN_PORT)).status, 401);
-    assert.equal((await mcp('tools/list', {}, { authorization: 'Bearer wrong' }, TOKEN_PORT)).status, 401);
-    const ok = await mcp('tools/list', {}, { authorization: 'Bearer correct-horse' }, TOKEN_PORT);
-    assert.equal(ok.result.tools.length, 3);
-    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, { ...hello, token: 'wrong' }), { outcome: 'closed', code: 4003 });
-    const good = await rawSocket(TOKEN_PORT, ORIGIN, { ...hello, token: 'correct-horse' });
-    assert.equal(good.outcome, 'welcomed');
-    good.ws.close();
+    assert.equal((await rawSocket(PORT, 'https://evil.example')).outcome, 'rejected');
   });
 
   await check('logs survive a Foundry disconnect, stay readable, and are bounded by markers', async () => {
@@ -298,10 +351,58 @@ try {
     console.error('private thing from the live campaign');
     await sleep(200);
     assert.equal((await getLogs({ contains: 'private thing' })).entries.length, 0);
+    game.world.id = 'test-world';
+  });
+
+  // ------------------------------------------------------------------- token
+  await check('a hub with a token refuses MCP calls without it', async () => {
+    assert.equal((await mcp('tools/list', {}, { port: TOKEN_PORT })).status, 401);
+    assert.equal((await mcp('tools/list', {}, bearer('wrong'))).status, 401);
+    assert.equal((await toolNames(bearer(TOKEN))).length, 3);
+  });
+
+  await check('a module without the right token cannot connect to a token hub', async () => {
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, 'wrong'), { outcome: 'closed', code: 4003 });
+    const before = moduleSockets.length;
+    await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, ''); // real module, no token configured
+    assert.equal(moduleSockets.length, before + 1);
+    assert.match((await callTool('foundry_status', {}, bearer(TOKEN))).content[0].text, /not connected/);
+  });
+
+  await check('a module with the token proves itself, checks the hub, and then works', async () => {
+    await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, TOKEN);
+    assert.equal((await evalCode('return 40 + 2', {}, bearer(TOKEN))).result, 42);
+  });
+
+  await check('a module with a token refuses a hub that cannot prove it knows the token', async () => {
+    // BARE_PORT has no token, as a program squatting on the hub port would not.
+    await startModule(`ws://127.0.0.1:${BARE_PORT}/foundry`, TOKEN);
+    assert.match((await callTool('foundry_status', {}, { port: BARE_PORT })).content[0].text, /not connected/);
+  });
+
+  // ----------------------------------------------------------------- options
+  await check('allowEval: false removes foundry_eval and nothing else', async () => {
+    assert.deepEqual(await toolNames({ port: BARE_PORT }), ['foundry_status', 'foundry_logs']);
+  });
+
+  await check('a hub started with no configuration creates a token and requires it', async () => {
+    assert.ok(existsSync(freshConfig));
+    const generated = JSON.parse(readFileSync(freshConfig, 'utf8')).token;
+    assert.ok(generated.length >= 32);
+    assert.equal((await mcp('tools/list', {}, { port: FRESH_PORT })).status, 401);
+    assert.equal((await toolNames({ port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } })).length, 3);
+    // With no worlds configured, even an authenticated call cannot run code.
+    const result = await callTool('foundry_status', {}, { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } });
+    assert.equal(result.isError, true);
   });
 
   console.log(`\nALL ${passed} CHECKS PASSED (simulated Foundry)`);
+} catch (error) {
+  console.error(`\nFAILED after ${passed} passing checks:\n`, error);
+  process.exitCode = 1;
 } finally {
   for (const hub of hubs) hub.kill();
-  setTimeout(() => process.exit(), 100);
+  await sleep(200);
+  rmSync(tmp, { recursive: true, force: true });
+  process.exit();
 }

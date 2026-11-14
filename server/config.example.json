@@ -2,6 +2,6 @@
   "port": 30123,
   "worlds": ["my-test-world-id"],
   "origins": ["http://localhost:30000", "http://127.0.0.1:30000"],
-  "token": "",
+  "allowEval": true,
   "logLimit": 1000
 }

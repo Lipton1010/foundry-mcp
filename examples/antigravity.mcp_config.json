@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "foundry": {
+      "serverUrl": "http://127.0.0.1:30123/mcp",
+      "headers": {
+        "Authorization": "Bearer PASTE_HUB_TOKEN_HERE"
+      }
+    }
+  }
+}
