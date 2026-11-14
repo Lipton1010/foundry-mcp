@@ -25,7 +25,7 @@ Hooks.once('init', () => {
     default: 'ws://127.0.0.1:30123/foundry',
   });
   game.settings.register(MODULE_ID, 'token', {
-    name: 'Hub token (optional)',
+    name: 'Hub token',
     hint: 'The "token" value from the hub\'s config.json. Leave empty only if the hub runs without one. Stored in this browser. Reload after changing.',
     scope: 'client',
     config: true,
@@ -63,13 +63,35 @@ function connect() {
   const binding = (hubNonce) => [nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
   let sessionKey = null; // with a token: set once the hub has proved it knows it; signs every command after that
   let received = 0; // commands seen, for the hub's signed sequence number
-  const refuse = (reason) => ws.close(4003, reason);
-  const ws = new WebSocket(url.href);
+  let refused = false;
+  let ws;
+  const refuse = (reason) => {
+    refused = true; // nothing queued behind this message may run
+    if (socket === ws) socket = null;
+    ws.close(4003, reason);
+  };
+  try {
+    ws = new WebSocket(url.href);
+  } catch (error) {
+    // Some browsers refuse outright, for example a secure page opening an insecure socket.
+    console.log(`${MODULE_ID} | not connecting: the browser would not open ${url.href} (${error.message})`);
+    return;
+  }
   ws.addEventListener('open', () => send({ hello }, ws));
-  ws.addEventListener('message', async (event) => {
+
+  // Messages are handled strictly one after another. Checking a signature is
+  // asynchronous, and without the queue a short "cancel" could overtake the
+  // "eval" it refers to. Only the checking is queued: evaluations still run side by side.
+  let queue = Promise.resolve();
+  ws.addEventListener('message', (event) => {
+    queue = queue.then(() => handle(event.data)).catch(() => refuse('a message from the hub could not be handled'));
+  });
+
+  async function handle(data) {
+    if (refused) return;
     let msg;
     try {
-      msg = JSON.parse(event.data);
+      msg = JSON.parse(data);
     } catch {
       return;
     }
@@ -95,7 +117,7 @@ function connect() {
     if (msg.method !== 'eval' && msg.method !== 'cancel') return;
     if (sessionKey) {
       // Every command must carry the next sequence number and the hub's signature,
-      // so nothing between us and the hub can insert, replay or alter one.
+      // so nothing between us and the hub can insert, replay, reorder or alter one.
       const expected = ++received;
       const signed = `${expected}\n${msg.method}\n${msg.id}\n${msg.params?.code ?? ''}`;
       if (msg.seq !== expected || msg.mac !== toHex(await hmac(sessionKey, signed))) {
@@ -108,19 +130,20 @@ function connect() {
     }
     const controller = new AbortController();
     running.set(msg.id, controller);
-    const reply = await evaluate(msg.params?.code, controller.signal);
-    running.delete(msg.id);
-    if (!send({ id: msg.id, ...reply }, ws)) {
-      send({ id: msg.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] }, ws);
-    }
-  });
+    // Not awaited: the queue moves on while this evaluation runs.
+    evaluate(msg.params?.code, controller.signal).then((reply) => {
+      running.delete(msg.id);
+      if (!send({ id: msg.id, ...reply }, ws)) {
+        send({ id: msg.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] }, ws);
+      }
+    });
+  }
+
   // The hub may not be running, or may restart: keep retrying quietly. Retry
   // slowly when the connection was refused (another GM tab, token trouble).
   ws.addEventListener('close', (event) => {
-    if (socket === ws) {
-      socket = null;
-      for (const controller of running.values()) controller.abort(); // nobody is waiting for these any more
-    }
+    if (socket === ws) socket = null;
+    for (const controller of running.values()) controller.abort(); // nobody is waiting for these any more
     if (event.code >= 4000) console.log(`${MODULE_ID} | not connected: ${event.reason}`);
     setTimeout(connect, event.code >= 4000 ? 30_000 : 5000);
   });
@@ -162,9 +185,16 @@ async function evaluate(code, signal) {
   const withLogs = (reply) => (logs.dropped ? { ...reply, logs, logsDropped: logs.dropped } : { ...reply, logs });
   try {
     const result = await new AsyncFunction('signal', `${code}\n//# sourceURL=${EVAL_SOURCE}`)(signal);
-    return withLogs({ ok: true, result: serialize(result) });
+    let serialized;
+    try {
+      serialized = serialize(result);
+    } catch (error) {
+      serialized = `[The result could not be serialized: ${error?.message}]`;
+    }
+    return withLogs({ ok: true, result: serialized });
   } catch (error) {
-    return withLogs({ ok: false, error: { name: error?.name, message: error?.message ?? String(error), stack: error?.stack } });
+    const clip = (value, max) => (value === undefined ? undefined : String(value).slice(0, max));
+    return withLogs({ ok: false, error: { name: clip(error?.name, 200), message: clip(error?.message ?? error, 10_000), stack: clip(error?.stack, 10_000) } });
   } finally {
     captures.delete(logs);
   }
@@ -177,6 +207,7 @@ async function evaluate(code, signal) {
 const captures = new Set(); // console output of evaluations in flight
 const backlog = []; // entries waiting for a hub connection
 const BACKLOG_LIMIT = 200;
+const REDACT_SLACK = 512; // extra text examined past a cut, so a secret straddling it is still recognised
 const CAPTURE_LIMIT = 200; // console lines returned by one evaluation; the rest are counted
 const RATE_LIMIT = 100; // entries per second; the rest are counted, not kept
 let windowStart = 0;
@@ -190,7 +221,7 @@ for (const level of ['log', 'warn', 'error']) {
       // Other modules log during an evaluation too, so this output is redacted like the rest.
       for (const logs of captures) {
         if (logs.length >= CAPTURE_LIMIT) logs.dropped += 1;
-        else logs.push({ level, text: redact(args.map((arg) => formatLogArg(arg, true)).join(' ').slice(0, 8000)) });
+        else logs.push({ level, text: redact(args.map((arg) => formatLogArg(arg, true)).join(' ').slice(0, 8000 + REDACT_SLACK)).slice(0, 8000) });
       }
       if (level !== 'log') {
         const error = args.find((arg) => arg instanceof Error);
@@ -220,7 +251,7 @@ function record(level, source, text, stack) {
       dropped += 1;
       return;
     }
-    const entry = { time: now, level, source, text: redact(String(text).slice(0, 2000)), ...describeStack(stack) };
+    const entry = { time: now, level, source, text: redact(String(text).slice(0, 2000 + REDACT_SLACK)).slice(0, 2000), ...describeStack(stack) };
     if (dropped) {
       entry.droppedBefore = dropped;
       dropped = 0;
@@ -275,12 +306,14 @@ function redact(text, opaque = true) {
     .replace(/\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*[:=]\s*)[^\n]+/gi, '$1$2[redacted]')
     .replace(/\b(bearer\s+)[\w.~+/=-]{8,}/gi, '$1[redacted]')
     // key=value and key: value, including prefixed names such as client_secret or openai_api_key.
-    .replace(/\b([\w-]*(?:pass(?:word|wd)|secret|api[-_ ]?key)[\w-]*|(?:access|auth|api|refresh|session|cobalt|id|client|hub)[-_ ]?token|[\w-]*token(?==))(\s*["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
+    .replace(/\b([\w-]*(?:pass(?:word|wd)|secret|api[-_ ]?key)[\w-]*|(?:access|auth|api|refresh|session|cobalt|id|client|hub)[-_ ]?token|[\w-]*token(?==))(\s*(?:["']\s*)?[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
     .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
     .replace(/(:\/\/[^/@\s:]+:)[^@\s/]+@/g, '$1[redacted]@') // https://user:password@host
     .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]');
-  // Long opaque strings. Skipped for stack frames, where long function names are normal.
-  return opaque ? text.replace(/\b[A-Za-z0-9_+=-]{40,}\b/g, '[redacted]') : text;
+  // Long opaque strings such as base64 or hex keys, including trailing "=" padding. Only runs that mix
+  // letters and digits count, so long names and divider lines survive. Skipped for stack frames.
+  if (!opaque) return text;
+  return text.replace(/(?<![A-Za-z0-9_+=-])[A-Za-z0-9_+=-]{40,}(?![A-Za-z0-9_+=-])/g, (run) => (/[A-Za-z]/.test(run) && /\d/.test(run) ? '[redacted]' : run));
 }
 function formatLogArg(arg, withStack) {
   if (typeof arg === 'string') return arg;
@@ -313,7 +346,7 @@ function serialize(value) {
     }
     if (v === null || typeof v !== 'object') return v;
     if (v instanceof Error) return walk({ name: v.name, message: v.message, stack: v.stack }, depth + 1);
-    if (v instanceof Date) return v.toISOString();
+    if (v instanceof Date) return Number.isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
     if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return `[${v.constructor.name} ${v.byteLength} bytes]`;
     if (v instanceof Map) {
       // Checked before toObject(): a Foundry collection's toObject() would clone every document in it
@@ -358,7 +391,13 @@ function serialize(value) {
           out['[Truncated]'] = 'more keys omitted';
           break;
         }
-        out[key] = walk(v[key], depth + 1);
+        let item;
+        try {
+          item = v[key];
+        } catch {
+          item = '[Unreadable]'; // a getter that throws must not fail the whole reply
+        }
+        out[key] = walk(item, depth + 1);
       }
     }
     ancestors.delete(v);

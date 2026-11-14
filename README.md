@@ -141,7 +141,7 @@ example.
 | `port` | `FOUNDRY_MCP_PORT` | `30123` | Loopback port for both `/mcp` and `/foundry`. |
 | `worlds` | `FOUNDRY_MCP_WORLDS` | none | World ids code may run in. `*` allows any world; avoid it. |
 | `origins` | `FOUNDRY_MCP_ORIGINS` | `http://localhost:30000`, `http://127.0.0.1:30000` | Page origins allowed to connect as Foundry. Must match the address in the GM's browser exactly. |
-| `token` | `FOUNDRY_MCP_TOKEN` | generated on first start | Shared secret. MCP clients send it as `Authorization: Bearer <token>`; the module proves it knows it. Set it to `""` to run without authentication (not recommended). |
+| `token` | `FOUNDRY_MCP_TOKEN` (hub only; do not reuse this name for clients) | generated on first start | Shared secret. MCP clients send it as `Authorization: Bearer <token>`; the module proves it knows it. Set it to `""` to run without authentication (not recommended). |
 | `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes `foundry_eval`, leaving clients able to read status and logs only. |
 | `logLimit` | `FOUNDRY_MCP_LOG_LIMIT` | `1000` | Log entries kept in memory. |
 
@@ -248,11 +248,11 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - The token handshake with the real module: the correct token connects, a wrong token is refused, and a hub reached
   without the bearer token answers 401.
 
-### Tested in simulation only (`npm test`, 42 checks)
+### Tested in simulation only (`npm test`, 43 checks)
 
 Serialization and its size limits, timeouts and the abort signal, the concurrency caps, flood limits and retention,
 origin, Host and method checks, malformed socket messages, a second GM tab, the world allowlist (including an empty
-one), a relay altering the reported world, a module refusing an unsigned command or a hub that cannot prove it knows
+one), a relay altering the reported world, a module refusing an unsigned or replayed command or a hub that cannot prove it knows
 the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects,
 the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
 user, `allowEval: false`, and token generation with file permissions.

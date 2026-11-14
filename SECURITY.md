@@ -35,7 +35,7 @@ players. It also means:
 | **The wrong world**: you open your live campaign while the hub is running. | The module does nothing unless it is enabled in that world. The hub refuses the connection of any world that is not on its allowlist, which is empty by default: no code runs there, none of its logs are kept, its id is not shown to clients, and it cannot block the test world's tab. | The allowlist relies on the world id the module reports. It guards against mistakes, not against a tampered module. `"worlds": ["*"]` removes it. |
 | **A player** tries to use the bridge. | The module connects only for GM users, and only to a loopback address on the GM's own computer. | A GM or assistant GM account that is compromised is already full control of the world. |
 | **Runaway or stuck code.** | Calls time out (30 s by default). The timeout aborts the `signal` passed to the code. The browser refuses to start more than 16 unfinished evaluations, counting ones that already timed out, and caps the size of results and captured console output. | JavaScript cannot be stopped from outside. Code that ignores `signal` keeps running, and keeps its slot, until it finishes or the world is reloaded (F5). |
-| **Secrets in logs.** | Only warnings and errors are kept, in memory, never on disk. Credential-looking values are redacted in the browser before they reach the hub. Logs from worlds off the allowlist are dropped. | Redaction is pattern matching and will miss unusual formats. Values returned by `foundry_eval` are not redacted at all, and the agent can read any setting directly. |
+| **Secrets in logs.** | Only warnings and errors are kept (plus the hub's own connect and disconnect markers), in memory, never on disk. Credential-looking values are redacted in the browser before they reach the hub. Logs from worlds off the allowlist are dropped. | Redaction is pattern matching and will miss unusual formats. Values returned by `foundry_eval` are not redacted at all, and the agent can read any setting directly. |
 | **Many clients at once.** | Each call is matched to its own reply. | Clients are not isolated from each other: they share the log buffer (including `clear`), and console output from concurrent evaluations can appear in each other's `logs`. Treat every client with the token as one trust level. |
 
 ## The token
@@ -51,7 +51,8 @@ players. It also means:
 - The handshake needs the browser's Web Crypto, which browsers provide only on `localhost` or `https` pages. If the
   GM opens Foundry at a plain `http://192.168...` address, the module refuses to connect to a hub that has a token.
 - To rotate it, stop the hub, change the value to `null` (`"token": null`), start the hub, and copy the new value
-  into the module setting and every client.
+  into the module setting and every client. If the hub's token comes from the `FOUNDRY_MCP_TOKEN` environment variable
+  instead, change it there: the variable overrides `config.json`.
 
 ## What is not protected
 

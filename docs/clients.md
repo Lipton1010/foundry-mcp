@@ -8,9 +8,13 @@ Sanitized templates are in [`examples/`](../examples). Where a client can read t
 variable the templates do that, so the token is not copied into another file. Set it once, for example:
 
 ```
-setx FOUNDRY_MCP_TOKEN "<token>"        # Windows; open a new terminal afterwards
-export FOUNDRY_MCP_TOKEN="<token>"      # macOS / Linux
+setx FOUNDRY_HUB_TOKEN "<token>"        # Windows; open a new terminal afterwards
+export FOUNDRY_HUB_TOKEN="<token>"      # macOS / Linux
 ```
+
+The variable is deliberately not called `FOUNDRY_MCP_TOKEN`: the hub reads that name as an override for its own
+token, so setting it for your clients would silently pin the hub's token and defeat rotation. After rotating the
+token, update `FOUNDRY_HUB_TOKEN` and restart your clients.
 
 If you run the hub with `"token": ""`, leave out the `headers` / bearer settings below.
 
@@ -22,7 +26,7 @@ If you run the hub with `"token": ""`, leave out the `headers` / bearer settings
 | Codex CLI | 0.169.0 | streamable HTTP | yes (from env var) | **Tested end to end**, with and without token |
 | Cursor | 3.30.14, agent CLI 2026.11.13 | streamable HTTP | yes | **Tested end to end**, with and without token |
 | OpenCode | 2.3.0 | streamable HTTP (`remote`) | yes | **Tested end to end**, with and without token |
-| Antigravity | 2.32.1 (desktop app) | streamable HTTP (`serverUrl`) | yes, per documentation | **Not tested end to end.** Configuration follows Google's documentation |
+| Antigravity | none (2.32.1 was installed, not run) | streamable HTTP (`serverUrl`) | yes, per documentation | **Not tested end to end.** Configuration follows Google's documentation |
 
 "End to end" means the client listed the three tools, called `foundry_status` and got the test world back, and read
 `foundry_logs`. Every test used a read-only call.
@@ -34,13 +38,13 @@ claude mcp add --transport http --scope user foundry http://127.0.0.1:30123/mcp 
 ```
 
 `--scope user` makes it available in every project. For one project instead, put
-[`examples/claude-code.mcp.json`](../examples/claude-code.mcp.json) in the project as `.mcp.json`; `${FOUNDRY_MCP_TOKEN}`
+[`examples/claude-code.mcp.json`](../examples/claude-code.mcp.json) in the project as `.mcp.json`; `${FOUNDRY_HUB_TOKEN}`
 is expanded from the environment. Check with `claude mcp get foundry`.
 
 ## Codex
 
 ```
-codex mcp add foundry --url http://127.0.0.1:30123/mcp --bearer-token-env-var FOUNDRY_MCP_TOKEN
+codex mcp add foundry --url http://127.0.0.1:30123/mcp --bearer-token-env-var FOUNDRY_HUB_TOKEN
 ```
 
 This writes the block in [`examples/codex.config.toml`](../examples/codex.config.toml) to `~/.codex/config.toml`.
@@ -49,7 +53,7 @@ Codex reads the token from the named environment variable each time it starts. C
 ## Cursor
 
 Put [`examples/cursor.mcp.json`](../examples/cursor.mcp.json) at `~/.cursor/mcp.json` (all projects) or
-`<project>/.cursor/mcp.json` (one project). `${env:FOUNDRY_MCP_TOKEN}` is expanded from the environment, so start
+`<project>/.cursor/mcp.json` (one project). `${env:FOUNDRY_HUB_TOKEN}` is expanded from the environment, so start
 Cursor from a session that has it set.
 
 - The editor and the `agent` CLI read the same files.
@@ -64,9 +68,9 @@ OpenCode 2.x keeps servers under `mcp.servers`. Merge [`examples/opencode.json`]
 
 - `"type": "remote"` is streamable HTTP.
 - `"oauth": false` is needed because the hub uses a plain bearer token, not OAuth.
-- `{env:FOUNDRY_MCP_TOKEN}` is expanded from the environment.
+- `{env:FOUNDRY_HUB_TOKEN}` is expanded from the environment.
 - Check with `opencode mcp list`, run from the project folder.
-- OpenCode's background service reads the environment when it starts. After setting `FOUNDRY_MCP_TOKEN`, restart
+- OpenCode's background service reads the environment when it starts. After setting `FOUNDRY_HUB_TOKEN`, restart
   that service (or log out and in), or the header is sent empty and the hub answers 401.
 - OpenCode 1.x put server names directly under `mcp` and used `enabled`; that older shape is not tested here.
 

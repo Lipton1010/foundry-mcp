@@ -71,6 +71,8 @@ const tokenGenerated = config.token === undefined;
 if (tokenGenerated) {
   config.token = randomBytes(24).toString('base64url');
   try {
+    // Tighten an existing file first, so the token is never in a world-readable file even briefly.
+    if (existsSync(configFile)) chmodSync(configFile, 0o600);
     writeFileSync(configFile, `${JSON.stringify({ ...fileConfig, token: config.token }, null, 2)}\n`, { mode: 0o600 });
   } catch (error) {
     fail(`Cannot save a new token to ${configFile}: ${error.message}`);
@@ -448,10 +450,10 @@ const http = createServer(async (req, res) => {
     if (!validateHost(req, res)) return;
     // MCP clients are not browsers. A request carrying Origin comes from a web
     // page, and no web page should be able to run code in Foundry through us.
-    if (req.headers.origin) return res.writeHead(403).end('Browser origins are not allowed');
+    if (req.headers.origin !== undefined) return res.writeHead(403).end('Browser origins are not allowed');
     if (new URL(req.url, 'http://localhost').pathname !== '/mcp') return res.writeHead(404).end('Not found');
     // Before anything that depends on the request: a caller without the token learns nothing else.
-    if (config.token && !secretEquals(req.headers.authorization?.replace(/^Bearer\s+/i, ''), config.token)) {
+    if (config.token && !secretEquals(req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1], config.token)) {
       return res
         .writeHead(401, { 'www-authenticate': 'Bearer' })
         .end('This hub requires its token: send "Authorization: Bearer <token>", using the token from server/config.json.');
@@ -491,7 +493,10 @@ sockets.on('error', startupFailed); // the socket server re-emits the HTTP serve
 // Drop a tab that vanished without closing (sleep, crash), so a new one can connect.
 setInterval(() => {
   for (const ws of sockets.clients) {
-    if (!ws.isAlive) ws.terminate();
+    if (!ws.isAlive) {
+      ws.terminate();
+      continue;
+    }
     ws.isAlive = false;
     ws.ping();
   }

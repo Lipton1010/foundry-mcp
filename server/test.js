@@ -89,6 +89,7 @@ globalThis.WebSocket = class extends NodeWebSocket {
   constructor(url) {
     super(url, { headers: { origin: ORIGIN } });
     moduleSockets.push(this);
+    this.addEventListener('close', (event) => (this.closeCode = event.code));
   }
 };
 // Loads another copy of the real module script, as a second browser tab would.
@@ -203,6 +204,8 @@ try {
   await check('eval serializes awkward values', async () => {
     const reply = await evalCode(`const o = { big: 10n, when: new Date(0), set: new Set([1]) }; o.self = o; return o;`);
     assert.deepEqual(reply.result, { big: '10', when: '1970-01-01T00:00:00.000Z', set: [1], self: '[Circular]' });
+    const odd = await evalCode(`return { bad: new Date('nope'), bytes: new Uint8Array(1000), map: new Map([['a', 1]]), get boom() { throw new Error('getter'); } };`);
+    assert.deepEqual(odd.result, { bad: 'Invalid Date', bytes: '[Uint8Array 1000 bytes]', map: { a: 1 }, boom: '[Unreadable]' });
   });
 
   await check('a timeout returns promptly and aborts the signal given to the code', async () => {
@@ -294,8 +297,14 @@ try {
     console.error(secrets);
     console.warn('blob ' + 'A1b2'.repeat(12));
     console.warn('jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl');
+    console.warn('padded ' + 'Q1w2'.repeat(10) + 'ab== ' + '-'.repeat(60) + ' aVeryLongFunctionNameWithoutAnyDigitsInItAtAllReally');
     await sleep(200);
-    assert.deepEqual((await getLogs({ since: before })).entries.map((e) => e.text), [expected, 'blob [redacted]', 'jwt [redacted]']);
+    assert.deepEqual((await getLogs({ since: before })).entries.map((e) => e.text), [
+      expected,
+      'blob [redacted]',
+      'jwt [redacted]',
+      'padded [redacted] ' + '-'.repeat(60) + ' aVeryLongFunctionNameWithoutAnyDigitsInItAtAllReally',
+    ]);
     const reply = await evalCode(`console.log(${JSON.stringify(secrets)}); return 1;`);
     assert.deepEqual(reply.logs, [{ level: 'log', text: expected }]);
   });
@@ -384,9 +393,16 @@ try {
   });
 
   await check('malformed socket messages close that socket and leave the hub running', async () => {
-    for (const firstMessage of ['not json', '{"hello":{"world":{"toString":null}}}', '{"hello":null}', '[]', '{"hello":{"world":"w"}}']) {
-      const { outcome } = await Promise.race([rawSocket(PORT, ORIGIN, undefined, { firstMessage }), sleep(1500).then(() => ({ outcome: 'ignored' }))]);
-      assert.ok(['closed', 'ignored'].includes(outcome), `${firstMessage} -> ${outcome}`);
+    // Broken input closes the socket with 4002; input that is merely not a hello is ignored until the handshake deadline.
+    for (const [firstMessage, expected] of [
+      ['not json', 4002],
+      ['{"hello":{"world":{"toString":null}}}', 4002],
+      ['{"hello":{"world":"w"}}', 4002],
+      ['{"hello":null}', 'ignored'],
+      ['[]', 'ignored'],
+    ]) {
+      const result = await Promise.race([rawSocket(PORT, ORIGIN, undefined, { firstMessage }), sleep(1500).then(() => ({ outcome: 'ignored' }))]);
+      assert.equal(result.code ?? result.outcome, expected, firstMessage);
     }
     assert.equal((await evalCode('return 7')).result, 7);
   });
@@ -487,6 +503,7 @@ try {
     const before = moduleSockets.length;
     await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, ''); // real module, no token configured
     assert.equal(moduleSockets.length, before + 1);
+    assert.equal(moduleSockets.at(-1).closeCode, 4003, 'the module itself gave up, with the token-trouble code');
     assert.match((await callTool('foundry_status', {}, bearer(TOKEN))).content[0].text, /not connected/);
   });
 
@@ -502,24 +519,39 @@ try {
     const reply = await evalCode(`console.log('leaked ${TOKEN} here'); return 'second';`, {}, bearer(TOKEN));
     assert.equal(reply.result, 'second');
     assert.deepEqual(reply.logs, [{ level: 'log', text: 'leaked [redacted] here' }]);
+    // A signed cancel reaches the code it refers to, even though it is a much shorter message than the eval.
+    const padding = '/* ' + 'x'.repeat(200_000) + ' */';
+    const slow = await callTool('foundry_eval', { code: `${padding} await new Promise((r) => signal.addEventListener('abort', r)); globalThis.signedCancel = true;`, timeoutMs: 1000 }, bearer(TOKEN));
+    assert.match(slow.content[0].text, /Timed out/);
+    await sleep(300);
+    assert.equal((await evalCode('return globalThis.signedCancel === true', {}, bearer(TOKEN))).result, true);
   });
 
   // A stand-in hub, for behaviour the real hub never shows. `wrongProof` answers the challenge
   // without knowing the token; otherwise it completes the handshake honestly and then sends an
   // unsigned command, as something sitting between the module and the real hub would.
-  const fakeHub = async ({ wrongProof }) => {
+  const fakeHub = async ({ wrongProof, replay }) => {
     const fake = new WebSocketServer({ port: FAKE_PORT, host: '127.0.0.1' });
     const closed = new Promise((resolve) => {
       fake.on('connection', (ws) => {
+        let hello;
         ws.on('close', (code) => resolve(code));
         ws.on('message', (data) => {
           const msg = JSON.parse(data);
           if (msg.hello) {
+            hello = msg.hello;
             const proof = wrongProof ? '00'.repeat(32) : sign(TOKEN, `hub\n${bindingOf(msg.hello, 'hubnonce')}`).toString('hex');
             ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof } }));
           } else if (msg.proof) {
             ws.send(JSON.stringify({ welcome: true }));
-            ws.send(JSON.stringify({ id: 'x', method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
+            if (replay) {
+              // One genuinely signed command, sent twice.
+              const code = 'globalThis.replayed = (globalThis.replayed ?? 0) + 1;';
+              const key = sign(TOKEN, `session\n${bindingOf(hello, 'hubnonce')}`);
+              const command = JSON.stringify({ id: 'r', method: 'eval', params: { code }, seq: 1, mac: sign(key, `1\neval\nr\n${code}`).toString('hex') });
+              ws.send(command);
+              ws.send(command);
+            } else ws.send(JSON.stringify({ id: 'x', method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
           }
         });
       });
@@ -539,9 +571,15 @@ try {
     assert.equal(await fakeHub({ wrongProof: false }), 4003);
     assert.equal(globalThis.injected, undefined);
   });
+  await check('a module runs a signed command once and refuses its replay', async () => {
+    assert.equal(await fakeHub({ replay: true }), 4003);
+    assert.equal(globalThis.replayed, 1);
+  });
+
   await check('a module with a token refuses a hub that cannot prove it knows the token', async () => {
     // BARE_PORT has no token, as a program squatting on the hub port would not.
     await startModule(`ws://127.0.0.1:${BARE_PORT}/foundry`, TOKEN);
+    assert.equal(moduleSockets.at(-1).closeCode, 4003);
     assert.match((await callTool('foundry_status', {}, { port: BARE_PORT })).content[0].text, /not connected/);
   });
 
