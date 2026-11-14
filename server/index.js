@@ -6,13 +6,14 @@
 // The module only knows how to evaluate JavaScript and to forward warnings and
 // errors, so every tool is defined here.
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
-import { McpServer } from '@modelcontextprotocol/server';
-import { localhostHostValidation, NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+import { localhostHostValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import * as z from 'zod/v4';
 
 // ---------------------------------------------------------------------- config
@@ -45,7 +46,8 @@ const config = {
   // Browser origins allowed to connect as Foundry. Browsers cannot forge
   // Origin, so this keeps other web pages from posing as the Foundry tab.
   origins: list(env('ORIGINS')) ?? fileConfig.origins ?? ['http://localhost:30000', 'http://127.0.0.1:30000'],
-  token: env('TOKEN') ?? fileConfig.token,
+  // null, like a missing line, asks for a new token to be generated.
+  token: env('TOKEN') ?? fileConfig.token ?? undefined,
   // false removes foundry_eval, leaving clients able to read status and logs only.
   allowEval: env('ALLOW_EVAL') !== undefined ? { true: true, false: false }[env('ALLOW_EVAL').toLowerCase()] : (fileConfig.allowEval ?? true),
   logLimit: env('LOG_LIMIT') !== undefined ? Number(env('LOG_LIMIT')) : (fileConfig.logLimit ?? 1000),
@@ -57,9 +59,10 @@ if (!isStrings(config.origins)) fail('"origins" must be a list of page origins, 
 if (typeof config.allowEval !== 'boolean') fail('"allowEval" must be true or false (not in quotes).');
 if (!Number.isInteger(config.logLimit) || config.logLimit < 1) fail('"logLimit" must be a whole number of at least 1.');
 if (config.token !== undefined && typeof config.token !== 'string') {
-  fail('"token" must be text in quotes. Delete the line to have a new token generated, or use "" to run without one.');
+  fail('"token" must be text in quotes. Use null to have a new token generated, or "" to run without one.');
 }
-if (config.token && config.token.length < 16) fail('"token" is too short to be safe. Delete the line to have one generated.');
+if (config.token !== undefined) config.token = config.token.trim(); // the module trims its copy too
+if (config.token && config.token.length < 16) fail('"token" is too short to be safe. Set it to null to have one generated.');
 
 // The shared secret. Unset means "make one": a hub nobody configured should not
 // be open to every program and every account on the computer. An explicit
@@ -189,9 +192,16 @@ function queryLogs({ since = 0, level = 'info', package: pkg, contains, limit = 
 // ---------------------------------------------------------------- Foundry side
 
 let foundry = null; // { ws, hello } for the one connected, authenticated GM tab
+let refusedWorldAt = 0; // when a world that is not on the allowlist last tried to connect
 const pending = new Map(); // request id -> { resolve, reject, timer }
 
-function callFoundry(code, timeoutMs = 30_000) {
+function callFoundry(code, timeoutMs = 30_000, signal) {
+  if (!foundry && Date.now() - refusedWorldAt < 60_000) {
+    throw new Error(
+      "The world open in Foundry is not on this hub's allowlist, so the hub refused its connection and no code will be run in it. " +
+        'The person running the hub can allow it by adding its id to "worlds" in server/config.json and restarting the hub.'
+    );
+  }
   if (!foundry) {
     throw new Error(
       'Foundry is not connected. Launch Foundry, open a world with the "Foundry MCP" module enabled, and log in as a GM. ' +
@@ -211,16 +221,25 @@ function callFoundry(code, timeoutMs = 30_000) {
   if (pending.size >= MAX_PENDING) {
     throw new Error(`${MAX_PENDING} evaluations are already running in Foundry. Wait for some to finish or time out.`);
   }
+  if (signal?.aborted) throw new Error('The request was cancelled before it started.');
   const id = randomUUID();
   const { ws } = foundry;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      // JavaScript cannot be stopped from outside; this only aborts the
-      // `signal` the code was given, for code that chooses to honour it.
+    // Give up on a call: free its slot here and tell the module. JavaScript
+    // cannot be stopped from outside; this only aborts the `signal` the code
+    // was given, for code that chooses to honour it.
+    const abandon = (message) => {
+      if (!pending.delete(id)) return;
+      clearTimeout(timer);
       if (ws.readyState === ws.OPEN) sendCommand(ws, id, 'cancel');
-      reject(new Error(`Timed out after ${timeoutMs} ms. The code may still be running in Foundry; only code that checks \`signal.aborted\` stops.`));
-    }, timeoutMs);
+      reject(new Error(message));
+    };
+    const timer = setTimeout(
+      () => abandon(`Timed out after ${timeoutMs} ms. The code may still be running in Foundry; only code that checks \`signal.aborted\` stops.`),
+      timeoutMs
+    );
+    // The MCP client disconnected or cancelled: nobody is waiting for the answer.
+    signal?.addEventListener('abort', () => abandon('The client cancelled the request.'), { once: true });
     pending.set(id, { resolve, reject, timer });
     sendCommand(ws, id, 'eval', code);
   });
@@ -292,11 +311,18 @@ function onHandshakeMessage(ws, msg) {
 }
 
 function register(ws) {
+  // A world that is not allowed never becomes the connected world: it cannot
+  // block the test world's tab, and its id and logs stay out of the hub.
+  if (!worldAllowed(ws.hello.world)) {
+    refusedWorldAt = Date.now();
+    console.error(`[foundry-mcp] Refused world "${ws.hello.world}": it is not in "worlds" in the hub configuration.`);
+    return ws.close(4004, 'This world is not on the hub allowlist');
+  }
   if (foundry) return ws.close(4001, 'Another GM tab is already connected');
   foundry = { ws, hello: ws.hello };
-  const allowed = worldAllowed(foundry.hello.world);
-  console.error(`[foundry-mcp] Foundry connected: world=${foundry.hello.world} (${allowed ? 'allowed' : 'NOT on the allowlist; code will be refused'})`);
-  if (allowed) addBridgeLog(foundry.hello, 'Foundry connected (new page session; earlier entries are from before the reload)');
+  refusedWorldAt = 0;
+  console.error(`[foundry-mcp] Foundry connected: world=${foundry.hello.world}`);
+  addBridgeLog(foundry.hello, 'Foundry connected (new page session; earlier entries are from before the reload)');
   ws.send(JSON.stringify({ welcome: true }));
 }
 
@@ -310,10 +336,12 @@ const asText = (value) => {
   return text;
 };
 
+const requestScope = new AsyncLocalStorage(); // the AbortSignal of the HTTP request being served
+
 async function runTool(code, timeoutMs) {
   const logSeq = lastSeq;
   try {
-    const reply = await callFoundry(code, timeoutMs);
+    const reply = await callFoundry(code, timeoutMs, requestScope.getStore());
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
     return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, logSeq }) }], isError: !reply.ok };
@@ -405,7 +433,15 @@ function buildMcpServer() {
 
 // ------------------------------------------------------------------ HTTP + WS
 
+
 const validateHost = localhostHostValidation(); // blocks DNS-rebinding requests
+
+// Serves the 2026-07-28 MCP revision and, for older clients, the stateless
+// 2025 style with its initialize handshake. Either way: a fresh server per request.
+const serveMcp = toNodeHandler(
+  createMcpHandler(() => buildMcpServer(), { onerror: (error) => console.error('[foundry-mcp] MCP error:', error.message) }),
+  { onerror: (error) => console.error('[foundry-mcp] request failed:', error.message), maxRequestBodySize: MAX_REQUEST_BYTES }
+);
 
 const http = createServer(async (req, res) => {
   try {
@@ -414,28 +450,34 @@ const http = createServer(async (req, res) => {
     // page, and no web page should be able to run code in Foundry through us.
     if (req.headers.origin) return res.writeHead(403).end('Browser origins are not allowed');
     if (new URL(req.url, 'http://localhost').pathname !== '/mcp') return res.writeHead(404).end('Not found');
-    if (req.method !== 'POST') return res.writeHead(405, { allow: 'POST' }).end('Use POST');
+    // Before anything that depends on the request: a caller without the token learns nothing else.
     if (config.token && !secretEquals(req.headers.authorization?.replace(/^Bearer\s+/i, ''), config.token)) {
       return res
         .writeHead(401, { 'www-authenticate': 'Bearer' })
         .end('This hub requires its token: send "Authorization: Bearer <token>", using the token from server/config.json.');
     }
+    if (req.method !== 'POST') return res.writeHead(405, { allow: 'POST' }).end('Use POST');
     if (Number(req.headers['content-length']) > MAX_REQUEST_BYTES) return res.writeHead(413).end('Request too large');
-    // Stateless: a fresh MCP server and transport per request.
-    const server = buildMcpServer();
-    const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    res.on('close', () => {
-      transport.close();
-      server.close();
-    });
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
+    // If the client goes away, stop waiting on Foundry for it and free its slot.
+    const gone = new AbortController();
+    res.on('close', () => gone.abort());
+    await requestScope.run(gone.signal, () => serveMcp(req, res));
   } catch (error) {
     console.error('[foundry-mcp] request failed:', error);
     if (!res.headersSent) res.writeHead(500);
     res.end();
   }
 });
+
+const startupFailed = (error) => {
+  console.error(
+    error.code === 'EADDRINUSE'
+      ? `[foundry-mcp] Port ${config.port} is already in use. Is another hub running? Stop it, or set "port" in config.json.`
+      : `[foundry-mcp] ${error.message}`
+  );
+  process.exit(1);
+};
+http.on('error', startupFailed);
 
 const sockets = new WebSocketServer({
   server: http,
@@ -444,6 +486,7 @@ const sockets = new WebSocketServer({
   verifyClient: ({ origin }) => config.origins.includes(origin),
 });
 sockets.on('connection', onFoundryConnection);
+sockets.on('error', startupFailed); // the socket server re-emits the HTTP server's errors
 
 // Drop a tab that vanished without closing (sleep, crash), so a new one can connect.
 setInterval(() => {
@@ -453,15 +496,6 @@ setInterval(() => {
     ws.ping();
   }
 }, 15_000).unref();
-
-http.on('error', (error) => {
-  console.error(
-    error.code === 'EADDRINUSE'
-      ? `[foundry-mcp] Port ${config.port} is already in use. Is another hub running? Stop it, or set "port" in config.json.`
-      : `[foundry-mcp] ${error.message}`
-  );
-  process.exit(1);
-});
 
 http.listen(config.port, '127.0.0.1', () => {
   const say = (text) => console.error(`[foundry-mcp] ${text}`);

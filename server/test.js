@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
 const PORT = 30199; // no token, small log buffer
 const TOKEN_PORT = 30198; // token required
@@ -38,7 +39,7 @@ function startHub(env) {
 }
 const hubs = [
   startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_LOG_LIMIT: 60 }),
-  startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: TOKEN }),
+  startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: `${TOKEN} ` }), // trailing space, as a shell can add
   startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
   startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
 ];
@@ -274,6 +275,9 @@ try {
       'Cookie: session=abc123; refresh=anotherSecret456',
       '{"token":"abcdefghijklmnopqrstuvwxyzABCDEF","name":"kept","apiKey":"k-123"}',
       'sent with Bearer abcdefgh12345678 ok',
+      'client_secret=hunter22 openai_api_key=sk-short123 hub_token=abc12345',
+      'https://gm:secretpass@foundry.example/api',
+      '{"headers":{"Authorization":"Bearer tok12345678"},"status":502,"reason":"Bad Gateway"}',
     ].join('\n');
     const expected = [
       'login failed password=[redacted] api_key: "[redacted]" cobalt-token=[redacted] token=[redacted] Token Goblin is fine',
@@ -283,6 +287,9 @@ try {
       'Cookie: [redacted]',
       '{"token":"[redacted]","name":"kept","apiKey":"[redacted]"}',
       'sent with Bearer [redacted] ok',
+      'client_secret=[redacted] openai_api_key=[redacted] hub_token=[redacted]',
+      'https://gm:[redacted]@foundry.example/api',
+      '{"headers":{"Authorization":"[redacted]"},"status":502,"reason":"Bad Gateway"}',
     ].join('\n');
     console.error(secrets);
     console.warn('blob ' + 'A1b2'.repeat(12));
@@ -362,6 +369,14 @@ try {
       request({ host: '127.0.0.1', port: PORT, path: '/mcp', method: 'POST', headers: { host: 'attacker.example' } }, (res) => resolve(res.statusCode)).end('{}')
     );
     assert.equal(rebound, 403);
+    // Without the token a caller learns nothing about the endpoint, not even which methods it serves.
+    assert.equal((await mcp('tools/list', {}, { httpMethod: 'GET', port: TOKEN_PORT })).status, 401);
+    const tooBig = await new Promise((resolve) =>
+      request({ host: '127.0.0.1', port: PORT, path: '/mcp', method: 'POST', headers: { 'content-length': 5_000_000 } }, (res) => resolve(res.statusCode))
+        .on('error', () => resolve('reset'))
+        .end('{}')
+    );
+    assert.equal(tooBig, 413);
   });
 
   await check('a page from another origin cannot pose as Foundry', async () => {
@@ -380,6 +395,39 @@ try {
     const init = await mcp('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
     assert.equal(init.result.serverInfo.name, 'foundry');
     assert.match(init.result.instructions, /foundry_status first/);
+  });
+
+  await check('the official MCP client connects, lists the tools and calls one', async () => {
+    const client = new Client({ name: 'foundry-mcp-test', version: '1.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`)));
+    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['foundry_status', 'foundry_eval', 'foundry_logs']);
+    const reply = await client.callTool({ name: 'foundry_eval', arguments: { code: 'return 6 * 7' } });
+    assert.equal(JSON.parse(reply.content[0].text).result, 42);
+    await client.close();
+  });
+
+  await check('a client that disconnects stops holding a slot and the code is told to stop', async () => {
+    const gone = new AbortController();
+    const call = fetch(`http://127.0.0.1:${PORT}/mcp`, {
+      method: 'POST',
+      signal: gone.signal,
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'foundry_eval', arguments: { code: `await new Promise((r) => signal.addEventListener('abort', r)); globalThis.clientGone = true;`, timeoutMs: 60_000 } } }),
+    }).catch(() => 'aborted');
+    await sleep(400);
+    gone.abort();
+    assert.equal(await call, 'aborted');
+    await sleep(400);
+    assert.equal((await evalCode('return globalThis.clientGone === true')).result, true);
+  });
+
+  await check('a call in flight when Foundry disconnects fails at once instead of timing out', async () => {
+    const call = callTool('foundry_eval', { code: 'await new Promise(() => {});', timeoutMs: 60_000 });
+    await sleep(300);
+    moduleSockets.at(-1).close();
+    assert.match((await call).content[0].text, /disconnected before replying/);
+    await sleep(6000); // reconnects
+    assert.equal((await evalCode('return 3')).result, 3);
   });
 
   await check('logs survive a Foundry disconnect, stay readable, and are bounded by markers', async () => {
@@ -419,6 +467,11 @@ try {
     console.error('private thing from the live campaign');
     await sleep(200);
     assert.equal((await getLogs({ contains: 'private thing' })).entries.length, 0);
+    assert.equal((await getLogs()).world, null, 'its id is not reported to clients');
+    // It did not take the one connection slot: the test world's tab can still connect.
+    const testWorldTab = await rawSocket(PORT, ORIGIN);
+    assert.equal(testWorldTab.outcome, 'welcomed');
+    testWorldTab.ws.close();
     game.world.id = 'test-world';
   });
 
@@ -451,19 +504,19 @@ try {
     assert.deepEqual(reply.logs, [{ level: 'log', text: 'leaked [redacted] here' }]);
   });
 
-  await check('a module refuses a command the hub did not sign', async () => {
-    // A stand-in hub that completes the handshake honestly, then sends an unsigned command,
-    // as something sitting between the module and the real hub would.
+  // A stand-in hub, for behaviour the real hub never shows. `wrongProof` answers the challenge
+  // without knowing the token; otherwise it completes the handshake honestly and then sends an
+  // unsigned command, as something sitting between the module and the real hub would.
+  const fakeHub = async ({ wrongProof }) => {
     const fake = new WebSocketServer({ port: FAKE_PORT, host: '127.0.0.1' });
     const closed = new Promise((resolve) => {
       fake.on('connection', (ws) => {
-        let hello;
         ws.on('close', (code) => resolve(code));
         ws.on('message', (data) => {
           const msg = JSON.parse(data);
           if (msg.hello) {
-            hello = msg.hello;
-            ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof: sign(TOKEN, `hub\n${bindingOf(hello, 'hubnonce')}`).toString('hex') } }));
+            const proof = wrongProof ? '00'.repeat(32) : sign(TOKEN, `hub\n${bindingOf(msg.hello, 'hubnonce')}`).toString('hex');
+            ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof } }));
           } else if (msg.proof) {
             ws.send(JSON.stringify({ welcome: true }));
             ws.send(JSON.stringify({ id: 'x', method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
@@ -472,11 +525,20 @@ try {
       });
     });
     await startModule(`ws://127.0.0.1:${FAKE_PORT}/foundry`, TOKEN);
-    assert.equal(await closed, 4003);
+    const code = await closed;
+    await new Promise((resolve) => fake.close(resolve));
+    return code;
+  };
+
+  await check('a module refuses a hub whose proof is wrong, and sends it nothing more', async () => {
+    assert.equal(await fakeHub({ wrongProof: true }), 4003);
     assert.equal(globalThis.injected, undefined);
-    fake.close();
   });
 
+  await check('a module refuses a command the hub did not sign', async () => {
+    assert.equal(await fakeHub({ wrongProof: false }), 4003);
+    assert.equal(globalThis.injected, undefined);
+  });
   await check('a module with a token refuses a hub that cannot prove it knows the token', async () => {
     // BARE_PORT has no token, as a program squatting on the hub port would not.
     await startModule(`ws://127.0.0.1:${BARE_PORT}/foundry`, TOKEN);
@@ -498,7 +560,7 @@ try {
     assert.equal((await toolNames(auth)).length, 3);
     // An authenticated module in a world, with nothing on the allowlist: connected, but no code runs.
     await startModule(`ws://127.0.0.1:${FRESH_PORT}/foundry`, generated);
-    assert.equal((await getLogsFrom(auth)).connected, true);
+    assert.equal((await getLogsFrom(auth)).connected, false, 'a world that is not allowed never becomes the connected world');
     const refused = await callTool('foundry_eval', { code: 'globalThis.ranAnyway = true; return 1' }, auth);
     assert.match(refused.content[0].text, /not on this hub's allowlist/);
     assert.equal(globalThis.ranAnyway, undefined);
@@ -521,7 +583,7 @@ try {
     };
     for (const [name, content, expected] of [
       ['eval-string.json', '{ "token": "", "allowEval": "false" }', /"allowEval" must be true or false/],
-      ['token-null.json', '{ "token": null }', /"token" must be text/],
+      ['token-number.json', '{ "token": 5 }', /"token" must be text/],
       ['token-short.json', '{ "token": "abc" }', /too short/],
       ['limit.json', '{ "token": "", "logLimit": "not-a-number" }', /"logLimit" must be/],
       ['worlds.json', '{ "token": "", "worlds": "my-world" }', /"worlds" must be a list/],
@@ -533,6 +595,27 @@ try {
     }
     assert.match(start('env.json', '{ "token": "" }', { FOUNDRY_MCP_ALLOW_EVAL: 'maybe' }).stderr, /"allowEval" must be true or false/);
     assert.match(start('env.json', undefined, { FOUNDRY_MCP_PORT: 'abc' }).stderr, /"port" must be/);
+  });
+
+  await check('starting a second hub on a port in use explains the problem', async () => {
+    const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
+    const run = spawnSync(process.execPath, ['index.js'], {
+      cwd: import.meta.dirname,
+      env: { ...base, FOUNDRY_MCP_CONFIG: join(tmp, 'none.json'), FOUNDRY_MCP_PORT: String(PORT), FOUNDRY_MCP_TOKEN: '' },
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /Port 30199 is already in use/);
+    assert.doesNotMatch(run.stderr, /Unhandled 'error' event/);
+  });
+
+  await check('a player\'s browser never connects', async () => {
+    const before = moduleSockets.length;
+    game.user.isGM = false;
+    await startModule(`ws://127.0.0.1:${BARE_PORT}/foundry`, '');
+    game.user.isGM = true;
+    assert.equal(moduleSockets.length, before);
   });
 
   await check('code that outlives its timeout still counts against the limit, in the browser', async () => {

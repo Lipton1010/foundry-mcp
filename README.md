@@ -109,8 +109,9 @@ example.
    cd foundry-mcp/server
    npm ci
    ```
-2. **Make a test world.** In Foundry's setup screen, duplicate your world's folder under `Data/worlds` (or create a
-   new world). Never point this at a campaign you cannot restore.
+2. **Make a test world.** Create a new world in Foundry's setup screen, or, with Foundry shut down, copy your
+   world's folder under `Data/worlds` to a new folder name and change `id` in the copy's `world.json` to that
+   same name. Never point this at a campaign you cannot restore.
 3. **Configure the hub.** Still in the `server` folder, copy `config.example.json` to `config.json` and replace `my-test-world-id`
    with the test world's id (its folder name under `Data/worlds`). With no worlds listed the hub refuses to run code.
 4. **Start the hub** with `npm start` and leave it running. On first start it generates a token and saves it in
@@ -158,7 +159,8 @@ not Foundry. After setup, check your test world from your agent:
    so later, `foundry_logs` with `since` set to the returned `logSeq` shows the entry with `fromEval: true`.
 4. Reload the world (F5). `foundry_status` works again within about five seconds, and `foundry_logs` still shows the
    earlier entries followed by "Foundry disconnected" and "Foundry connected" markers.
-5. From a terminal, `curl -X POST http://127.0.0.1:30123/mcp` answers `401` (token required).
+5. From a terminal, `curl -i -X POST http://127.0.0.1:30123/mcp` answers `401` (token required). In Windows
+   PowerShell 5 use `curl.exe`.
 
 ## Logs
 
@@ -214,7 +216,7 @@ Behaviour worth knowing:
 | `... token checks need a secure page` | Foundry is open at a plain `http://` address other than localhost. Open it at `http://localhost:<port>`, or serve it over https. |
 | HTTP 401 from `/mcp` | The client is not sending `Authorization: Bearer <token>`. See [docs/clients.md](docs/clients.md). |
 | HTTP 403 from `/mcp` | The request carried an `Origin` header (a browser) or a non-loopback `Host`. Use `127.0.0.1` or `localhost` in the client's URL. |
-| "World ... is not on this hub's allowlist" | Add the id to `worlds` in `server/config.json` and restart the hub, if you really mean to. |
+| "The world open in Foundry is not on this hub's allowlist" | The hub refused that world's connection and prints its id in the hub window. Add the id to `worlds` in `server/config.json` and restart the hub, if you really mean to. The module retries every 30 s. |
 | "module ... is out of date" | Module and hub versions differ. Update the module folder and reload the world. |
 | Hub prints nothing on world load | Foundry is served from another address (reverse proxy, hosting service, different port). Set `origins` to the exact origin in the address bar. |
 | Calls time out, or automation finishes a minute late | `windowVisibility` is `hidden`: the Foundry window is minimized or covered and the browser is throttling its timers. Bring it to the front. |
@@ -237,8 +239,8 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 
 ### Tested against a real world
 
-- `foundry_status`, `foundry_eval` and `foundry_logs` from Claude Code, Codex, Cursor and OpenCode, with and without
-  a hub token.
+- `foundry_status` and `foundry_logs` from Claude Code, Codex, Cursor and OpenCode, with and without a hub token.
+  `foundry_eval` from Claude Code and Codex; the Cursor and OpenCode runs were kept to read-only calls.
 - Reading and writing document flags, and automatic reconnection after a world reload.
 - Logs: start-up warnings from other modules, an asynchronous error raised after `foundry_eval` returned, and a real
   midi-qol workflow whose on-use macro threw, attributed to `midi-qol`.
@@ -246,19 +248,22 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - The token handshake with the real module: the correct token connects, a wrong token is refused, and a hub reached
   without the bearer token answers 401.
 
-### Tested in simulation only (`npm test`, 36 checks)
+### Tested in simulation only (`npm test`, 42 checks)
 
 Serialization and its size limits, timeouts and the abort signal, the concurrency caps, flood limits and retention,
 origin, Host and method checks, malformed socket messages, a second GM tab, the world allowlist (including an empty
 one), a relay altering the reported world, a module refusing an unsigned command or a hub that cannot prove it knows
-the token, configuration validation, `allowEval: false`, and token generation with file permissions.
+the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects,
+the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
+user, `allowEval: false`, and token generation with file permissions.
 
 ### Not tested
 
 - **Antigravity** end to end. Its configuration format is taken from Google's documentation.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, Linux (CI runs the simulated tests on Linux), and
-  browsers other than the Foundry desktop app.
+  browsers other than the Foundry desktop app. Log attribution reads Chromium-style stack traces; Firefox and
+  Safari formats are parsed but have never been run.
 - Foundry behind HTTPS, a reverse proxy or a hosting service. Browsers may block a secure page from reaching
   `ws://127.0.0.1`, and the GM's browser must run on the same computer as the hub.
 - Several GM tabs or several worlds at once.

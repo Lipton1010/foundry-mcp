@@ -241,36 +241,47 @@ function describeStack(stack) {
   const frames = String(stack ?? '')
     .split('\n')
     .map((frame) => frame.trim().replaceAll(location.origin, ''))
-    .filter((frame) => frame.startsWith('at '));
+    .filter((frame) => frame.startsWith('at ') || /@.*:\d+:\d+$/.test(frame)); // V8, or Firefox and Safari
   const own = `/modules/${MODULE_ID}/`;
   const packages = frames
     .map((frame) => !frame.includes(own) && frame.match(/\/(?:modules|systems)\/([^/]+)\//)?.[1])
     .filter(Boolean)
-    .map(decodeURIComponent);
+    .map(safeDecode);
   return {
     packages: [...new Set(packages)].slice(0, 10),
     fromEval: frames.some((frame) => frame.includes(EVAL_SOURCE)),
-    stack: frames.filter((frame) => !frame.includes(`${own}scripts/bridge.js`) || frame.includes(EVAL_SOURCE)).slice(0, 8).map(redact),
+    stack: frames.filter((frame) => !frame.includes(`${own}scripts/bridge.js`) || frame.includes(EVAL_SOURCE)).slice(0, 8).map((frame) => redact(frame, false)),
   };
+}
+
+function safeDecode(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
 }
 
 // Best-effort removal of credentials before a log line leaves the browser.
 // "token" alone is only treated as a credential in `token=...` or as a quoted
 // key, because in a tabletop tool "Token: Goblin" is ordinary text.
-function redact(text) {
+function redact(text, opaque = true) {
   if (hubToken) text = text.split(hubToken).join('[redacted]');
-  return text
-    // Header values run to the end of the line: "Authorization: Basic ...", "Cookie: a=1; b=2".
-    .replace(/\b((?:proxy-)?authorization|(?:set-)?cookie)(["']?\s*[:=]\s*)[^\n]+/gi, '$1$2[redacted]')
+  text = text
+    // JSON-style: any quoted key that names a credential, such as {"token":"..."} or 'Authorization': '...'.
+    .replace(/(["'][\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization|cookie)[\w-]*["']\s*:\s*["'])[^"']+/gi, '$1[redacted]')
+    // Header lines: the value runs to the end of the line ("Authorization: Basic ...", "Cookie: a=1; b=2").
+    // Not applied to quoted keys, which the rule above handled without eating the rest of the object.
+    .replace(/\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*[:=]\s*)[^\n]+/gi, '$1$2[redacted]')
     .replace(/\b(bearer\s+)[\w.~+/=-]{8,}/gi, '$1[redacted]')
-    // JSON-style: any quoted key that names a credential, such as {"token":"..."} or 'apiKey': '...'.
-    .replace(/(["'][\w-]*(?:token|secret|password|passwd|api[-_]?key)[\w-]*["']\s*:\s*["'])[^"']+/gi, '$1[redacted]')
-    .replace(/\b(pass(?:word|wd)|secret|api[-_ ]?key|(?:access|auth|api|refresh|session|cobalt)[-_ ]?token|token(?==))(\s*["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
+    // key=value and key: value, including prefixed names such as client_secret or openai_api_key.
+    .replace(/\b([\w-]*(?:pass(?:word|wd)|secret|api[-_ ]?key)[\w-]*|(?:access|auth|api|refresh|session|cobalt|id|client|hub)[-_ ]?token|[\w-]*token(?==))(\s*["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
     .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
-    .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]')
-    .replace(/\b[A-Za-z0-9_+=-]{40,}\b/g, '[redacted]');
+    .replace(/(:\/\/[^/@\s:]+:)[^@\s/]+@/g, '$1[redacted]@') // https://user:password@host
+    .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]');
+  // Long opaque strings. Skipped for stack frames, where long function names are normal.
+  return opaque ? text.replace(/\b[A-Za-z0-9_+=-]{40,}\b/g, '[redacted]') : text;
 }
-
 function formatLogArg(arg, withStack) {
   if (typeof arg === 'string') return arg;
   if (arg instanceof Error) return withStack ? (arg.stack ?? arg.message) : `${arg.name}: ${arg.message}`;
@@ -303,14 +314,27 @@ function serialize(value) {
     if (v === null || typeof v !== 'object') return v;
     if (v instanceof Error) return walk({ name: v.name, message: v.message, stack: v.stack }, depth + 1);
     if (v instanceof Date) return v.toISOString();
+    if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return `[${v.constructor.name} ${v.byteLength} bytes]`;
+    if (v instanceof Map) {
+      // Checked before toObject(): a Foundry collection's toObject() would clone every document in it
+      // before any limit applied. Walking it entry by entry stops when the budget does.
+      const entries = {};
+      for (const [key, item] of v) {
+        if (budget <= 0) {
+          entries['[Truncated]'] = `${v.size - Object.keys(entries).length} more entries omitted`;
+          break;
+        }
+        entries[String(key)] = walk(item, depth + 1);
+      }
+      return entries;
+    }
     if (typeof v.toObject === 'function') {
       try {
         v = v.toObject();
       } catch {
         return String(v);
       }
-    } else if (v instanceof Map) v = Object.fromEntries(v);
-    else if (v instanceof Set) v = [...v];
+    } else if (v instanceof Set) v = [...v];
     if (v === null || typeof v !== 'object') return v;
     if (ancestors.has(v)) return '[Circular]';
     if (depth > 12) return '[MaxDepth]';

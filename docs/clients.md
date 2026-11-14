@@ -66,6 +66,8 @@ OpenCode 2.x keeps servers under `mcp.servers`. Merge [`examples/opencode.json`]
 - `"oauth": false` is needed because the hub uses a plain bearer token, not OAuth.
 - `{env:FOUNDRY_MCP_TOKEN}` is expanded from the environment.
 - Check with `opencode mcp list`, run from the project folder.
+- OpenCode's background service reads the environment when it starts. After setting `FOUNDRY_MCP_TOKEN`, restart
+  that service (or log out and in), or the header is sent empty and the hub answers 401.
 - OpenCode 1.x put server names directly under `mcp` and used `enabled`; that older shape is not tested here.
 
 ## Antigravity
@@ -79,6 +81,9 @@ Put [`examples/antigravity.mcp_config.json`](../examples/antigravity.mcp_config.
   supported.
 - The documentation describes no environment-variable expansion in `headers`, so the token has to be written into
   the file. Keep that file out of version control.
+- The surest way to find the file your version reads is Manage MCP Servers ► View raw config inside Antigravity.
+  Older releases used `~/.gemini/antigravity/mcp_config.json`.
+- Prefer the global file. A workspace file puts the token in your project folder, where it is easy to commit.
 - Restart the server from Customizations ► Installed ► MCP Servers after editing.
 - Agent sessions started by other tools on top of Antigravity may not load workspace MCP servers at all. One such
   harness was tried and exposed none.
@@ -97,4 +102,5 @@ curl -s -X POST http://127.0.0.1:30123/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
-A list of three tools means the hub and token are right. `401` means the token is missing or wrong.
+A list of three tools means the hub and token are right. `401` means the token is missing or wrong. The command
+is written for bash; in Windows PowerShell 5 use `curl.exe` and put it on one line.

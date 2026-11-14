@@ -28,3 +28,9 @@ graft/
 /opencode.jsonc
 .mcp.json
 .vscode/
+
+# More client config locations and Foundry world databases
+.opencode/
+.agent/
+mcp_config.json
+*.ldb
