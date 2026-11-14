@@ -5,8 +5,8 @@
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { createHmac } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHmac, randomUUID } from 'node:crypto';
+import { chmodSync, copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -94,7 +94,7 @@ globalThis.WebSocket = class extends NodeWebSocket {
 };
 // Loads another copy of the real module script, as a second browser tab would.
 let copies = 0;
-async function startModule(url, token) {
+async function startModule(url, token, beforeReady) {
   settings['foundry-mcp.url'] = url;
   settings['foundry-mcp.token'] = token;
   // A real second instance needs a second file: Node reuses the module for a URL that differs only by query.
@@ -104,6 +104,7 @@ async function startModule(url, token) {
   await import(pathToFileURL(copy).href);
   assert.notEqual(hooks.ready, registered, 'a separate module instance was loaded');
   hooks.init();
+  beforeReady?.();
   hooks.ready();
   await sleep(600);
 }
@@ -113,7 +114,7 @@ const sign = (key, text) => createHmac('sha256', key).update(text).digest();
 const bindingOf = (hello, hubNonce) => [hello.nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
 function rawSocket(port, origin, token, { firstMessage, claimedWorld } = {}) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
-  const hello = { protocol: 4, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc' };
+  const hello = { protocol: 5, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc' };
   return new Promise((resolve) => {
     ws.addEventListener('open', () => ws.send(firstMessage ?? JSON.stringify({ hello: { ...hello, world: claimedWorld ?? hello.world } })));
     ws.addEventListener('message', (event) => {
@@ -201,11 +202,20 @@ try {
     assert.equal(payload(result).error.message, 'boom');
   });
 
+  await check('a thrown value that cannot be read is reported and does not leak a slot', async () => {
+    const hostile = `throw { get name() { throw new Error('no'); }, get message() { throw new Error('no'); } };`;
+    const replies = await Promise.all(Array.from({ length: 20 }, () => callTool('foundry_eval', { code: hostile })));
+    assert.ok(replies.every((r) => r.isError && payload(r).error.name === '[Unreadable]'));
+    assert.equal((await evalCode('return 5')).result, 5);
+  });
+
   await check('eval serializes awkward values', async () => {
     const reply = await evalCode(`const o = { big: 10n, when: new Date(0), set: new Set([1]) }; o.self = o; return o;`);
     assert.deepEqual(reply.result, { big: '10', when: '1970-01-01T00:00:00.000Z', set: [1], self: '[Circular]' });
     const odd = await evalCode(`return { bad: new Date('nope'), bytes: new Uint8Array(1000), map: new Map([['a', 1]]), get boom() { throw new Error('getter'); } };`);
     assert.deepEqual(odd.result, { bad: 'Invalid Date', bytes: '[Uint8Array 1000 bytes]', map: { a: 1 }, boom: '[Unreadable]' });
+    const loops = await evalCode(`const m = new Map(); m.set('self', m); const s = new Set(); s.add(s); return { m, s, viaToObject: { toObject: () => 'plain' } };`);
+    assert.deepEqual(loops.result, { m: { self: '[Circular]' }, s: ['[Circular]'], viaToObject: 'plain' });
   });
 
   await check('a timeout returns promptly and aborts the signal given to the code', async () => {
@@ -219,9 +229,13 @@ try {
   });
 
   await check('concurrent evaluations are answered separately and capped', async () => {
-    const replies = await Promise.all(
-      Array.from({ length: 17 }, (_, i) => callTool('foundry_eval', { code: `await new Promise((r) => setTimeout(r, 800)); return ${i};` }))
-    );
+    // Each call waits at a gate, so all sixteen are provably still running when the seventeenth arrives.
+    globalThis.gate = [];
+    const calls = Array.from({ length: 17 }, (_, i) => callTool('foundry_eval', { code: `await new Promise((r) => globalThis.gate.push(r)); return ${i};` }));
+    await Promise.race(calls); // the refusal is the only one that can finish
+    assert.equal(globalThis.gate.length, 16);
+    globalThis.gate.forEach((open) => open());
+    const replies = await Promise.all(calls);
     const refused = replies.filter((r) => r.isError);
     assert.equal(refused.length, 1);
     assert.match(refused[0].content[0].text, /already running/);
@@ -281,6 +295,10 @@ try {
       'client_secret=hunter22 openai_api_key=sk-short123 hub_token=abc12345',
       'https://gm:secretpass@foundry.example/api',
       '{"headers":{"Authorization":"Bearer tok12345678"},"status":502,"reason":"Bad Gateway"}',
+      'password="two word secret" then more',
+      `{"password":"abc'restOfSecret","note":"an \\"escaped\\" value"}`,
+      '{"tokenName":"Goblin","tokenId":"abc123"} Secret: a hidden door',
+      'time: password=afterAnotherKey',
     ].join('\n');
     const expected = [
       'login failed password=[redacted] api_key: "[redacted]" cobalt-token=[redacted] token=[redacted] Token Goblin is fine',
@@ -293,6 +311,10 @@ try {
       'client_secret=[redacted] openai_api_key=[redacted] hub_token=[redacted]',
       'https://gm:[redacted]@foundry.example/api',
       '{"headers":{"Authorization":"[redacted]"},"status":502,"reason":"Bad Gateway"}',
+      'password="[redacted]" then more',
+      `{"password":"[redacted]","note":"an \\"escaped\\" value"}`,
+      '{"tokenName":"Goblin","tokenId":"abc123"} Secret: a hidden door',
+      'time: password=[redacted]',
     ].join('\n');
     console.error(secrets);
     console.warn('blob ' + 'A1b2'.repeat(12));
@@ -332,6 +354,14 @@ try {
     await sleep(200);
     const logs = await getLogs({ since: before });
     assert.deepEqual(logs.entries.map((e) => [e.count, e.fromEval]), [[5, false], [1, true]]);
+    // Same text and same kind of source, but logged from two different places.
+    const start = (await getLogs()).lastSeq;
+    const fromHere = () => console.warn('one message, two origins');
+    const fromThere = () => console.warn('one message, two origins');
+    fromHere();
+    fromThere();
+    await sleep(200);
+    assert.deepEqual((await getLogs({ since: start })).entries.map((e) => e.count), [1, 1]);
   });
 
   await check('huge results and chatty code are cut down in the browser', async () => {
@@ -349,6 +379,9 @@ try {
     };
     assert.ok((await sentChars(`return 'x'.repeat(1_000_000);`)) < 450_000, 'long strings are cut');
     assert.ok((await sentChars(`return Array.from({ length: 100_001 }, (_, i) => 100_000 + i);`)) < 600_000, 'long lists are cut');
+    assert.ok((await sentChars(`return new Set(Array.from({ length: 100_001 }, (_, i) => 100_000 + i));`)) < 600_000, 'long sets are cut');
+    assert.ok((await sentChars(`return { ['k'.repeat(1_000_000)]: 1 };`)) < 450_000, 'long keys are cut');
+    assert.ok((await sentChars(`return { toObject: () => 'x'.repeat(1_000_000) };`)) < 450_000, 'text from toObject() is cut');
   });
 
   await check('a flood is rate-limited in the browser and the buffer stays bounded', async () => {
@@ -513,7 +546,10 @@ try {
   });
 
   await check('a module with the token proves itself, checks the hub, and then works', async () => {
-    await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, TOKEN);
+    // Something prints the token during world start-up, before the module has read its own setting.
+    await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, TOKEN, () => console.error(`startup leak ${TOKEN} end`));
+    const startup = payload(await callTool('foundry_logs', { contains: 'startup leak' }, bearer(TOKEN)));
+    assert.deepEqual(startup.entries.map((e) => e.text), ['startup leak [redacted] end']);
     assert.equal((await evalCode('return 40 + 2', {}, bearer(TOKEN))).result, 42);
     // Signed commands keep working in sequence, and the hub token is scrubbed from output.
     const reply = await evalCode(`console.log('leaked ${TOKEN} here'); return 'second';`, {}, bearer(TOKEN));
@@ -530,7 +566,7 @@ try {
   // A stand-in hub, for behaviour the real hub never shows. `wrongProof` answers the challenge
   // without knowing the token; otherwise it completes the handshake honestly and then sends an
   // unsigned command, as something sitting between the module and the real hub would.
-  const fakeHub = async ({ wrongProof, replay }) => {
+  const fakeHub = async ({ wrongProof, replay, badId }) => {
     const fake = new WebSocketServer({ port: FAKE_PORT, host: '127.0.0.1' });
     const closed = new Promise((resolve) => {
       fake.on('connection', (ws) => {
@@ -544,14 +580,17 @@ try {
             ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof } }));
           } else if (msg.proof) {
             ws.send(JSON.stringify({ welcome: true }));
+            const key = sign(TOKEN, `session\n${bindingOf(hello, 'hubnonce')}`);
+            const signed = (id, code) => JSON.stringify({ id, method: 'eval', params: { code }, seq: 1, mac: sign(key, JSON.stringify([1, 'eval', id, code])).toString('hex') });
             if (replay) {
               // One genuinely signed command, sent twice.
-              const code = 'globalThis.replayed = (globalThis.replayed ?? 0) + 1;';
-              const key = sign(TOKEN, `session\n${bindingOf(hello, 'hubnonce')}`);
-              const command = JSON.stringify({ id: 'r', method: 'eval', params: { code }, seq: 1, mac: sign(key, `1\neval\nr\n${code}`).toString('hex') });
+              const command = signed(randomUUID(), 'globalThis.replayed = (globalThis.replayed ?? 0) + 1;');
               ws.send(command);
               ws.send(command);
-            } else ws.send(JSON.stringify({ id: 'x', method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
+            } else if (badId) {
+              // Correctly signed, but the id is not a UUID: the shape a field-shifting relay would need.
+              ws.send(signed('not-a-uuid\nreturn;', 'globalThis.injected = true;'));
+            } else ws.send(JSON.stringify({ id: randomUUID(), method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
           }
         });
       });
@@ -571,6 +610,11 @@ try {
     assert.equal(await fakeHub({ wrongProof: false }), 4003);
     assert.equal(globalThis.injected, undefined);
   });
+  await check('a module refuses a command whose id is not a plain UUID, signed or not', async () => {
+    assert.equal(await fakeHub({ badId: true }), 4003);
+    assert.equal(globalThis.injected, undefined);
+  });
+
   await check('a module runs a signed command once and refuses its replay', async () => {
     assert.equal(await fakeHub({ replay: true }), 4003);
     assert.equal(globalThis.replayed, 1);
@@ -593,6 +637,7 @@ try {
     assert.ok(generated.length >= 32);
     // The config was world-readable before the token was added (0644), as a copied example would be.
     if (process.platform !== 'win32') assert.equal(statSync(freshConfig).mode & 0o077, 0, 'config is private after the token is written');
+    assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp')), [], 'no temporary token file is left behind');
     const auth = { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } };
     assert.equal((await mcp('tools/list', {}, { port: FRESH_PORT })).status, 401);
     assert.equal((await toolNames(auth)).length, 3);
@@ -622,6 +667,8 @@ try {
     for (const [name, content, expected] of [
       ['eval-string.json', '{ "token": "", "allowEval": "false" }', /"allowEval" must be true or false/],
       ['token-number.json', '{ "token": 5 }', /"token" must be text/],
+      ['eval-null.json', '{ "token": "", "allowEval": null }', /"allowEval" must be true or false/],
+      ['worlds-null.json', '{ "token": "", "worlds": null }', /"worlds" must be a list/],
       ['token-short.json', '{ "token": "abc" }', /too short/],
       ['limit.json', '{ "token": "", "logLimit": "not-a-number" }', /"logLimit" must be/],
       ['worlds.json', '{ "token": "", "worlds": "my-world" }', /"worlds" must be a list/],

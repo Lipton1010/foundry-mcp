@@ -197,7 +197,7 @@ Behaviour worth knowing:
 - **Levels.** Many modules report real failures as warnings (midi-qol logs a failing on-use macro with
   `console.warn`), so do not filter to `error` only.
 - **Privacy.** Only warnings and errors are kept, never ordinary `console.log` output. Values that look like
-  credentials (`password=`, `api_key:`, `token=`, quoted keys such as `"token": "..."`, `Authorization` and
+  credentials (`password=`, `api_key:`, `token=`, prefixed names such as `client_secret`, quoted keys such as `"token": "..."`, `Authorization` and
   `Cookie` headers, bearer tokens, `?token=` in URLs, JWTs, long opaque strings, and the hub token itself) are
   replaced with `[redacted]` in the browser, in log entries and in the `logs` of `foundry_eval`. This is best effort. Log text
   is otherwise whatever your modules print, which can include actor, item and user names. Logs from worlds that are
@@ -251,7 +251,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 43 checks)
+### Tested in simulation only (`npm test`, 45 checks)
 
 Serialization and its size limits, timeouts and the abort signal, the concurrency caps, flood limits and retention,
 origin, Host and method checks, malformed socket messages, a second GM tab, the world allowlist (including an empty

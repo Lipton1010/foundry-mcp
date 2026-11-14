@@ -41,8 +41,8 @@ players. It also means:
 ## The token
 
 - Generated on first start: 24 random bytes, stored as `token` in `server/config.json`. On macOS and Linux the hub
-  sets that file readable only by you each time it starts with a token; on Windows it inherits the folder's
-  permissions. A token you set yourself must be at least 16 characters.
+  sets that file readable only by you each time it starts with a token, and refuses to start if it cannot; on
+  Windows it inherits the folder's permissions. A token you set yourself must be at least 16 characters.
 - It also has to be stored in each MCP client's configuration (or an environment variable) and in the browser, in
   Foundry's client settings. Any module or macro running in that world on that browser can read it there.
 - MCP clients send it as a bearer header over loopback HTTP on every call. The module never sends it: both ends prove

@@ -4,7 +4,7 @@
 // need to change.
 
 const MODULE_ID = 'foundry-mcp';
-const PROTOCOL = 4; // bump together with MODULE_PROTOCOL in server/index.js
+const PROTOCOL = 5; // bump together with MODULE_PROTOCOL in server/index.js
 const SESSION = Math.random().toString(36).slice(2, 10); // identifies this page load
 const EVAL_SOURCE = 'foundry-mcp-eval.js'; // name evaluated code gets in stack traces
 const LOOPBACK = ['127.0.0.1', 'localhost', '[::1]'];
@@ -100,29 +100,34 @@ function connect() {
       if (!token) return refuse('the hub requires a token; paste it into the "Hub token" module setting');
       if (!globalThis.crypto?.subtle) return refuse('token checks need a secure page (open Foundry via localhost or https)');
       const hubNonce = String(msg.challenge.nonce);
-      if (msg.challenge.proof !== toHex(await hmac(token, `hub\n${binding(hubNonce)}`))) {
-        return refuse('whatever answered at the hub address does not know the token');
-      }
+      const proofOk = msg.challenge.proof === toHex(await hmac(token, `hub\n${binding(hubNonce)}`));
+      if (refused) return; // the connection went away while the proof was being checked
+      if (!proofOk) return refuse('whatever answered at the hub address does not know the token');
       sessionKey = await hmac(token, `session\n${binding(hubNonce)}`);
-      return send({ proof: toHex(await hmac(token, `module\n${binding(hubNonce)}`)) }, ws);
+      const proof = toHex(await hmac(token, `module\n${binding(hubNonce)}`));
+      return refused ? undefined : send({ proof }, ws);
     }
     if (msg.welcome && socket !== ws) {
       if (token && !sessionKey) return refuse('whatever answered at the hub address did not ask for the token');
       console.log(`${MODULE_ID} | connected to MCP hub`);
       socket = ws;
-      for (const entry of backlog.splice(0)) send({ log: entry });
+      // Entries captured during start-up were redacted before the token setting could be read; scrub them again.
+      for (const entry of backlog.splice(0)) send({ log: { ...entry, text: redact(entry.text), stack: entry.stack.map((frame) => redact(frame, false)) } });
       return;
     }
     if (socket !== ws) return; // obey nothing until the handshake is complete
     if (msg.method !== 'eval' && msg.method !== 'cancel') return;
+    const code = msg.method === 'eval' ? msg.params?.code : '';
+    // Exact shapes only: an id is a UUID and code is text. Anything else is not from our hub.
+    if (typeof msg.id !== 'string' || !UUID.test(msg.id) || typeof code !== 'string') return refuse('a malformed command arrived');
     if (sessionKey) {
       // Every command must carry the next sequence number and the hub's signature,
       // so nothing between us and the hub can insert, replay, reorder or alter one.
+      // The signed text is a JSON array, so no field can borrow characters from its neighbour.
       const expected = ++received;
-      const signed = `${expected}\n${msg.method}\n${msg.id}\n${msg.params?.code ?? ''}`;
-      if (msg.seq !== expected || msg.mac !== toHex(await hmac(sessionKey, signed))) {
-        return refuse('a command arrived that the hub did not sign');
-      }
+      const signatureOk = msg.seq === expected && msg.mac === toHex(await hmac(sessionKey, JSON.stringify([expected, msg.method, msg.id, code])));
+      if (refused) return; // the connection closed while the signature was being checked: do not start anything
+      if (!signatureOk) return refuse('a command arrived that the hub did not sign');
     }
     if (msg.method === 'cancel') return running.get(msg.id)?.abort();
     if (running.size >= MAX_RUNNING) {
@@ -131,17 +136,20 @@ function connect() {
     const controller = new AbortController();
     running.set(msg.id, controller);
     // Not awaited: the queue moves on while this evaluation runs.
-    evaluate(msg.params?.code, controller.signal).then((reply) => {
-      running.delete(msg.id);
-      if (!send({ id: msg.id, ...reply }, ws)) {
-        send({ id: msg.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] }, ws);
-      }
-    });
+    evaluate(code, controller.signal)
+      .catch(() => ({ ok: false, error: { message: 'The evaluation failed in a way that could not be reported.' }, logs: [] }))
+      .then((reply) => {
+        if (!send({ id: msg.id, ...reply }, ws)) {
+          send({ id: msg.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] }, ws);
+        }
+      })
+      .finally(() => running.delete(msg.id)); // whatever happened, the slot is free once the code has finished
   }
 
   // The hub may not be running, or may restart: keep retrying quietly. Retry
   // slowly when the connection was refused (another GM tab, token trouble).
   ws.addEventListener('close', (event) => {
+    refused = true; // anything still queued for this connection must not run
     if (socket === ws) socket = null;
     for (const controller of running.values()) controller.abort(); // nobody is waiting for these any more
     if (event.code >= 4000) console.log(`${MODULE_ID} | not connected: ${event.reason}`);
@@ -149,6 +157,7 @@ function connect() {
   });
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_RUNNING = 16; // evaluations that have not finished, including ones the hub gave up on
 const running = new Map(); // evaluation id -> AbortController
 let hubToken = ''; // kept so it can be scrubbed from anything logged
@@ -193,8 +202,16 @@ async function evaluate(code, signal) {
     }
     return withLogs({ ok: true, result: serialized });
   } catch (error) {
-    const clip = (value, max) => (value === undefined ? undefined : String(value).slice(0, max));
-    return withLogs({ ok: false, error: { name: clip(error?.name, 200), message: clip(error?.message ?? error, 10_000), stack: clip(error?.stack, 10_000) } });
+    // A thrown value can be anything, including an object whose properties throw when read.
+    const read = (pick, max) => {
+      try {
+        const value = pick();
+        return value === undefined ? undefined : String(value).slice(0, max);
+      } catch {
+        return '[Unreadable]';
+      }
+    };
+    return withLogs({ ok: false, error: { name: read(() => error?.name, 200), message: read(() => error?.message ?? error, 10_000), stack: read(() => error?.stack, 10_000) } });
   } finally {
     captures.delete(logs);
   }
@@ -281,7 +298,7 @@ function describeStack(stack) {
   return {
     packages: [...new Set(packages)].slice(0, 10),
     fromEval: frames.some((frame) => frame.includes(EVAL_SOURCE)),
-    stack: frames.filter((frame) => !frame.includes(`${own}scripts/bridge.js`) || frame.includes(EVAL_SOURCE)).slice(0, 8).map((frame) => redact(frame, false)),
+    stack: frames.filter((frame) => !frame.includes(`${own}scripts/bridge.js`) || frame.includes(EVAL_SOURCE)).slice(0, 8).map((frame) => redact(frame.slice(0, 300), false)),
   };
 }
 
@@ -294,19 +311,21 @@ function safeDecode(text) {
 }
 
 // Best-effort removal of credentials before a log line leaves the browser.
-// "token" alone is only treated as a credential in `token=...` or as a quoted
-// key, because in a tabletop tool "Token: Goblin" is ordinary text.
 function redact(text, opaque = true) {
   if (hubToken) text = text.split(hubToken).join('[redacted]');
   text = text
-    // JSON-style: any quoted key that names a credential, such as {"token":"..."} or 'Authorization': '...'.
-    .replace(/(["'][\w-]*(?:token|secret|password|passwd|api[-_]?key|authorization|cookie)[\w-]*["']\s*:\s*["'])[^"']+/gi, '$1[redacted]')
     // Header lines: the value runs to the end of the line ("Authorization: Basic ...", "Cookie: a=1; b=2").
-    // Not applied to quoted keys, which the rule above handled without eating the rest of the object.
+    // A quoted key ("Authorization":"...") is left for the next rule, which keeps the rest of the object.
     .replace(/\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*[:=]\s*)[^\n]+/gi, '$1$2[redacted]')
     .replace(/\b(bearer\s+)[\w.~+/=-]{8,}/gi, '$1[redacted]')
-    // key=value and key: value, including prefixed names such as client_secret or openai_api_key.
-    .replace(/\b([\w-]*(?:pass(?:word|wd)|secret|api[-_ ]?key)[\w-]*|(?:access|auth|api|refresh|session|cobalt|id|client|hub)[-_ ]?token|[\w-]*token(?==))(\s*(?:["']\s*)?[:=]\s*["']?)[^\s"',;&}]+/gi, '$1$2[redacted]')
+    // key=value, key: value and "key":"value". The key is one bounded word ending in a credential-like
+    // word and is judged by name afterwards; a quoted value is taken up to its own closing quote,
+    // escapes included.
+    .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
+      if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='))) return match;
+      const quote = value[0] === '"' || value[0] === "'" ? value[0] : '';
+      return `${key}${separator}${quote}[redacted]${quote}`;
+    })
     .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
     .replace(/(:\/\/[^/@\s:]+:)[^@\s/]+@/g, '$1[redacted]@') // https://user:password@host
     .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]');
@@ -315,6 +334,18 @@ function redact(text, opaque = true) {
   if (!opaque) return text;
   return text.replace(/(?<![A-Za-z0-9_+=-])[A-Za-z0-9_+=-]{40,}(?![A-Za-z0-9_+=-])/g, (run) => (/[A-Za-z]/.test(run) && /\d/.test(run) ? '[redacted]' : run));
 }
+
+// Does this key name a credential? It must END in the credential word, so a Foundry "tokenId" or
+// "tokenName" is left alone. "token" and "secret" are also everyday words in a tabletop tool
+// ("Token: Goblin", "Secret: a hidden door"), so on their own they only count in `key=value`
+// or quoted-key form (`assignment`); with a prefix (access_token, client_secret) they always count.
+function isCredentialKey(key, assignment) {
+  const name = key.toLowerCase();
+  if (/(?:password|passwd|api[-_]?key|secret[-_]?key|private[-_]?key|authorization|cookie)$/.test(name)) return true;
+  if (/(?:token|secret)$/.test(name)) return assignment || name.length > 6;
+  return false;
+}
+
 function formatLogArg(arg, withStack) {
   if (typeof arg === 'string') return arg;
   if (arg instanceof Error) return withStack ? (arg.stack ?? arg.message) : `${arg.name}: ${arg.message}`;
@@ -327,67 +358,84 @@ function formatLogArg(arg, withStack) {
 
 // -------------------------------------------------------------- serialization
 // Turn any value into plain JSON. Documents and data models become their
-// toObject() source data; cycles, depth and size are capped so that returning
-// something huge (a Token placeable, the canvas) cannot freeze the tab.
+// toObject() source data. Every path is subject to the same limits (values,
+// text including keys, depth, cycles), so returning something huge (a Token
+// placeable, the canvas, a whole collection) cannot freeze the tab.
 
 function serialize(value) {
   const ancestors = new WeakSet();
   let budget = 50_000; // values of any kind
-  let chars = 400_000; // text across all strings; the hub cuts replies far below this anyway
+  let chars = 400_000; // text across all strings and keys; the hub cuts replies far below this anyway
+  const text = (v) => {
+    const kept = v.length > chars ? `${v.slice(0, chars)}[Truncated ${v.length - chars} chars]` : v;
+    chars = Math.max(0, chars - v.length);
+    return kept;
+  };
   const walk = (v, depth) => {
     if (--budget < 0) return '[Truncated]';
     if (v === undefined) return null;
-    if (typeof v === 'function') return `[Function ${v.name}]`;
+    if (typeof v === 'function') return `[Function ${text(String(v.name))}]`;
     if (typeof v === 'bigint') return v.toString();
-    if (typeof v === 'string') {
-      const kept = v.length > chars ? `${v.slice(0, chars)}[Truncated ${v.length - chars} chars]` : v;
-      chars = Math.max(0, chars - v.length);
-      return kept;
-    }
+    if (typeof v === 'string') return text(v);
     if (v === null || typeof v !== 'object') return v;
-    if (v instanceof Error) return walk({ name: v.name, message: v.message, stack: v.stack }, depth + 1);
     if (v instanceof Date) return Number.isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString();
     if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return `[${v.constructor.name} ${v.byteLength} bytes]`;
-    if (v instanceof Map) {
-      // Checked before toObject(): a Foundry collection's toObject() would clone every document in it
-      // before any limit applied. Walking it entry by entry stops when the budget does.
-      const entries = {};
-      for (const [key, item] of v) {
-        if (budget <= 0) {
-          entries['[Truncated]'] = `${v.size - Object.keys(entries).length} more entries omitted`;
-          break;
-        }
-        entries[String(key)] = walk(item, depth + 1);
-      }
-      return entries;
-    }
-    if (typeof v.toObject === 'function') {
-      try {
-        v = v.toObject();
-      } catch {
-        return String(v);
-      }
-    } else if (v instanceof Set) v = [...v];
-    if (v === null || typeof v !== 'object') return v;
     if (ancestors.has(v)) return '[Circular]';
     if (depth > 12) return '[MaxDepth]';
     ancestors.add(v);
-    let out;
-    // Stop visiting once the budget is spent, so a huge collection costs no more than a small one.
-    if (Array.isArray(v)) {
-      out = [];
-      for (const item of v) {
-        if (budget <= 0) {
-          out.push(`[Truncated ${v.length - out.length} more items]`);
-          break;
+    try {
+      if (v instanceof Error) return walk({ name: v.name, message: v.message, stack: v.stack }, depth + 1);
+      // Maps (which include Foundry collections) and Sets are walked entry by entry and stop with the
+      // budget. A collection's own toObject() would clone every document in it before any limit applied.
+      if (v instanceof Map) {
+        const entries = {};
+        let seen = 0;
+        for (const [key, item] of v) {
+          if (budget <= 0 || chars <= 0) {
+            entries['[Truncated]'] = `${v.size - seen} more entries omitted`;
+            break;
+          }
+          entries[text(String(key))] = walk(item, depth + 1);
+          seen += 1;
         }
-        out.push(walk(item, depth + 1));
+        return entries;
       }
-    } else {
-      out = {};
+      if (v instanceof Set) {
+        const items = [];
+        for (const item of v) {
+          if (budget <= 0) {
+            items.push(`[Truncated ${v.size - items.length} more items]`);
+            break;
+          }
+          items.push(walk(item, depth + 1));
+        }
+        return items;
+      }
+      if (typeof v.toObject === 'function') {
+        let source;
+        try {
+          source = v.toObject();
+        } catch {
+          return text(String(v));
+        }
+        return source === v ? '[Circular]' : walk(source, depth + 1); // whatever it returned gets the same limits
+      }
+      // Stop visiting once the budget is spent, so a huge collection costs no more than a small one.
+      if (Array.isArray(v)) {
+        const out = [];
+        for (const item of v) {
+          if (budget <= 0) {
+            out.push(`[Truncated ${v.length - out.length} more items]`);
+            break;
+          }
+          out.push(walk(item, depth + 1));
+        }
+        return out;
+      }
+      const out = {};
       for (const key in v) {
         if (!Object.hasOwn(v, key)) continue;
-        if (budget <= 0) {
+        if (budget <= 0 || chars <= 0) {
           out['[Truncated]'] = 'more keys omitted';
           break;
         }
@@ -397,11 +445,12 @@ function serialize(value) {
         } catch {
           item = '[Unreadable]'; // a getter that throws must not fail the whole reply
         }
-        out[key] = walk(item, depth + 1);
+        out[text(key)] = walk(item, depth + 1);
       }
+      return out;
+    } finally {
+      ancestors.delete(v);
     }
-    ancestors.delete(v);
-    return out;
   };
   return walk(value, 0);
 }

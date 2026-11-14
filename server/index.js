@@ -9,7 +9,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
@@ -37,20 +37,23 @@ if (existsSync(configFile)) {
 const env = (name) => process.env[`FOUNDRY_MCP_${name}`];
 const list = (text) => text?.split(',').map((s) => s.trim()).filter(Boolean);
 
+
 // A wrong type must never quietly weaken a protection ("allowEval": "false"
-// is a truthy string), so every value is checked before anything is used.
+// is a truthy string, and null is not "use the default"), so only a MISSING
+// key falls back to its default and every value is checked before use.
+const fromFile = (key, fallback) => (fileConfig[key] === undefined ? fallback : fileConfig[key]);
 const config = {
-  port: env('PORT') !== undefined ? Number(env('PORT')) : (fileConfig.port ?? 30123),
+  port: env('PORT') !== undefined ? Number(env('PORT')) : fromFile('port', 30123),
   // World ids this hub may run code in. Empty means none; "*" means any.
-  worlds: list(env('WORLDS')) ?? fileConfig.worlds ?? [],
+  worlds: list(env('WORLDS')) ?? fromFile('worlds', []),
   // Browser origins allowed to connect as Foundry. Browsers cannot forge
   // Origin, so this keeps other web pages from posing as the Foundry tab.
-  origins: list(env('ORIGINS')) ?? fileConfig.origins ?? ['http://localhost:30000', 'http://127.0.0.1:30000'],
-  // null, like a missing line, asks for a new token to be generated.
+  origins: list(env('ORIGINS')) ?? fromFile('origins', ['http://localhost:30000', 'http://127.0.0.1:30000']),
+  // The one setting where null is meaningful: like a missing line, it asks for a new token.
   token: env('TOKEN') ?? fileConfig.token ?? undefined,
   // false removes foundry_eval, leaving clients able to read status and logs only.
-  allowEval: env('ALLOW_EVAL') !== undefined ? { true: true, false: false }[env('ALLOW_EVAL').toLowerCase()] : (fileConfig.allowEval ?? true),
-  logLimit: env('LOG_LIMIT') !== undefined ? Number(env('LOG_LIMIT')) : (fileConfig.logLimit ?? 1000),
+  allowEval: env('ALLOW_EVAL') !== undefined ? { true: true, false: false }[env('ALLOW_EVAL').toLowerCase()] : fromFile('allowEval', true),
+  logLimit: env('LOG_LIMIT') !== undefined ? Number(env('LOG_LIMIT')) : fromFile('logLimit', 1000),
 };
 const isStrings = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item);
 if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) fail('"port" must be a whole number from 1 to 65535.');
@@ -70,25 +73,28 @@ if (config.token && config.token.length < 16) fail('"token" is too short to be s
 const tokenGenerated = config.token === undefined;
 if (tokenGenerated) {
   config.token = randomBytes(24).toString('base64url');
+  // Written to a private temporary file and moved into place, so the token is
+  // never in a readable file and a failed write cannot destroy the old settings.
+  const temporary = `${configFile}.${process.pid}.tmp`;
   try {
-    // Tighten an existing file first, so the token is never in a world-readable file even briefly.
-    if (existsSync(configFile)) chmodSync(configFile, 0o600);
-    writeFileSync(configFile, `${JSON.stringify({ ...fileConfig, token: config.token }, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(temporary, `${JSON.stringify({ ...fileConfig, token: config.token }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, configFile);
   } catch (error) {
+    rmSync(temporary, { force: true });
     fail(`Cannot save a new token to ${configFile}: ${error.message}`);
   }
 }
-if (config.token && existsSync(configFile)) {
-  // The mode above only applies to a file being created. A config copied from
-  // the example is usually world-readable, so tighten it (no effect on Windows).
+if (config.token && env('TOKEN') === undefined && process.platform !== 'win32') {
+  // A token typed into an existing file may be sitting in one that other accounts can read.
+  // (Windows has no file modes; the file inherits its folder's permissions there.)
   try {
     chmodSync(configFile, 0o600);
-  } catch {
-    // Not fatal: the file may belong to someone else or sit on a filesystem without modes.
+  } catch (error) {
+    fail(`${configFile} holds the hub token but could not be made private (${error.message}). Fix its ownership or permissions.`);
   }
 }
 
-const MODULE_PROTOCOL = 4; // bump together with PROTOCOL in foundry-mcp/scripts/bridge.js
+const MODULE_PROTOCOL = 5; // bump together with PROTOCOL in foundry-mcp/scripts/bridge.js
 const MAX_RESULT_CHARS = 80_000;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_PENDING = 16; // evaluations in flight at once, across all clients
@@ -106,12 +112,14 @@ const proof = (role, ws) => hmac(config.token, `${role}\n${binding(ws)}`).toStri
 
 // Commands to the module. With a token, each carries a sequence number and a
 // signature under a key derived for this connection, so nothing sitting
-// between hub and module can insert, replay or alter one.
+// between hub and module can insert, replay or alter one. The signed text is a
+// JSON array: joined with a separator, a field could borrow characters from
+// its neighbour and two different commands would share one signature.
 function sendCommand(ws, id, method, code = '') {
   const message = { id, method, ...(method === 'eval' ? { params: { code } } : {}) };
   if (ws.sessionKey) {
     message.seq = ++ws.sent;
-    message.mac = hmac(ws.sessionKey, `${message.seq}\n${method}\n${id}\n${code}`).toString('hex');
+    message.mac = hmac(ws.sessionKey, JSON.stringify([message.seq, method, id, code])).toString('hex');
   }
   ws.send(JSON.stringify(message));
 }
@@ -129,8 +137,8 @@ function addLog(entry) {
   const sameAsLast =
     last &&
     ['world', 'session', 'level', 'source', 'text', 'fromEval'].every((key) => last[key] === entry[key]) &&
-    last.packages.join() === entry.packages.join() &&
-    last.stack.join() === entry.stack.join();
+    JSON.stringify(last.packages) === JSON.stringify(entry.packages) &&
+    JSON.stringify(last.stack) === JSON.stringify(entry.stack);
   if (sameAsLast) {
     // A repeating error (a render loop, say) becomes one entry with a count.
     last.count += 1;
