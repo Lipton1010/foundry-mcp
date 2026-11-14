@@ -204,8 +204,12 @@ try {
 
   await check('a thrown value that cannot be read is reported and does not leak a slot', async () => {
     const hostile = `throw { get name() { throw new Error('no'); }, get message() { throw new Error('no'); } };`;
-    const replies = await Promise.all(Array.from({ length: 20 }, () => callTool('foundry_eval', { code: hostile })));
-    assert.ok(replies.every((r) => r.isError && payload(r).error.name === '[Unreadable]'));
+    // One at a time, and more of them than there are slots: if each leaked a slot, the later ones would be refused.
+    for (let i = 0; i < 20; i++) {
+      const reply = await callTool('foundry_eval', { code: hostile });
+      assert.equal(reply.isError, true);
+      assert.equal(payload(reply).error.name, '[Unreadable]', `call ${i + 1}`);
+    }
     assert.equal((await evalCode('return 5')).result, 5);
   });
 
