@@ -140,10 +140,10 @@ example.
 |---|---|---|---|
 | `port` | `FOUNDRY_MCP_PORT` | `30123` | Loopback port for both `/mcp` and `/foundry`. |
 | `worlds` | `FOUNDRY_MCP_WORLDS` | none | World ids code may run in. `*` allows any world; avoid it. |
-| `origins` | `FOUNDRY_MCP_ORIGINS` | `http://localhost:30000`, `http://127.0.0.1:30000` | Page origins allowed to connect as Foundry. Must match the address in the GM's browser exactly. |
-| `token` | `FOUNDRY_MCP_TOKEN` (hub only; do not reuse this name for clients) | generated on first start | Shared secret. MCP clients send it as `Authorization: Bearer <token>`; the module proves it knows it. Set it to `""` to run without authentication (not recommended). |
+| `origins` | `FOUNDRY_MCP_ORIGINS` | `http://localhost:30000`, `http://127.0.0.1:30000` | Page origins allowed to connect as Foundry: scheme, host and port only, matching the address in the GM's browser. Capital letters and a trailing `/` are tidied up; a path or `*` stops the hub with a message. |
+| `token` | `FOUNDRY_MCP_TOKEN` (hub only; do not reuse this name for clients) | generated on first start | Shared secret. MCP clients send it as `Authorization: Bearer <token>`; the module proves it knows it. Set it to `""` to run without authentication (not recommended). A blank value, or one containing a line break, stops the hub with a message. |
 | `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes `foundry_eval`, leaving clients able to read status and logs only. |
-| `logLimit` | `FOUNDRY_MCP_LOG_LIMIT` | `1000` | Log entries kept in memory. |
+| `logLimit` | `FOUNDRY_MCP_LOG_LIMIT` | `1000` | Log entries kept in memory, from 1 to 10000. |
 
 Module settings (stored per browser): **MCP hub address** (default `ws://127.0.0.1:30123/foundry`; only loopback
 addresses are accepted) and **Hub token**.
@@ -198,8 +198,13 @@ Behaviour worth knowing:
   `console.warn`), so do not filter to `error` only.
 - **Privacy.** Only warnings and errors are kept, never ordinary `console.log` output. Values that look like
   credentials (`password=`, `api_key:`, `token=`, prefixed names such as `client_secret`, quoted keys such as `"token": "..."`, `Authorization` and
-  `Cookie` headers, bearer tokens, `?token=` in URLs, JWTs, long opaque strings, and the hub token itself) are
-  replaced with `[redacted]` in the browser, in log entries and in the `logs` of `foundry_eval`. This is best effort. Log text
+  `Cookie` headers, bearer tokens, `?token=` in URLs, passwords in addresses such as `redis://:password@host`, JWTs,
+  AWS, Stripe, GitHub and Slack keys, long opaque strings, and the hub token itself) are
+  replaced with `[redacted]` in the browser, in log entries and in the `logs` of `foundry_eval`. This is best effort.
+  Because "token" and "secret" are everyday words at a game table, a plain `token: value` or `secret: value` is redacted
+  only when the value looks machine-made (six or more characters with a digit, or twelve or more), so `Token: Goblin`
+  survives and so would a short all-letter secret. Also not caught: a bare `key: value`, a password containing a space
+  outside quotes, and long strings made of letters only. Log text
   is otherwise whatever your modules print, which can include actor, item and user names. Logs from worlds that are
   not on the allowlist are discarded.
 - **Not captured.** `console.log/info/debug` outside an evaluation, notifications created with `console: false`,
@@ -222,7 +227,8 @@ Behaviour worth knowing:
 | Calls time out, or automation finishes a minute late | `windowVisibility` is `hidden`: the Foundry window is minimized or covered and the browser is throttling its timers. Bring it to the front. |
 | A second GM tab never connects | Only one tab is served. Close the other; the new one connects within 30 s. |
 | "Port 30123 is already in use" | Another hub is running. Stop it, or change `port`. |
-| Results end in `[truncated ...]` | Return fewer fields; replies are capped at 80,000 characters. |
+| A result contains `[Truncated ...]` and a `truncated` field | Return fewer fields; replies are capped at 80,000 characters. A cut reply is still valid JSON. |
+| `foundry_logs` returns `entriesOmitted` | The matches did not fit in one reply, so the oldest were left out. Lower `limit` or raise `since`. |
 
 ## Tested versions
 
@@ -244,18 +250,23 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - Reading and writing document flags, and automatic reconnection after a world reload.
 - Logs: start-up warnings from other modules, an asynchronous error raised after `foundry_eval` returned, and a real
   midi-qol workflow whose on-use macro threw, attributed to `midi-qol`.
-- Redaction of synthetic credentials in eval output, in an asynchronous console error and in a UI notification.
+- Redaction of synthetic credentials in eval output, in an asynchronous console error and in a UI notification,
+  including plain `token: value` lines and passwords inside connection addresses.
+- Returning a whole collection (`return game.actors`): cut down to valid JSON within the reply limit. An oversized
+  `foundry_logs` reply likewise, keeping the newest entries.
+- Logging a real document 100 times from 16 evaluations at once: about 0.1 s of browser time each.
 - The token handshake with the real module: the correct token connects, signed commands run, a signed cancel reaches
   the code after a timeout, a wrong token is refused, and a hub reached without the bearer token answers 401.
 - A hub whose allowlist does not include the open world refuses its connection, runs nothing and keeps no logs.
 - A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 45 checks)
+### Tested in simulation only (`npm test`, 50 checks)
 
-Serialization and its size limits, timeouts and the abort signal, the concurrency caps, flood limits and retention,
+Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
+several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
 origin, Host and method checks, malformed socket messages, a second GM tab, the world allowlist (including an empty
-one), a relay altering the reported world, a module refusing an unsigned or replayed command or a hub that cannot prove it knows
+one), a relay altering the reported world or moving text between the reported fields, a module refusing an unsigned or replayed command or a hub that cannot prove it knows
 the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects,
 the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
 user, `allowEval: false`, and token generation with file permissions.

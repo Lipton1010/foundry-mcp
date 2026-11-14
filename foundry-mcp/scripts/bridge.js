@@ -235,14 +235,23 @@ for (const level of ['log', 'warn', 'error']) {
   const original = console[level];
   console[level] = (...args) => {
     try {
+      // Turning the arguments into text is the expensive part (a logged document is walked and
+      // serialized), so it happens at most once per call, however many evaluations are listening,
+      // and not at all when nobody will keep the line.
+      let parts;
+      const text = (withStack) => {
+        parts ??= args.map((arg) => (arg instanceof Error ? arg : formatLogArg(arg)));
+        return parts.map((part) => (part instanceof Error ? (withStack ? (part.stack ?? part.message) : `${part.name}: ${part.message}`) : part)).join(' ');
+      };
       // Other modules log during an evaluation too, so this output is redacted like the rest.
+      let line;
       for (const logs of captures) {
         if (logs.length >= CAPTURE_LIMIT) logs.dropped += 1;
-        else logs.push({ level, text: redact(args.map((arg) => formatLogArg(arg, true)).join(' ').slice(0, 8000 + REDACT_SLACK)).slice(0, 8000) });
+        else logs.push((line ??= { level, text: redact(text(true).slice(0, 8000 + REDACT_SLACK)).slice(0, 8000) }));
       }
       if (level !== 'log') {
         const error = args.find((arg) => arg instanceof Error);
-        record(level, 'console', args.map((arg) => formatLogArg(arg, false)).join(' '), error?.stack ?? new Error().stack);
+        record(level, 'console', () => text(false), error?.stack ?? new Error().stack);
       }
     } catch {
       // Never let capture break the console.
@@ -268,6 +277,7 @@ function record(level, source, text, stack) {
       dropped += 1;
       return;
     }
+    if (typeof text === 'function') text = text(); // console lines are only formatted once they are known to be kept
     const entry = { time: now, level, source, text: redact(String(text).slice(0, 2000 + REDACT_SLACK)).slice(0, 2000), ...describeStack(stack) };
     if (dropped) {
       entry.droppedBefore = dropped;
@@ -322,13 +332,17 @@ function redact(text, opaque = true) {
     // word and is judged by name afterwards; a quoted value is taken up to its own closing quote,
     // escapes included.
     .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
-      if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='))) return match;
       const quote = value[0] === '"' || value[0] === "'" ? value[0] : '';
+      if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='), quote ? value.slice(1, -1) : value)) return match;
       return `${key}${separator}${quote}[redacted]${quote}`;
     })
     .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
-    .replace(/(:\/\/[^/@\s:]+:)[^@\s/]+@/g, '$1[redacted]@') // https://user:password@host
-    .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]');
+    // scheme://user:password@host. The user may be empty (redis://:password@host), and the password
+    // runs to the LAST "@" before the path, because a password may itself contain one.
+    .replace(/(:\/\/[^/@\s:"']*:)[^\s/?#"']+@/g, '$1[redacted]@')
+    .replace(/\beyJ[\w-]{8,}\.[\w-]+\.[\w-]+/g, '[redacted]')
+    // Keys recognisable by their published prefix: AWS access key ids, Stripe, GitHub and Slack tokens.
+    .replace(/\b(?:A[KS]IA[0-9A-Z]{16}|[spr]k_(?:live|test)_[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|xox[abeprs]-[\w-]{10,})\b/g, '[redacted]');
   // Long opaque strings such as base64 or hex keys, including trailing "=" padding. Only runs that mix
   // letters and digits count, so long names and divider lines survive. Skipped for stack frames.
   if (!opaque) return text;
@@ -339,18 +353,23 @@ function redact(text, opaque = true) {
 // "tokenName" is left alone. "token" and "secret" are also everyday words in a tabletop tool
 // ("Token: Goblin", "Secret: a hidden door"), so on their own they only count in `key=value`
 // or quoted-key form (`assignment`); with a prefix (access_token, client_secret) they always count.
-function isCredentialKey(key, assignment) {
+// Written as plain `token: value`, the value decides: one that looks machine-made (six or more
+// characters with a digit, or twelve or more of anything) is taken for a credential, a short word is not.
+function isCredentialKey(key, assignment, value) {
   const name = key.toLowerCase();
   if (/(?:password|passwd|api[-_]?key|secret[-_]?key|private[-_]?key|authorization|cookie)$/.test(name)) return true;
-  if (/(?:token|secret)$/.test(name)) return assignment || name.length > 6;
+  if (/(?:token|secret)$/.test(name)) return assignment || name.length > 6 || value.length >= 12 || (value.length >= 6 && /\d/.test(value));
   return false;
 }
 
-function formatLogArg(arg, withStack) {
+// A console line keeps at most 8000 characters, so its arguments get a far smaller allowance than
+// a result does: logging a huge object in a loop must not stall the tab.
+const LOG_ARG_LIMITS = { budget: 5000, chars: 20_000 };
+
+function formatLogArg(arg) {
   if (typeof arg === 'string') return arg;
-  if (arg instanceof Error) return withStack ? (arg.stack ?? arg.message) : `${arg.name}: ${arg.message}`;
   try {
-    return JSON.stringify(serialize(arg));
+    return JSON.stringify(serialize(arg, LOG_ARG_LIMITS));
   } catch {
     return String(arg);
   }
@@ -362,10 +381,10 @@ function formatLogArg(arg, withStack) {
 // text including keys, depth, cycles), so returning something huge (a Token
 // placeable, the canvas, a whole collection) cannot freeze the tab.
 
-function serialize(value) {
+// `budget` counts values of any kind; `chars` counts text across all strings and keys (the hub
+// cuts replies far below the default anyway).
+function serialize(value, { budget = 50_000, chars = 400_000 } = {}) {
   const ancestors = new WeakSet();
-  let budget = 50_000; // values of any kind
-  let chars = 400_000; // text across all strings and keys; the hub cuts replies far below this anyway
   const text = (v) => {
     const kept = v.length > chars ? `${v.slice(0, chars)}[Truncated ${v.length - chars} chars]` : v;
     chars = Math.max(0, chars - v.length);
@@ -388,9 +407,10 @@ function serialize(value) {
       // Maps (which include Foundry collections) and Sets are walked entry by entry and stop with the
       // budget. A collection's own toObject() would clone every document in it before any limit applied.
       if (v instanceof Map) {
-        const entries = {};
+        const entries = Object.create(null); // no prototype, so a key named "__proto__" is kept like any other
         let seen = 0;
-        for (const [key, item] of v) {
+        // Map's own entries(): a Foundry Collection is a Map whose default iterator yields values only.
+        for (const [key, item] of Map.prototype.entries.call(v)) {
           if (budget <= 0 || chars <= 0) {
             entries['[Truncated]'] = `${v.size - seen} more entries omitted`;
             break;
@@ -432,7 +452,7 @@ function serialize(value) {
         }
         return out;
       }
-      const out = {};
+      const out = Object.create(null);
       for (const key in v) {
         if (!Object.hasOwn(v, key)) continue;
         if (budget <= 0 || chars <= 0) {

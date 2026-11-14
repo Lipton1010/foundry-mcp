@@ -55,16 +55,39 @@ const config = {
   allowEval: env('ALLOW_EVAL') !== undefined ? { true: true, false: false }[env('ALLOW_EVAL').toLowerCase()] : fromFile('allowEval', true),
   logLimit: env('LOG_LIMIT') !== undefined ? Number(env('LOG_LIMIT')) : fromFile('logLimit', 1000),
 };
+const MAX_LOG_LIMIT = 10_000;
 const isStrings = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item);
 if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) fail('"port" must be a whole number from 1 to 65535.');
 if (!isStrings(config.worlds)) fail('"worlds" must be a list of world ids, for example ["my-test-world"].');
 if (!isStrings(config.origins)) fail('"origins" must be a list of page origins, for example ["http://localhost:30000"].');
 if (typeof config.allowEval !== 'boolean') fail('"allowEval" must be true or false (not in quotes).');
-if (!Number.isInteger(config.logLimit) || config.logLimit < 1) fail('"logLimit" must be a whole number of at least 1.');
+// Bounded above too: every entry is memory the hub holds for as long as it runs.
+if (!Number.isInteger(config.logLimit) || config.logLimit < 1 || config.logLimit > MAX_LOG_LIMIT) fail(`"logLimit" must be a whole number from 1 to ${MAX_LOG_LIMIT}.`);
+// A browser sends its origin in one exact form (lower case, no trailing slash, no default port).
+// Write each configured origin the same way, and stop on one that could never match: the hub
+// would otherwise start, look healthy, and refuse every connection without saying why.
+config.origins = config.origins.map((origin) => {
+  if (origin.includes('*')) fail('"origins" does not support "*". List each exact page origin, for example "http://localhost:30000".');
+  if (!/^https?:/i.test(origin)) return origin;
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    fail(`"origins" contains "${origin}", which is not a page origin such as "http://localhost:30000".`);
+  }
+  if (url.pathname !== '/' || url.search || url.hash || url.username || url.password) {
+    fail(`"origins" contains "${origin}". An origin is only the scheme, host and port, for example "${url.origin}".`);
+  }
+  return url.origin;
+});
 if (config.token !== undefined && typeof config.token !== 'string') {
   fail('"token" must be text in quotes. Use null to have a new token generated, or "" to run without one.');
 }
+// Spaces only is not "no token": turning authentication off must be the deliberate "".
+if (config.token && !config.token.trim()) fail('"token" is blank. Use null to have a new token generated, or "" to run without one.');
 if (config.token !== undefined) config.token = config.token.trim(); // the module trims its copy too
+// Clients send the token in an HTTP header, which cannot carry a line break or other control character.
+if (config.token && /[\x00-\x1f\x7f]/.test(config.token)) fail('"token" contains a line break or control character, which no client could send. Set it to null to have one generated.');
 if (config.token && config.token.length < 16) fail('"token" is too short to be safe. Set it to null to have one generated.');
 
 // The shared secret. Unset means "make one": a hub nobody configured should not
@@ -106,6 +129,9 @@ const secretEquals = (given, expected) => timingSafeEqual(digest(given), digest(
 // Proof that a side knows the token. It covers both sides' fresh nonces, so it
 // cannot be replayed, and everything the module said about itself, so a relay
 // in the middle cannot change the reported world. The token never crosses the socket.
+// The fields are joined with line breaks, which is only unambiguous because a hello
+// containing one is refused (see onHandshakeMessage): otherwise a relay could move
+// text from one field into the next and keep the proof valid.
 const hmac = (key, text) => createHmac('sha256', key).update(text).digest();
 const binding = (ws) => [ws.moduleNonce, ws.hubNonce, ws.hello.protocol, ws.hello.world, ws.hello.core, ws.hello.system, ws.hello.session].join('\n');
 const proof = (role, ws) => hmac(config.token, `${role}\n${binding(ws)}`).toString('hex');
@@ -158,8 +184,10 @@ const clip = (value, max) => (typeof value === 'string' ? value.slice(0, max) : 
 
 function addFoundryLog(hello, raw) {
   if (!raw || typeof raw !== 'object') return;
+  // A time no Date can hold would throw below; one bad log line must not cost the connection.
+  const ms = Number(raw.time);
   addLog({
-    time: new Date(Number(raw.time) || Date.now()).toISOString(),
+    time: new Date(ms && Math.abs(ms) <= 8.64e15 ? ms : Date.now()).toISOString(),
     world: hello.world,
     session: hello.session,
     level: raw.level === 'error' ? 'error' : 'warn',
@@ -241,7 +269,11 @@ function callFoundry(code, timeoutMs = 30_000, signal) {
     const abandon = (message) => {
       if (!pending.delete(id)) return;
       clearTimeout(timer);
-      if (ws.readyState === ws.OPEN) sendCommand(ws, id, 'cancel');
+      try {
+        if (ws.readyState === ws.OPEN) sendCommand(ws, id, 'cancel');
+      } catch {
+        // This can run from a timer: a socket that fails to send must not take the hub down. Its close handler tidies up.
+      }
       reject(new Error(message));
     };
     const timer = setTimeout(
@@ -251,7 +283,13 @@ function callFoundry(code, timeoutMs = 30_000, signal) {
     // The MCP client disconnected or cancelled: nobody is waiting for the answer.
     signal?.addEventListener('abort', () => abandon('The client cancelled the request.'), { once: true });
     pending.set(id, { resolve, reject, timer });
-    sendCommand(ws, id, 'eval', code);
+    try {
+      sendCommand(ws, id, 'eval', code);
+    } catch (error) {
+      pending.delete(id);
+      clearTimeout(timer);
+      reject(new Error(`The code could not be sent to Foundry: ${error.message}`));
+    }
   });
 }
 
@@ -301,8 +339,9 @@ function onFoundryConnection(ws) {
 function onHandshakeMessage(ws, msg) {
   if (msg.hello && !ws.hello) {
     const { hello } = msg;
-    // Exact, short strings only: these values are signed and logged.
-    const short = (value) => typeof value === 'string' && value.length <= 200;
+    // Exact, short strings only, with no line breaks or other control characters: these values
+    // are signed joined by line breaks, and logged.
+    const short = (value) => typeof value === 'string' && value.length <= 200 && !/[\x00-\x1f\x7f]/.test(value);
     if (!hello || typeof hello !== 'object' || ![hello.world, hello.core, hello.system, hello.session, hello.nonce].every(short)) {
       return ws.close(4002, 'Malformed hello (is the module out of date?)');
     }
@@ -338,12 +377,68 @@ function register(ws) {
 
 // -------------------------------------------------------------------- MCP side
 
-const asText = (value) => {
-  let text = JSON.stringify(value, null, 1);
-  if (text.length > MAX_RESULT_CHARS) {
-    text = `${text.slice(0, MAX_RESULT_CHARS)}\n... [truncated ${text.length - MAX_RESULT_CHARS} chars; ask for less data]`;
+// Tool replies are JSON text that clients may parse, so one that is too long is cut where JSON
+// allows it (inside strings, at the end of lists and objects) and stays valid, rather than being
+// sliced mid-value. `budget` is roughly the characters the copy may hold.
+function prune(value, budget) {
+  const cut = (text) => {
+    const room = Math.max(0, budget);
+    budget -= text.length + 4;
+    return text.length > room ? `${text.slice(0, room)}[Truncated ${text.length - room} chars]` : text;
+  };
+  const walk = (v) => {
+    if (typeof v === 'string') return cut(v);
+    budget -= 4;
+    if (!v || typeof v !== 'object') return v;
+    if (Array.isArray(v)) {
+      const out = [];
+      for (const item of v) {
+        if (budget <= 0) {
+          out.push(`[Truncated ${v.length - out.length} more items]`);
+          break;
+        }
+        out.push(walk(item));
+      }
+      return out;
+    }
+    const out = Object.create(null); // so a key named "__proto__" stays an ordinary key
+    const keys = Object.keys(v);
+    for (const [index, key] of keys.entries()) {
+      if (budget <= 0) {
+        out['[Truncated]'] = `${keys.length - index} more keys omitted`;
+        break;
+      }
+      out[cut(key)] = walk(v[key]);
+    }
+    return out;
+  };
+  return walk(value);
+}
+
+// `keep` holds the small fields that must survive whatever happens to the rest (logSeq).
+const asText = (value, keep = {}) => {
+  const whole = JSON.stringify({ ...value, ...keep }, null, 1);
+  if (whole.length <= MAX_RESULT_CHARS) return whole;
+  const truncated = { chars: whole.length, limit: MAX_RESULT_CHARS, note: 'This reply was too long. Parts marked [Truncated] were cut; ask for less data.' };
+  // Indentation and escaping make the text longer than the budget predicts, so shrink until it fits.
+  // The smallest fields are fitted first, so a huge result is what gets cut, not the console output beside it.
+  const size = ([, field]) => JSON.stringify(field)?.length ?? 0;
+  const smallestFirst = Object.fromEntries(Object.entries(value).sort((a, b) => size(a) - size(b)));
+  for (let budget = MAX_RESULT_CHARS; ; budget = Math.floor(budget / 2)) {
+    const pruned = prune(smallestFirst, budget);
+    const inOrder = Object.fromEntries([...Object.keys(value), '[Truncated]'].filter((key) => key in pruned).map((key) => [key, pruned[key]]));
+    const text = JSON.stringify({ ...inOrder, truncated, ...keep }, null, 1);
+    if (text.length <= MAX_RESULT_CHARS) return text;
   }
-  return text;
+};
+
+// Log replies lose their oldest entries instead: the newest are the ones a caller is after.
+const logsText = (result) => {
+  for (let entries = result.entries; ; entries = entries.slice(Math.ceil(entries.length / 4))) {
+    const omitted = result.entries.length - entries.length;
+    const text = JSON.stringify({ ...result, entries, ...(omitted ? { entriesOmitted: omitted } : {}) }, null, 1);
+    if (text.length <= MAX_RESULT_CHARS || entries.length <= 1) return text;
+  }
 };
 
 const requestScope = new AsyncLocalStorage(); // the AbortSignal of the HTTP request being served
@@ -354,7 +449,7 @@ async function runTool(code, timeoutMs) {
     const reply = await callFoundry(code, timeoutMs, requestScope.getStore());
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
-    return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, logSeq }) }], isError: !reply.ok };
+    return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped }, { logSeq }) }], isError: !reply.ok };
   } catch (error) {
     return { content: [{ type: 'text', text: error.message }], isError: true };
   }
@@ -403,7 +498,8 @@ function buildMcpServer() {
           'The code is the body of an async function: use `await` freely and `return` the value you want. ' +
           'All Foundry globals are available (game, canvas, ui, CONFIG, foundry, Hooks, fromUuid, ChatMessage, Roll, ...), ' +
           'plus `signal`, an AbortSignal that fires if the call times out; long-running code should check `signal.aborted`. ' +
-          'Documents and collections are serialized with toObject(); return only the fields you need, large results are truncated. ' +
+          'Documents and collections are serialized with toObject(); return only the fields you need. A reply over 80,000 characters ' +
+          'is cut down but stays valid JSON: cut parts are marked [Truncated] and a `truncated` field is added. ' +
           'console.log/warn/error output during the run is returned as `logs`. Errors raised later (hooks, workflows, timers) are not: ' +
           'read them with foundry_logs, passing the returned `logSeq` as `since`. This can change or delete anything a GM can.',
         inputSchema: z.object({
@@ -425,7 +521,8 @@ function buildMcpServer() {
         'the first is usually the one that logged it), `fromEval` (true when code sent through foundry_eval is on the stack), ' +
         'text, stack and a repeat count. ' +
         'The buffer is bounded and shared by all clients; it survives world reloads but not a hub restart. ' +
-        'Works while Foundry is disconnected. Prefer `since` over `clear`, because clearing affects every client.',
+        'Works while Foundry is disconnected. Prefer `since` over `clear`, because clearing affects every client. ' +
+        'If the matches are too long for one reply, the oldest are left out and counted in `entriesOmitted`: lower `limit` or raise `since`.',
       inputSchema: z.object({
         since: z.number().int().min(0).optional().describe('Only entries with seq greater than this. Use the logSeq returned by foundry_eval.'),
         level: z.enum(LEVELS).optional().describe('Minimum level. "info" (default) also includes connect/disconnect markers.'),
@@ -435,7 +532,7 @@ function buildMcpServer() {
         clear: z.boolean().optional().describe('Empty the whole buffer after this read.'),
       }),
     },
-    (args) => ({ content: [{ type: 'text', text: asText(queryLogs(args)) }] })
+    (args) => ({ content: [{ type: 'text', text: logsText(queryLogs(args)) }] })
   );
 
   return server;
@@ -493,6 +590,8 @@ const sockets = new WebSocketServer({
   server: http,
   path: '/foundry',
   maxPayload: 16 * 1024 * 1024,
+  // Origin is the control here. Host is not checked as it is for /mcp: a page that reached this
+  // port by DNS rebinding still sends its own origin, which is not on the list.
   verifyClient: ({ origin }) => config.origins.includes(origin),
 });
 sockets.on('connection', onFoundryConnection);

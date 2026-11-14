@@ -1,7 +1,7 @@
 // End-to-end checks without Foundry: starts hubs, loads the real module script
 // against stubbed Foundry globals, and calls the tools over MCP HTTP.
 // Everything here is simulated; see README "Verifying against a real world".
-// Run with: npm test   (takes about 40 s because it waits out real reconnects)
+// Run with: npm test   (takes about 45 s because it waits out real reconnects)
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -40,7 +40,7 @@ function startHub(env) {
 const hubs = [
   startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_LOG_LIMIT: 60 }),
   startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: `${TOKEN} ` }), // trailing space, as a shell can add
-  startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
+  startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false', FOUNDRY_MCP_ORIGINS: 'http://LOCALHOST:30000/' }), // origin as a person might type it
   startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
 ];
 
@@ -110,17 +110,19 @@ async function startModule(url, token, beforeReady) {
 }
 // A hand-rolled socket for playing a second tab, a hostile page, or a client with the wrong token.
 // `firstMessage` replaces the hello; `claimedWorld` is what a relay would rewrite the hello to say.
+// `reported` overrides what the module says about itself (and proves); `relayed` what reaches the hub instead.
 const sign = (key, text) => createHmac('sha256', key).update(text).digest();
 const bindingOf = (hello, hubNonce) => [hello.nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
-function rawSocket(port, origin, token, { firstMessage, claimedWorld } = {}) {
+function rawSocket(port, origin, token, { firstMessage, claimedWorld, reported = {}, relayed = {} } = {}) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
-  const hello = { protocol: 5, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc' };
+  const hello = { protocol: 5, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc', ...reported };
+  const sent = { ...hello, world: claimedWorld ?? hello.world, ...relayed };
   return new Promise((resolve) => {
-    ws.addEventListener('open', () => ws.send(firstMessage ?? JSON.stringify({ hello: { ...hello, world: claimedWorld ?? hello.world } })));
+    ws.addEventListener('open', () => ws.send(firstMessage ?? JSON.stringify({ hello: sent })));
     ws.addEventListener('message', (event) => {
       const msg = JSON.parse(event.data);
       if (msg.challenge) {
-        const expected = sign(TOKEN, `hub\n${bindingOf({ ...hello, world: claimedWorld ?? hello.world }, msg.challenge.nonce)}`).toString('hex');
+        const expected = sign(TOKEN, `hub\n${bindingOf(sent, msg.challenge.nonce)}`).toString('hex');
         assert.equal(msg.challenge.proof, expected, 'the hub proves it knows the token');
         ws.send(JSON.stringify({ proof: sign(token ?? '', `module\n${bindingOf(hello, msg.challenge.nonce)}`).toString('hex') }));
       } else resolve({ ws, outcome: msg.welcome ? 'welcomed' : 'other' });
@@ -131,6 +133,16 @@ function rawSocket(port, origin, token, { firstMessage, claimedWorld } = {}) {
 }
 const fixture = await import('./test-fixtures/modules/fake-automation/scripts/workflow.js');
 globalThis.fakeAutomation = fixture;
+
+// Wait for something to become true instead of guessing how long it takes.
+const until = async (probe, what) => {
+  for (let tries = 0; tries < 200; tries++) {
+    const value = await probe();
+    if (value) return value;
+    await sleep(50);
+  }
+  assert.fail(`timed out waiting for ${what}`);
+};
 
 let passed = 0;
 const check = async (name, fn) => {
@@ -220,6 +232,13 @@ try {
     assert.deepEqual(odd.result, { bad: 'Invalid Date', bytes: '[Uint8Array 1000 bytes]', map: { a: 1 }, boom: '[Unreadable]' });
     const loops = await evalCode(`const m = new Map(); m.set('self', m); const s = new Set(); s.add(s); return { m, s, viaToObject: { toObject: () => 'plain' } };`);
     assert.deepEqual(loops.result, { m: { self: '[Circular]' }, s: ['[Circular]'], viaToObject: 'plain' });
+    // A Foundry Collection is a Map that iterates its values, not its entries (found against a real world: `return game.actors`).
+    const collection = await evalCode(`class Collection extends Map { [Symbol.iterator]() { return this.values(); } }
+      return new Collection([['a1', game.actors.get('a1')], ['n', 2]]);`);
+    assert.deepEqual(collection.result, { a1: { name: 'Test Actor', flags: { mcp: { ok: true } } }, n: 2 });
+    // A key named "__proto__" (a flags object can have one) is data like any other key.
+    const proto = await callTool('foundry_eval', { code: `return { map: new Map([['__proto__', { a: 1 }], ['z', 2]]), plain: JSON.parse('{"__proto__": 5, "y": 1}') };` });
+    assert.equal(JSON.stringify(JSON.parse(proto.content[0].text).result), '{"map":{"__proto__":{"a":1},"z":2},"plain":{"__proto__":5,"y":1}}');
   });
 
   await check('a timeout returns promptly and aborts the signal given to the code', async () => {
@@ -244,6 +263,32 @@ try {
     assert.equal(refused.length, 1);
     assert.match(refused[0].content[0].text, /already running/);
     assert.deepEqual(replies.filter((r) => !r.isError).map((r) => payload(r).result), Array.from({ length: 16 }, (_, i) => i));
+  });
+
+  await check('a console line is turned into text once, however many evaluations are listening', async () => {
+    // Counted, not timed: three evaluations wait at a gate while something logs an object.
+    globalThis.gate = [];
+    const calls = Array.from({ length: 3 }, () => evalCode(`await new Promise((r) => globalThis.gate.push(r)); return 1;`));
+    await until(() => globalThis.gate.length === 3, 'three evaluations to be running');
+    let serialized = 0;
+    console.warn('watched', { toObject() { serialized += 1; return { hp: 7 }; } });
+    assert.equal(serialized, 1, 'serialized once for three captures and the log buffer');
+    // A huge object costs a bounded amount of work, because a line keeps only 8000 characters of it.
+    let reads = 0;
+    const big = {};
+    for (let i = 0; i < 20_000; i++) Object.defineProperty(big, `k${i}`, { enumerable: true, get: () => ((reads += 1), i) });
+    console.warn(big);
+    assert.ok(reads <= 5000, `read ${reads} of 20000 properties`);
+    // console.log is kept by nobody once no evaluation is listening, so it is not serialized at all.
+    globalThis.gate.forEach((open) => open());
+    const replies = await Promise.all(calls);
+    for (const reply of replies) {
+      assert.equal(reply.logs[0].text, 'watched {"hp":7}');
+      assert.equal(reply.logs[1].text.length, 8000);
+    }
+    serialized = 0;
+    console.log('unwatched', { toObject() { serialized += 1; return {}; } });
+    assert.equal(serialized, 0);
   });
 
   // -------------------------------------------------------------------- logs
@@ -335,6 +380,25 @@ try {
     assert.deepEqual(reply.logs, [{ level: 'log', text: expected }]);
   });
 
+  await check('everyday credential shapes are redacted: plain "token:", empty user names, "@" in passwords, known key prefixes', async () => {
+    const before = (await getLogs()).lastSeq;
+    const cases = [
+      ['token: abc123 secret: s3cr3tvalue', 'token: [redacted] secret: [redacted]'],
+      ['token: "abc123" Secret: longenoughtobeakey', 'token: "[redacted]" Secret: [redacted]'],
+      // Everyday tabletop text is left alone.
+      ['Token: Goblin Secret: a hidden door token: "Goblin" Token: 5', 'Token: Goblin Secret: a hidden door token: "Goblin" Token: 5'],
+      ['redis://:sup3rSecret@cache.local:6379/0', 'redis://:[redacted]@cache.local:6379/0'],
+      ['mongodb://admin:p@ssw0rdMore@db.local/x', 'mongodb://admin:[redacted]@db.local/x'],
+      ['amqp://user:pa@ss@mq.local?x=1 next', 'amqp://user:[redacted]@mq.local?x=1 next'],
+      ['http://localhost:30000/modules/x.js mail gm@example.com', 'http://localhost:30000/modules/x.js mail gm@example.com'],
+      ['{"url":"http://host:8080","email":"gm@example.com"}', '{"url":"http://host:8080","email":"gm@example.com"}'],
+      ['aws AKIAIOSFODNN7EXAMPLE stripe sk_live_abc123DEF456 github ghp_abcdefghij0123456789ABCD', 'aws [redacted] stripe [redacted] github [redacted]'],
+    ];
+    console.error(cases.map(([input]) => input).join('\n'));
+    const [entry] = (await until(async () => { const logs = await getLogs({ since: before }); return logs.entries.length && logs; }, 'the log entry')).entries;
+    assert.deepEqual(entry.text.split('\n'), cases.map(([, output]) => output));
+  });
+
   await check('level, text and limit filters work; console.log is not retained', async () => {
     const before = (await getLogs()).lastSeq;
     console.log('just chatter');
@@ -379,13 +443,33 @@ try {
     // which reveals how much the browser sent. Unbounded, each of these is about a million characters.
     const sentChars = async (code) => {
       const text = (await callTool('foundry_eval', { code })).content[0].text;
-      return 80_000 + Number(text.match(/truncated (\d+) chars/)[1]);
+      assert.ok(text.length <= 80_000, 'the reply is within the limit');
+      const cut = JSON.parse(text); // a cut reply is still JSON, and keeps the fields a caller needs
+      assert.equal(typeof cut.logSeq, 'number');
+      assert.deepEqual(cut.logs, []);
+      assert.match(JSON.stringify(cut.result), /\[Truncated/);
+      return cut.truncated.chars;
     };
     assert.ok((await sentChars(`return 'x'.repeat(1_000_000);`)) < 450_000, 'long strings are cut');
     assert.ok((await sentChars(`return Array.from({ length: 100_001 }, (_, i) => 100_000 + i);`)) < 600_000, 'long lists are cut');
     assert.ok((await sentChars(`return new Set(Array.from({ length: 100_001 }, (_, i) => 100_000 + i));`)) < 600_000, 'long sets are cut');
     assert.ok((await sentChars(`return { ['k'.repeat(1_000_000)]: 1 };`)) < 450_000, 'long keys are cut');
     assert.ok((await sentChars(`return { toObject: () => 'x'.repeat(1_000_000) };`)) < 450_000, 'text from toObject() is cut');
+    // Text that doubles in size when written as JSON still ends up within the limit.
+    assert.ok((await sentChars(`return '"'.repeat(300_000);`)) > 80_000);
+  });
+
+  await check('a log reply that is too long drops its oldest entries and stays valid JSON', async () => {
+    const before = (await getLogs()).lastSeq;
+    for (let i = 0; i < 50; i++) console.warn(`entry ${i} ${'lorem ipsum '.repeat(160)}`);
+    await until(async () => (await getLogs({ since: before, limit: 1 })).matched === 50, 'fifty entries to arrive');
+    const result = await callTool('foundry_logs', { since: before, limit: 200 });
+    assert.ok(result.content[0].text.length <= 80_000);
+    const logs = payload(result);
+    assert.equal(logs.matched, 50);
+    assert.ok(logs.entriesOmitted > 0);
+    assert.equal(logs.entries.length + logs.entriesOmitted, 50);
+    assert.match(logs.entries.at(-1).text, /^entry 49 /, 'the newest entries are the ones kept');
   });
 
   await check('a flood is rate-limited in the browser and the buffer stays bounded', async () => {
@@ -442,6 +526,23 @@ try {
       assert.equal(result.code ?? result.outcome, expected, firstMessage);
     }
     assert.equal((await evalCode('return 7')).result, 7);
+  });
+
+  await check('a log line with an impossible time is kept and does not cost the connection', async () => {
+    // This hub was given its origin as "http://LOCALHOST:30000/"; being welcomed shows it was normalised.
+    const tab = await rawSocket(BARE_PORT, ORIGIN);
+    assert.equal(tab.outcome, 'welcomed');
+    const times = [1e20, 8.64e15 + 1, -1e20, 'soon', null, 1e12];
+    times.forEach((time, i) => tab.ws.send(JSON.stringify({ log: { time, level: 'warn', text: `odd time ${i}` } })));
+    const logs = await until(async () => {
+      const found = payload(await callTool('foundry_logs', { contains: 'odd time' }, { port: BARE_PORT }));
+      return found.entries.length === times.length && found;
+    }, 'all six log lines');
+    assert.equal(logs.connected, true);
+    assert.ok(logs.entries.every((entry) => !Number.isNaN(Date.parse(entry.time))));
+    assert.equal(logs.entries.at(-1).time, '2001-09-09T01:46:40.000Z', 'a sensible time is still used as given');
+    tab.ws.close();
+    await until(async () => !payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, 'the hub to notice the close');
   });
 
   await check('clients that open with an MCP initialize handshake are served', async () => {
@@ -547,6 +648,15 @@ try {
   await check('a relay cannot change the world the module reported', async () => {
     // The proof is computed over "test-world", but the hello that reaches the hub says otherwise.
     assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { claimedWorld: 'another-world' }), { outcome: 'closed', code: 4003 });
+  });
+
+  await check('a relay cannot move text between the fields the module reported', async () => {
+    // Joined with line breaks, these two hellos are the same text, so the module's proof fits both.
+    const reported = { world: 'test-world\nx', core: 'x', system: '14', session: 'sess' };
+    const relayed = { world: 'test-world', core: 'x', system: 'x', session: '14\nsess' };
+    assert.equal(bindingOf({ nonce: 'abc', protocol: 5, ...reported }, 'n'), bindingOf({ nonce: 'abc', protocol: 5, ...relayed }, 'n'));
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { reported, relayed }), { outcome: 'closed', code: 4002 });
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { reported }), { outcome: 'closed', code: 4002 });
   });
 
   await check('a module with the token proves itself, checks the hub, and then works', async () => {
@@ -677,6 +787,12 @@ try {
       ['limit.json', '{ "token": "", "logLimit": "not-a-number" }', /"logLimit" must be/],
       ['worlds.json', '{ "token": "", "worlds": "my-world" }', /"worlds" must be a list/],
       ['broken.json', '{ not json', /Cannot read/],
+      // Values that used to start a hub which then silently refused everything, or silently ran unprotected.
+      ['origin-star.json', '{ "token": "", "origins": ["*"] }', /"origins" does not support "\*"/],
+      ['origin-path.json', '{ "token": "", "origins": ["http://localhost:30000/game"] }', /only the scheme, host and port/],
+      ['token-blank.json', '{ "token": "   " }', /"token" is blank/],
+      ['token-newline.json', '{ "token": "abcdefgh12345678\\nijklmnop" }', /line break or control character/],
+      ['limit-huge.json', '{ "token": "", "logLimit": 5000000 }', /"logLimit" must be a whole number from 1 to 10000/],
     ]) {
       const run = start(name, content);
       assert.equal(run.status, 1, name);
