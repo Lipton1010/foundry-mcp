@@ -232,7 +232,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 |---|---|
 | Foundry VTT | 14.370 (desktop app, world served at `http://localhost:30000`) |
 | Game system | dnd5e 6.0.6 |
-| Automation modules present | midi-qol 14.6.11, DAE 14.6.9, libWrapper 1.13.5.1, and about 50 others |
+| Automation modules present | midi-qol 14.6.11 and 14.6.12, DAE 14.6.9, libWrapper 1.13.5.1, and about 50 others |
 | Node.js | 24.16 |
 | MCP SDK | `@modelcontextprotocol/server` 2.4.0, `@modelcontextprotocol/node` 2.1.2 |
 | Clients | Claude Code 2.1.325, Codex CLI 0.169.0, Cursor 3.30.14 (agent CLI 2026.11.13), OpenCode 2.3.0 |
@@ -245,8 +245,11 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - Logs: start-up warnings from other modules, an asynchronous error raised after `foundry_eval` returned, and a real
   midi-qol workflow whose on-use macro threw, attributed to `midi-qol`.
 - Redaction of synthetic credentials in eval output, in an asynchronous console error and in a UI notification.
-- The token handshake with the real module: the correct token connects, a wrong token is refused, and a hub reached
-  without the bearer token answers 401.
+- The token handshake with the real module: the correct token connects, signed commands run, a signed cancel reaches
+  the code after a timeout, a wrong token is refused, and a hub reached without the bearer token answers 401.
+- A hub whose allowlist does not include the open world refuses its connection, runs nothing and keeps no logs.
+- A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
+- The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
 ### Tested in simulation only (`npm test`, 43 checks)
 
