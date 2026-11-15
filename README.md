@@ -5,7 +5,7 @@ session, and see the warnings and errors its changes cause. It is for people who
 automation and want an agent that can run code in a **test** world.
 
 Works with any MCP client that supports streamable HTTP servers. Tested with Claude Code, Codex, Cursor and OpenCode;
-Antigravity is documented but not yet tested end to end (see [docs/clients.md](docs/clients.md)).
+Antigravity connects and calls the tools but has not yet been run against a world (see [docs/clients.md](docs/clients.md)).
 
 > **This gives the agent full GM power.** `foundry_eval` runs arbitrary JavaScript as the GM, and whatever the agent
 > reads from your world is sent to the AI provider behind your client. Use a copy of your world and read
@@ -274,7 +274,9 @@ private.
 
 ### Not tested
 
-- **Antigravity** end to end. Its configuration format is taken from Google's documentation.
+- **Antigravity** against a world. Antigravity 2.32.1 read the documented global file, listed the three tools and
+  called `foundry_status` and `foundry_logs` on a tokenless hub with no world connected. A token and a connected
+  world have not been tried.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, and real Foundry on Linux or in a browser other than
   the desktop app. CI runs the simulated tests on Linux, and the hub's handling of its config file has been run

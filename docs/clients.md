@@ -26,7 +26,7 @@ If you run the hub with `"token": ""`, leave out the `headers` / bearer settings
 | Codex CLI | 0.169.0 | streamable HTTP | yes (from env var) | **Tested end to end**, with and without token |
 | Cursor | 3.30.14, agent CLI 2026.11.13 | streamable HTTP | yes | **Tested end to end**, with and without token |
 | OpenCode | 2.3.0 | streamable HTTP (`remote`) | yes | **Tested end to end**, with and without token |
-| Antigravity | none (2.32.1 was installed, not run) | streamable HTTP (`serverUrl`) | yes, per documentation | **Not tested end to end.** Configuration follows Google's documentation |
+| Antigravity | 2.32.1 | streamable HTTP (`serverUrl`) | yes, per documentation | **Partly tested**, without token: listed the tools and called `foundry_status` and `foundry_logs` with no world connected |
 
 "End to end" means the client listed the three tools, called `foundry_status` and got the test world back, and read
 `foundry_logs`. Every test used a read-only call.
@@ -76,7 +76,8 @@ OpenCode 2.x keeps servers under `mcp.servers`. Merge [`examples/opencode.json`]
 
 ## Antigravity
 
-Not tested end to end; this follows [Google's MCP documentation](https://antigravity.google/docs/mcp).
+Partly tested (see the table above); this follows [Google's MCP documentation](https://antigravity.google/docs/mcp).
+The global file below was read by Antigravity 2.32.1 as written.
 
 Put [`examples/antigravity.mcp_config.json`](../examples/antigravity.mcp_config.json) at
 `~/.gemini/config/mcp_config.json` (all projects) or `<workspace>/.agents/mcp_config.json` (one workspace).
