@@ -4,8 +4,8 @@ Lets a coding agent read and change a [Foundry VTT](https://foundryvtt.com) worl
 session, and see the warnings and errors its changes cause. It is for people who build macros, modules and
 automation and want an agent that can run code in a **test** world.
 
-Works with any MCP client that supports streamable HTTP servers. Tested with Claude Code, Codex, Cursor and OpenCode;
-Antigravity connects and calls the tools but has not yet been run against a world (see [docs/clients.md](docs/clients.md)).
+Works with any MCP client that supports streamable HTTP servers. Tested with Claude Code, Codex, Cursor, OpenCode
+and Antigravity (see [docs/clients.md](docs/clients.md)).
 
 > **This gives the agent full GM power.** `foundry_eval` runs arbitrary JavaScript as the GM, and whatever the agent
 > reads from your world is sent to the AI provider behind your client. Use a copy of your world and read
@@ -241,12 +241,13 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 | Automation modules present | midi-qol 14.6.11 and 14.6.12, DAE 14.6.9, libWrapper 1.13.5.1, and about 50 others |
 | Node.js | 24.16 |
 | MCP SDK | `@modelcontextprotocol/server` 2.4.0, `@modelcontextprotocol/node` 2.1.2 |
-| Clients | Claude Code 2.1.325, Codex CLI 0.169.0, Cursor 3.30.14 (agent CLI 2026.11.13), OpenCode 2.3.0 |
+| Clients | Claude Code 2.1.325, Codex CLI 0.169.0, Cursor 3.30.14 (agent CLI 2026.11.13), OpenCode 2.3.0, Antigravity 2.32.1 |
 
 ### Tested against a real world
 
-- `foundry_status` and `foundry_logs` from Claude Code, Codex, Cursor and OpenCode, with and without a hub token.
-  `foundry_eval` from Claude Code and Codex; the Cursor and OpenCode runs were kept to read-only calls.
+- `foundry_status` and `foundry_logs` from Claude Code, Codex, Cursor and OpenCode, with and without a hub token,
+  and from Antigravity without one. `foundry_eval` from all five, read-only in every client but Claude Code and
+  Codex, including a whole-collection result cut down to valid JSON.
 - Reading and writing document flags, and automatic reconnection after a world reload.
 - Logs: start-up warnings from other modules, an asynchronous error raised after `foundry_eval` returned, and a real
   midi-qol workflow whose on-use macro threw, attributed to `midi-qol`.
@@ -274,9 +275,7 @@ private.
 
 ### Not tested
 
-- **Antigravity** against a world. Antigravity 2.32.1 read the documented global file, listed the three tools and
-  called `foundry_status` and `foundry_logs` on a tokenless hub with no world connected. A token and a connected
-  world have not been tried.
+- **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, and real Foundry on Linux or in a browser other than
   the desktop app. CI runs the simulated tests on Linux, and the hub's handling of its config file has been run
