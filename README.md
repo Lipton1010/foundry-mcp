@@ -261,13 +261,13 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 50 checks)
+### Tested in simulation only (`npm test`, 51 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
 origin, Host and method checks, malformed socket messages, a second GM tab, the world allowlist (including an empty
 one), a relay altering the reported world or moving text between the reported fields, a module refusing an unsigned or replayed command or a hub that cannot prove it knows
-the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects,
+the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects, a socket that fails to send,
 the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
 user, `allowEval: false`, and token generation with file permissions.
 

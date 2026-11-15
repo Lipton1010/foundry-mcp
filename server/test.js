@@ -19,6 +19,7 @@ const PORT = 30199; // no token, small log buffer
 const TOKEN_PORT = 30198; // token required
 const BARE_PORT = 30197; // no token, eval disabled, nothing connected: stands in for an impostor hub
 const FRESH_PORT = 30196; // a config copied from the example: no token, no worlds, world-readable
+const FAULT_PORT = 30194; // no token; its sockets can be made to fail on send (test-fixtures/fault-send.mjs)
 const FAKE_PORT = 30195; // a hand-rolled hub that knows the token but sends an unsigned command
 const TOKEN = 'correct-horse-battery';
 const ORIGIN = 'http://localhost:30000';
@@ -27,10 +28,10 @@ const freshConfig = join(tmp, 'config.json');
 writeFileSync(freshConfig, '{ "worlds": [] }');
 chmodSync(freshConfig, 0o644);
 
-function startHub(env) {
+function startHub(env, nodeArgs = []) {
   const base = { ...process.env };
   for (const key of Object.keys(base)) if (key.startsWith('FOUNDRY_MCP_')) delete base[key];
-  return spawn(process.execPath, ['index.js'], {
+  return spawn(process.execPath, [...nodeArgs, 'index.js'], {
     cwd: import.meta.dirname,
     // Point at a config file that does not exist so a local config.json is never read.
     env: { ...base, FOUNDRY_MCP_CONFIG: join(tmp, 'none.json'), FOUNDRY_MCP_WORLDS: 'test-world', ...env },
@@ -42,6 +43,7 @@ const hubs = [
   startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: `${TOKEN} ` }), // trailing space, as a shell can add
   startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false', FOUNDRY_MCP_ORIGINS: 'http://LOCALHOST:30000/' }), // origin as a person might type it
   startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
+  startHub({ FOUNDRY_MCP_PORT: FAULT_PORT, FOUNDRY_MCP_TOKEN: '' }, ['--import', new URL('./test-fixtures/fault-send.mjs', import.meta.url).href]),
 ];
 
 async function mcp(method, params, { headers = {}, port = PORT, httpMethod = 'POST' } = {}) {
@@ -153,7 +155,7 @@ const check = async (name, fn) => {
 
 try {
   // Wait until every hub answers instead of guessing how long start-up takes.
-  for (const port of [PORT, TOKEN_PORT, BARE_PORT, FRESH_PORT]) {
+  for (const port of [PORT, TOKEN_PORT, BARE_PORT, FRESH_PORT, FAULT_PORT]) {
     for (let tries = 0; ; tries++) {
       try {
         await fetch(`http://127.0.0.1:${port}/`);
@@ -543,6 +545,25 @@ try {
     assert.equal(logs.entries.at(-1).time, '2001-09-09T01:46:40.000Z', 'a sensible time is still used as given');
     tab.ws.close();
     await until(async () => !payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, 'the hub to notice the close');
+  });
+
+  await check('a socket that fails to send costs one call, not the hub', async () => {
+    // A stand-in tab that never answers, on a hub whose sockets fail on demand.
+    const tab = await rawSocket(FAULT_PORT, ORIGIN);
+    assert.equal(tab.outcome, 'welcomed');
+    const options = { port: FAULT_PORT };
+    const unsent = await callTool('foundry_eval', { code: '/* FAULT_SEND */ return 1' }, options);
+    assert.equal(unsent.isError, true);
+    assert.match(unsent.content[0].text, /could not be sent to Foundry/);
+    // The cancel that follows a timeout is sent from a timer, where a throw would end the process.
+    const timedOut = await callTool('foundry_eval', { code: '/* FAULT_CANCEL */ return 1', timeoutMs: 1000 }, options);
+    assert.match(timedOut.content[0].text, /Timed out/);
+    // Still running, and neither call kept a slot: sixteen more are accepted and the seventeenth is refused.
+    const more = Array.from({ length: 17 }, () => callTool('foundry_eval', { code: 'return 1', timeoutMs: 1000 }, options));
+    const replies = await Promise.all(more);
+    assert.equal(replies.filter((r) => /already running/.test(r.content[0].text)).length, 1);
+    assert.equal(replies.filter((r) => /Timed out/.test(r.content[0].text)).length, 16);
+    tab.ws.close();
   });
 
   await check('clients that open with an MCP initialize handshake are served', async () => {
