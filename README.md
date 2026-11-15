@@ -276,8 +276,10 @@ user, `allowEval: false`, and token generation with file permissions.
 - **Antigravity** end to end. Its configuration format is taken from Google's documentation.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, Linux (CI runs the simulated tests on Linux), and
-  browsers other than the Foundry desktop app. Log attribution reads Chromium-style stack traces; Firefox and
-  Safari formats are parsed but have never been run.
+  real Foundry in a browser other than the desktop app. Log attribution reads Chromium-style stack traces. The
+  module itself has been run in Firefox 143, on a stand-in page rather than Foundry: the token handshake, redaction,
+  and attribution of a log entry to evaluated code and to another module all worked. The Safari format is parsed
+  but has never been run.
 - Foundry behind HTTPS, a reverse proxy or a hosting service. Browsers may block a secure page from reaching
   `ws://127.0.0.1`, and the GM's browser must run on the same computer as the hub.
 - Several GM tabs or several worlds at once.
