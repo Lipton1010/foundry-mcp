@@ -261,7 +261,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
 - A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 51 checks)
+### Tested in simulation only (`npm test`, 52 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -269,19 +269,25 @@ origin, Host and method checks, malformed socket messages, a second GM tab, the 
 one), a relay altering the reported world or moving text between the reported fields, a module refusing an unsigned or replayed command or a hub that cannot prove it knows
 the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects, a socket that fails to send,
 the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
-user, `allowEval: false`, and token generation with file permissions.
+user, `allowEval: false`, token generation with file permissions, and a config file that cannot be saved or made
+private.
 
 ### Not tested
 
 - **Antigravity** end to end. Its configuration format is taken from Google's documentation.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
-- Foundry 13 or earlier (the manifest requires 14), macOS, Linux (CI runs the simulated tests on Linux), and
-  real Foundry in a browser other than the desktop app. Log attribution reads Chromium-style stack traces. The
-  module itself has been run in Firefox 143, on a stand-in page rather than Foundry: the token handshake, redaction,
-  and attribution of a log entry to evaluated code and to another module all worked. The Safari format is parsed
-  but has never been run.
-- Foundry behind HTTPS, a reverse proxy or a hosting service. Browsers may block a secure page from reaching
-  `ws://127.0.0.1`, and the GM's browser must run on the same computer as the hub.
+- Foundry 13 or earlier (the manifest requires 14), macOS, and real Foundry on Linux or in a browser other than
+  the desktop app. CI runs the simulated tests on Linux, and the hub's handling of its config file has been run
+  by hand on Linux (WSL 2, Node 24.16): a token in a file owned by another account stops the hub, a world-readable
+  file of your own is made private, and a new token is not written to a folder the hub cannot write to.
+- Log attribution reads Chromium-style stack traces. The module itself has been run in Firefox 143, on a
+  stand-in page rather than Foundry: the token handshake, redaction, and attribution of a log entry to evaluated
+  code and to another module all worked. The Safari format is parsed but has never been run.
+- Real Foundry behind HTTPS, a reverse proxy or a hosting service. On a stand-in page served over https with a
+  self-signed certificate, the module connected from Edge 157 and Firefox 160 both straight to
+  `ws://127.0.0.1` and to a `wss://` address on a local TLS proxy in front of the hub, and MCP calls worked
+  through that proxy. Safari is known to be stricter about a secure page opening `ws://`. The GM's browser
+  must run on the same computer as the hub in every case.
 - Several GM tabs or several worlds at once.
 
 ### Planned, not built

@@ -823,6 +823,32 @@ try {
     assert.match(start('env.json', undefined, { FOUNDRY_MCP_PORT: 'abc' }).stderr, /"port" must be/);
   });
 
+  await check('a config file that cannot be saved or made private stops the hub', async () => {
+    // What happens when the file or its folder belongs to another account, simulated by a preload.
+    const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
+    const start = (name, content, fault) => {
+      const file = join(tmp, name);
+      writeFileSync(file, content);
+      return spawnSync(process.execPath, ['--import', new URL('./test-fixtures/fault-fs.mjs', import.meta.url).href, 'index.js'], {
+        cwd: import.meta.dirname,
+        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: '30193', FAULT_FS: fault },
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+    };
+    const unsaved = start('unsaved.json', '{ "worlds": [] }', 'write');
+    assert.equal(unsaved.status, 1);
+    assert.match(unsaved.stderr, /Cannot save a new token/);
+    assert.equal(readFileSync(join(tmp, 'unsaved.json'), 'utf8'), '{ "worlds": [] }', 'the old settings survive');
+    assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp')), []);
+    // Windows has no file modes, so the hub does not try to change them there.
+    if (process.platform !== 'win32') {
+      const exposed = start('exposed.json', '{ "token": "abcdefgh12345678ijkl" }', 'chmod');
+      assert.equal(exposed.status, 1);
+      assert.match(exposed.stderr, /holds the hub token but could not be made private/);
+    }
+  });
+
   await check('starting a second hub on a port in use explains the problem', async () => {
     const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
     const run = spawnSync(process.execPath, ['index.js'], {
