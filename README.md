@@ -21,6 +21,9 @@ dice. This one is for writing and debugging the code behind a game, and it is sm
 - **It reports what broke and which module broke it.** Warnings, errors and unhandled rejections are captured in the
   tab, including ones raised after a call has returned (a hook, a midi-qol workflow, a timer). Each is tagged with the
   modules on its stack and with whether your evaluated code was involved.
+- **It shows what your code changed, and makes dice repeatable.** Each call lists the documents it created,
+  updated or deleted, with earlier values, including changes made by automation it set off. Dice can be seeded or
+  forced, so a midi-qol workflow or an activity can be tested the same way every time.
 - **It keeps everything on your computer.** No hosted relay, no account and no paid tiers: the hub listens on
   loopback only, and nothing leaves your machine except what your MCP client sends to its AI provider.
 - **It treats full GM power as the risk it is.** A hub token, a signed command channel between hub and module, a
@@ -119,6 +122,48 @@ return { hp: actor.system.attributes?.hp?.value, flag: actor.getFlag('world', 'c
 - `logs` holds at most 200 lines per call; `logsDropped` counts the rest.
 - At most 16 evaluations can be unfinished at once, across all clients. Code that outlived its timeout still
   counts, so after 16 stuck calls nothing more runs until the world is reloaded.
+- `changes` lists the documents created, updated or deleted while the call ran, whether by your code or by
+  something it set off, such as a hook, a module or another user (at most 100; `changesOmitted` counts the rest).
+  `changesSeq` is a cursor for `foundry_changes`, for changes that land after the call returned:
+  ```json
+  "changes": [{ "seq": 7, "action": "update", "documentName": "Actor", "uuid": "Actor.ZsaSGuRfxgI7ltMz",
+    "name": "Training Dummy", "user": "Gamemaster", "self": true,
+    "changes": [{ "path": "flags.world.checked", "value": true, "before": null }] }],
+  "changesSeq": 6
+  ```
+
+### `foundry_changes`
+
+Lists document changes the GM's tab has seen, from any user or module, newest last. Arguments, all optional:
+`since` (a `changesSeq`), `documentName`, `uuid` (that document and the documents embedded in it) and `limit`
+(default 50). It is listed when `allowRead` is on.
+
+- An update lists each changed path with its new value. `before` is there for changes made from the GM's tab;
+  Foundry tells other clients only the result. A field removed with Foundry's deletion operator reads
+  `"deleted": true`.
+- A deletion carries the deleted document's data, if it is under 20,000 characters, so it can be created again.
+- Tracking starts with the first call to `foundry_eval` or `foundry_changes` and lasts until the page reloads. The
+  newest 500 changes are kept, in the browser's memory only; `evicted` counts the rest. Long text values are cut.
+- A text value under a credential-like name (password, secret, api key, a name ending in `token` or `key`, and so
+  on) is `[withheld]`, as are the values of settings named that way. This is best effort, as in `foundry_settings`.
+
+### `foundry_dice`
+
+Makes dice rolled in the GM's tab predictable, so that automation can be tested the same way every time. It is
+listed when `allowEval` is on.
+
+```json
+// arguments: { "seed": 42, "next": [{ "faces": 20, "result": 20 }] }
+{ "result": { "seed": 42, "queued": [{ "faces": 20, "result": 20 }], "forced": 0, "active": true } }
+```
+
+- `seed` (a whole number from 0 to 4294967295) replaces Foundry's random source with a seeded Mersenne Twister, so
+  the same rolls in the same order give the same results. `null` restores Foundry's own.
+- `next` queues exact results. Each is used by the first die it fits: one with that many `faces`, if given, and a
+  result within the die's range. Dice it does not fit roll normally. `clear` empties the queue first.
+- With no arguments it reports the state. Setting `seed` to `null` with an empty queue puts everything back.
+- Only rolls evaluated in the GM's tab are affected. Players' own rolls, and code that calls `Math.random`
+  itself, are not. A world reload undoes it.
 
 ### `foundry_logs`
 
@@ -321,7 +366,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 57 checks)
+### Tested in simulation only (`npm test`, 59 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -331,9 +376,17 @@ the token or whose proof is wrong, a client that disconnects mid-call, a call in
 the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
 user, the read-only tools (listing, searching, reading by UUID and by field, withheld settings, hostile
 arguments), `allowEval: false`, `allowRead: false`, agreement between the version numbers and the manifest's
-download address, token generation with file permissions, and a config file that cannot be saved or made private.
+download address, token generation with file permissions, a config file that cannot be saved or made private, and
+the change tracker and dice control (below).
 
 ### Not tested
+
+- **`foundry_changes` and `foundry_dice` against real Foundry.** In simulation, the tracker records updates with
+  their earlier values, creations, deletions with their data, Foundry's deletion operator and the older `-=key`
+  form, withholds credential-like values, and installs its hooks once; dice control seeds both
+  `CONFIG.Dice.randomUniform` and Foundry's "Mersenne" fulfillment method, fits queued results to dice, refuses an
+  invalid seed and restores Foundry's own functions. Both were written against Foundry 14.370's source, and seeding
+  was checked against its own `MersenneTwister`, but neither has run in a world yet.
 
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - The read-only tools called by name from a client against a real world (their code has been; see above), and

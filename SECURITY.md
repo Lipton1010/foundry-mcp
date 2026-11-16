@@ -42,7 +42,7 @@ players. It also means:
 ## Read-only mode
 
 With `allowEval: false` a client cannot send code. `foundry_status`, `foundry_documents`, `foundry_document` and
-`foundry_settings` are fixed code written in the hub; a client's arguments are checked for shape and passed to
+`foundry_settings` and `foundry_changes` are fixed code written in the hub; a client's arguments are checked for shape and passed to
 that code as JSON data. What this does not change:
 
 - **Reading is still disclosure.** Everything these tools return goes to the AI provider behind the client:
@@ -55,6 +55,9 @@ that code as JSON data. What this does not change:
   when this hub cannot change the world.
 - **The module is unchanged.** It still evaluates whatever its hub sends; read-only is a property of the hub. Use
   the token so that only your hub can be that hub.
+- **`foundry_changes` reports what everyone does.** It lists changes from every user, players included, while the
+  tab is open. Its buffer lives in the GM's browser memory only, and credential-like text values are withheld on
+  the same best-effort rule as settings.
 
 ## The token
 

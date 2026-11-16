@@ -242,8 +242,8 @@ try {
     assert.equal(logs.entries[0].level, 'error');
   });
 
-  await check('lists the six tools', async () => {
-    assert.deepEqual(await toolNames(), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_logs']);
+  await check('lists the eight tools', async () => {
+    assert.deepEqual(await toolNames(), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_dice', 'foundry_changes', 'foundry_logs']);
   });
 
   await check('status reports world and system without assuming dnd5e', async () => {
@@ -417,6 +417,119 @@ try {
     serialized = 0;
     console.log('unwatched', { toObject() { serialized += 1; return {}; } });
     assert.equal(serialized, 0);
+  });
+
+  // ------------------------------------------------- document changes and dice
+  await check('eval lists the document changes it caused; later ones, secrets withheld, come from foundry_changes', async () => {
+    const before = await evalCode('return 1;');
+    assert.equal(before.changes, undefined, 'no tracking without Foundry hooks');
+    assert.equal(before.changesSeq, undefined);
+    // The hook and document API the tracker uses, as Foundry 14 provides it.
+    const handlers = {};
+    Hooks.on = (name, fn) => (handlers[name] ??= []).push(fn);
+    Hooks.fire = (name, ...args) => (handlers[name] ?? []).forEach((fn) => fn(...args));
+    globalThis.CONST = { ALL_DOCUMENT_TYPES: ['Actor', 'Item', 'User', 'Setting'] };
+    globalThis.foundry = { utils: { getProperty: (object, path) => path.split('.').reduce((value, key) => value?.[key], object) } };
+    game.user.id = 'gm1';
+    game.users = new Map([['gm1', { name: 'Gamemaster' }], ['p1', { name: 'Player' }]]);
+    globalThis.testHero = { documentName: 'Actor', uuid: 'Actor.h1', name: 'Hero', parent: null, type: 'character', _source: { system: { hp: 10 } } };
+    // In Foundry the hooks exist before the first call; here they arrived late, so start tracking explicitly.
+    assert.equal(payload(await callTool('foundry_changes')).matched, 0);
+
+    const reply = await evalCode(`
+      const hero = globalThis.testHero;
+      Hooks.fire('preUpdateActor', hero, { system: { hp: 4 } });
+      hero._source.system.hp = 4;
+      Hooks.fire('updateActor', hero, { _id: 'h1', system: { hp: 4 }, _stats: { modifiedTime: 1 } }, {}, 'gm1');
+      Hooks.fire('updateActor', hero, { _id: 'h1', _stats: { modifiedTime: 2 } }, {}, 'gm1'); // nothing changed: not recorded
+      Hooks.fire('createItem', { documentName: 'Item', uuid: 'Actor.h1.Item.i1', name: 'Sword', type: 'weapon', parent: hero }, {}, 'gm1');
+      return 'done';`);
+    assert.equal(reply.result, 'done');
+    assert.deepEqual(reply.changes.map((change) => [change.action, change.uuid]), [['update', 'Actor.h1'], ['create', 'Actor.h1.Item.i1']]);
+    assert.deepEqual(reply.changes[0].changes, [{ path: 'system.hp', value: 4, before: 10 }]);
+    assert.equal(reply.changes[0].user, 'Gamemaster');
+    assert.equal(reply.changes[0].self, true);
+    assert.equal(reply.changes[1].parent, 'Actor.h1');
+    assert.equal(typeof reply.changesSeq, 'number');
+
+    // After the call returned: a player's changes, with Foundry's deletion operator, a deleted document and secrets.
+    const deletion = { toJSON: () => ({ __$OPERATOR$__: 'ForcedDeletion' }) };
+    Hooks.fire('updateUser', { documentName: 'User', uuid: 'User.p1', name: 'Player' }, { password: 'hunter2hunter2', flags: { mod: { old: deletion }, x: { '-=gone': null } } }, {}, 'p1');
+    Hooks.fire('updateSetting', { documentName: 'Setting', uuid: 'Setting.s9', key: 'weather.apiKey' }, { value: '"sk-live-1"' }, {}, 'gm1');
+    Hooks.fire('deleteActor', { documentName: 'Actor', uuid: 'Actor.h2', name: 'Old', type: 'npc', toObject: () => ({ name: 'Old', flags: { mod: { apiKey: 'abc123secret', note: 'kept' } } }) }, {}, 'p1');
+
+    const later = payload(await callTool('foundry_changes', { since: reply.changesSeq }));
+    assert.equal(later.matched, 5);
+    const [, , user, setting, removed] = later.entries;
+    assert.equal(user.self, false);
+    assert.equal(user.user, 'Player');
+    assert.deepEqual(user.changes, [{ path: 'password', value: '[withheld]' }, { path: 'flags.mod.old', deleted: true }, { path: 'flags.x.gone', deleted: true }]);
+    assert.deepEqual(setting.changes, [{ path: 'value', value: '[withheld]' }]);
+    assert.deepEqual(removed.data, { name: 'Old', flags: { mod: { apiKey: '[withheld]', note: 'kept' } } });
+    assert.ok(!JSON.stringify(later).includes('hunter2') && !JSON.stringify(later).includes('sk-live') && !JSON.stringify(later).includes('abc123secret'));
+
+    const scoped = payload(await callTool('foundry_changes', { since: reply.changesSeq, uuid: 'Actor.h1' }));
+    assert.deepEqual(scoped.entries.map((entry) => entry.uuid), ['Actor.h1', 'Actor.h1.Item.i1'], 'a uuid includes the documents embedded in it');
+    assert.equal(payload(await callTool('foundry_changes', { documentName: 'Setting' })).matched, 1);
+    assert.equal(handlers.updateActor.length, 1, 'the hooks are installed once');
+  });
+
+  await check('dice can be seeded and forced, and Foundry\'s own rolling comes back afterwards', async () => {
+    // Foundry 14's DiceTerm face mapping, and a stand-in for its Mersenne Twister.
+    class DiceTerm {
+      constructor(faces) {
+        this.faces = faces;
+        this.minValue = 1;
+      }
+      mapRandomFace(randomUniform) {
+        return this.minValue - 1 + Math.ceil((1 - randomUniform) * this.faces);
+      }
+      randomFace() {
+        return this.mapRandomFace(CONFIG.Dice.randomUniform());
+      }
+    }
+    class MersenneTwister {
+      constructor(seed) {
+        this.state = seed % 2147483647 || 1;
+      }
+      random() {
+        this.state = (this.state * 48271) % 2147483647;
+        return (this.state - 1) / 2147483646;
+      }
+    }
+    const ownRandom = () => Math.random();
+    const ownHandler = (term) => term.mapRandomFace(Math.random());
+    const ownMap = DiceTerm.prototype.mapRandomFace;
+    globalThis.CONFIG = { Dice: { randomUniform: ownRandom, fulfillment: { methods: { mersenne: { handler: ownHandler } } } } };
+    foundry.dice = { terms: { DiceTerm }, MersenneTwister };
+    const d20s = () => Array.from({ length: 8 }, () => new DiceTerm(20).randomFace());
+    const dice = async (args) => payload(await callTool('foundry_dice', args)).result;
+
+    assert.deepEqual(await dice({}), { seed: null, queued: [], forced: 0, active: false });
+    assert.equal((await dice({ seed: 42 })).seed, 42);
+    const first = d20s();
+    await dice({ seed: 42 });
+    assert.deepEqual(d20s(), first, 'the same seed gives the same rolls');
+    await dice({ seed: 42 });
+    assert.deepEqual(Array.from({ length: 8 }, () => CONFIG.Dice.fulfillment.methods.mersenne.handler(new DiceTerm(20))), first, 'the Mersenne fulfillment method is seeded too');
+
+    const queued = await dice({ next: [{ faces: 20, result: 20 }, { result: 3 }, { result: 9 }] });
+    assert.equal(queued.queued.length, 3);
+    assert.equal(new DiceTerm(6).randomFace(), 3, 'an entry without faces is used by the first die it fits');
+    assert.ok(new DiceTerm(4).randomFace() <= 4, 'a d20 entry and a 9 do not fit a d4');
+    assert.equal(new DiceTerm(20).randomFace(), 20);
+    const state = await dice({});
+    assert.equal(state.forced, 2);
+    assert.deepEqual(state.queued, [{ result: 9 }]);
+    assert.deepEqual((await dice({ clear: true })).queued, []);
+
+    assert.deepEqual(await dice({ seed: null }), { seed: null, queued: [], forced: 2, active: false });
+    assert.equal(CONFIG.Dice.randomUniform, ownRandom);
+    assert.equal(CONFIG.Dice.fulfillment.methods.mersenne.handler, ownHandler);
+    assert.equal(DiceTerm.prototype.mapRandomFace, ownMap);
+    const refused = await mcp('tools/call', { name: 'foundry_dice', arguments: { seed: -1 } });
+    assert.ok(refused.error || refused.result?.isError, 'a negative seed is refused');
+    assert.equal(CONFIG.Dice.randomUniform, ownRandom);
   });
 
   // -------------------------------------------------------------------- logs
@@ -701,7 +814,7 @@ try {
   await check('the official MCP client connects, lists the tools and calls one', async () => {
     const client = new Client({ name: 'foundry-mcp-test', version: '1.0.0' });
     await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`)));
-    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_logs']);
+    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_dice', 'foundry_changes', 'foundry_logs']);
     const reply = await client.callTool({ name: 'foundry_eval', arguments: { code: 'return 6 * 7' } });
     assert.equal(JSON.parse(reply.content[0].text).result, 42);
     await client.close();
@@ -780,7 +893,7 @@ try {
   await check('a hub with a token refuses MCP calls without it', async () => {
     assert.equal((await mcp('tools/list', {}, { port: TOKEN_PORT })).status, 401);
     assert.equal((await mcp('tools/list', {}, bearer('wrong'))).status, 401);
-    assert.equal((await toolNames(bearer(TOKEN))).length, 6);
+    assert.equal((await toolNames(bearer(TOKEN))).length, 8);
   });
 
   await check('a module without the right token cannot connect to a token hub', async () => {
@@ -890,7 +1003,7 @@ try {
 
   // ----------------------------------------------------------------- options
   await check('allowEval: false removes foundry_eval and keeps the read-only tools working', async () => {
-    assert.deepEqual(await toolNames({ port: READ_PORT }), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_logs']);
+    assert.deepEqual(await toolNames({ port: READ_PORT }), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_changes', 'foundry_logs']);
     await startModule(`ws://127.0.0.1:${READ_PORT}/foundry`, '');
     assert.equal(payload(await callTool('foundry_documents', { type: 'Actor' }, { port: READ_PORT })).result.total, 2);
     const refused = await mcp('tools/call', { name: 'foundry_eval', arguments: { code: 'globalThis.ranWithoutEval = true' } }, { port: READ_PORT });
@@ -921,7 +1034,7 @@ try {
     assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp')), [], 'no temporary token file is left behind');
     const auth = { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } };
     assert.equal((await mcp('tools/list', {}, { port: FRESH_PORT })).status, 401);
-    assert.equal((await toolNames(auth)).length, 6);
+    assert.equal((await toolNames(auth)).length, 8);
     // An authenticated module in a world, with nothing on the allowlist: connected, but no code runs.
     await startModule(`ws://127.0.0.1:${FRESH_PORT}/foundry`, generated);
     assert.equal((await getLogsFrom(auth)).connected, false, 'a world that is not allowed never becomes the connected world');
