@@ -124,6 +124,8 @@ return { hp: actor.system.attributes?.hp?.value, flag: actor.getFlag('world', 'c
   counts, so after 16 stuck calls nothing more runs until the world is reloaded.
 - `changes` lists the documents created, updated or deleted while the call ran, whether by your code or by
   something it set off, such as a hook, a module or another user (at most 100; `changesOmitted` counts the rest).
+  Browsers can report time coarsely, so a change made up to half a second before the call, and not already listed
+  by an earlier call, is included too.
   `changesSeq` is a cursor for `foundry_changes`, for changes that land after the call returned:
   ```json
   "changes": [{ "seq": 7, "action": "update", "documentName": "Actor", "uuid": "Actor.ZsaSGuRfxgI7ltMz",
@@ -366,7 +368,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 59 checks)
+### Tested in simulation only (`npm test`, 60 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -383,7 +385,8 @@ the change tracker and dice control (below).
 
 - **`foundry_changes` and `foundry_dice` against real Foundry.** In simulation, the tracker records updates with
   their earlier values, creations, deletions with their data, Foundry's deletion operator and the older `-=key`
-  form, withholds credential-like values, and installs its hooks once; dice control seeds both
+  form, withholds credential-like values, installs its hooks once, credits a change to its call when the tab's
+  clock runs behind, and never lists one change for two calls; dice control seeds both
   `CONFIG.Dice.randomUniform` and Foundry's "Mersenne" fulfillment method, fits queued results to dice, refuses an
   invalid seed and restores Foundry's own functions. Both were written against Foundry 14.370's source, and seeding
   was checked against its own `MersenneTwister`, but neither has run in a world yet.

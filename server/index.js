@@ -477,21 +477,27 @@ async function changes(args) {
 
 // foundry_eval: the code, plus every document change the tab saw while it ran. Tracking is installed
 // once per page before the first call, so that call's changes are seen too; afterwards a single query
-// follows each call. The tab runs on this computer, so its clock and ours agree on the start time.
+// follows each call (a query before it would take one of the 16 slots). The tab runs on this computer,
+// but browsers and some platforms coarsen Date.now(), so the start time gets some slack; changes an
+// earlier query already reported are excluded by sequence number instead.
 // `changesSeq` is the cursor from the call's start, for foundry_changes to pick up later changes.
+const CLOCK_SLACK_MS = 500;
 async function evalTool(code, timeoutMs) {
   const logSeq = lastSeq;
   const connection = foundry;
   if (connection && !connection.trackingTried) {
     connection.trackingTried = true;
-    await changes({ install: true });
+    const installed = await changes({ install: true });
+    if (installed) connection.seenSeq = installed.seq;
   }
-  const startTime = Date.now();
+  const startTime = Date.now() - CLOCK_SLACK_MS;
+  const seqAtStart = connection?.seenSeq ?? 0;
   try {
     const reply = await callFoundry(code, timeoutMs, requestScope.getStore());
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
-    const found = await changes({ sinceTime: startTime, limit: 100 });
+    const found = await changes({ since: seqAtStart, sinceTime: startTime, limit: 100 });
+    if (found && connection) connection.seenSeq = Math.max(connection.seenSeq ?? 0, found.lastSeq);
     const changed = found?.matched ? { changes: found.entries, ...(found.matched > found.entries.length ? { changesOmitted: found.matched - found.entries.length } : {}) } : {};
     const keep = found ? { logSeq, changesSeq: found.cursor } : { logSeq };
     return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };

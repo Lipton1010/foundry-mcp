@@ -474,6 +474,21 @@ try {
     assert.equal(handlers.updateActor.length, 1, 'the hooks are installed once');
   });
 
+  await check('a tab clock that runs behind still credits a change to its call, and no change is credited twice', async () => {
+    const fire = `
+      const hero = globalThis.testHero;
+      const realNow = Date.now;
+      Date.now = () => realNow() - 200; // a coarse or lagging browser clock
+      try { Hooks.fire('updateActor', hero, { system: { hp: ARG } }, {}, 'gm1'); } finally { Date.now = realNow; }
+      return 'fired';`;
+    await evalCode('return 0;'); // takes up the previous check's changes, made within the slack just before
+    const first = await evalCode(fire.replace('ARG', '3'));
+    assert.deepEqual(first.changes?.map((change) => change.changes[0].value), [3]);
+    const second = await evalCode(fire.replace('ARG', '2'));
+    assert.deepEqual(second.changes?.map((change) => change.changes[0].value), [2], 'the first call\'s change is not repeated');
+    assert.equal((await evalCode('return 0;')).changes, undefined, 'a call that changes nothing lists nothing');
+  });
+
   await check('dice can be seeded and forced, and Foundry\'s own rolling comes back afterwards', async () => {
     // Foundry 14's DiceTerm face mapping, and a stand-in for its Mersenne Twister.
     class DiceTerm {
