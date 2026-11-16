@@ -1,0 +1,42 @@
+# Publishes a release when a version tag (v1.2.3) is pushed: the module manifest and a zip of the
+# module folder, which is what Foundry's "Install Module" downloads through the manifest URL.
+# The tag must match the version in foundry-mcp/module.json; `npm test` checks the rest agree.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - name: Check that the tag matches the manifest
+        run: |
+          version=$(node -p "require('./foundry-mcp/module.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match module.json version $version" >&2
+            exit 1
+          fi
+      - name: Test
+        working-directory: server
+        run: |
+          npm ci
+          npm test
+      - name: Package the module
+        run: |
+          cp LICENSE foundry-mcp/LICENSE
+          (cd foundry-mcp && zip -r ../module.zip .)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" module.zip foundry-mcp/module.json --title "$GITHUB_REF_NAME" --generate-notes

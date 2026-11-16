@@ -21,7 +21,8 @@ players. It also means:
 2. Keep the generated **token** on. It is the default.
 3. List only the test world in `worlds`. Do not use `*`.
 4. Keep your client's **approval prompts** for `foundry_eval` on, at least until you trust a workflow.
-5. Set `allowEval: false` when you only need to watch status and logs.
+5. Set `allowEval: false` when the agent only needs to read. It can then list and read documents and settings but
+   cannot run code or change anything. Add `allowRead: false` when you only need to watch status and logs.
 6. Run the hub only while you are working, and disable the module when you are done with a world.
 
 ## Threats and safeguards
@@ -35,8 +36,25 @@ players. It also means:
 | **The wrong world**: you open your live campaign while the hub is running. | The module does nothing unless it is enabled in that world. The hub refuses the connection of any world that is not on its allowlist, which is empty by default: no code runs there, none of its logs are kept, its id is not shown to clients, and it cannot block the test world's tab. | The allowlist relies on the world id the module reports. It guards against mistakes, not against a tampered module. `"worlds": ["*"]` removes it. |
 | **A player** tries to use the bridge. | The module connects only for GM users, and only to a loopback address on the GM's own computer. | A GM or assistant GM account that is compromised is already full control of the world. |
 | **Runaway or stuck code.** | Calls time out (30 s by default). The timeout aborts the `signal` passed to the code. The browser refuses to start more than 16 unfinished evaluations, counting ones that already timed out, and caps the size of results and captured console output. A console line is turned into text once, with a small allowance, however many evaluations are running. | JavaScript cannot be stopped from outside. Code that ignores `signal` keeps running, and keeps its slot, until it finishes or the world is reloaded (F5). |
-| **Secrets in logs.** | Only warnings and errors are kept (plus the hub's own connect and disconnect markers), in memory, never on disk. Credential-looking values are redacted in the browser before they reach the hub. Logs from worlds off the allowlist are dropped. | Redaction is pattern matching and will miss some formats: a bare `key: value`, a short all-letter value after a plain `token:` or `secret:` (kept so that `Token: Goblin` survives), an unquoted password containing a space, and long strings of letters only. Values returned by `foundry_eval` are not redacted at all, and the agent can read any setting directly. |
+| **Secrets in logs.** | Only warnings and errors are kept (plus the hub's own connect and disconnect markers), in memory, never on disk. Credential-looking values are redacted in the browser before they reach the hub. Logs from worlds off the allowlist are dropped. | Redaction is pattern matching and will miss some formats: a bare `key: value`, a short all-letter value after a plain `token:` or `secret:` (kept so that `Token: Goblin` survives), an unquoted password containing a space, and long strings of letters only. Values returned by `foundry_eval` are not redacted at all, and the agent can read any setting directly. `foundry_settings` withholds only text values under credential-like key names. |
 | **Many clients at once.** | Each call is matched to its own reply. | Clients are not isolated from each other: they share the log buffer (including `clear`), and console output from concurrent evaluations can appear in each other's `logs`. Treat every client with the token as one trust level. |
+
+## Read-only mode
+
+With `allowEval: false` a client cannot send code. `foundry_status`, `foundry_documents`, `foundry_document` and
+`foundry_settings` are fixed code written in the hub; a client's arguments are checked for shape and passed to
+that code as JSON data. What this does not change:
+
+- **Reading is still disclosure.** Everything these tools return goes to the AI provider behind the client:
+  journals, chat, GM notes, user names and settings.
+- **Withholding secrets in settings is best effort.** A text value is withheld only when its key is named like a
+  credential (password, secret, cookie, api key, or ending in `token` or `key`). A secret under any other name, or
+  inside an object, is returned. Stored settings are not readable through the document tools, which would
+  sidestep this. The hub token itself is withheld by this rule.
+- **Text the agent reads can still steer it**, and with other tools available to the same agent that matters even
+  when this hub cannot change the world.
+- **The module is unchanged.** It still evaluates whatever its hub sends; read-only is a property of the hub. Use
+  the token so that only your hub can be that hub.
 
 ## The token
 

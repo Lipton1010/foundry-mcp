@@ -20,7 +20,8 @@ MCP client(s) ──HTTP POST /mcp──►  hub (Node, 127.0.0.1:30123)  ◄─
 - **Hub** (`server/`): one long-running Node process bound to loopback. Any number of MCP clients share it.
 - **Module** (`foundry-mcp/`): a small script that, in a GM's tab, dials the hub, evaluates the JavaScript it is
   sent, and forwards warnings and errors. Foundry has no server-side API, so a logged-in GM tab is required.
-- All tool logic lives in the hub, so Foundry or game-system updates rarely need a module change.
+- All tool logic lives in the hub, so Foundry or game-system updates rarely need a module change. The read-only
+  tools are fixed code the hub sends; their arguments travel as data, never as code.
 - Nothing is specific to one game system. Agents are told to call `foundry_status` first and not to assume a system
   or module.
 
@@ -37,13 +38,42 @@ No arguments. Call it first.
     "core": "14.370", "system": "dnd5e", "systemTitle": "Dungeons & Dragons Fifth Edition", "systemVersion": "6.0.6",
     "user": "Gamemaster", "activeScene": "Tavern", "viewedScene": "Tavern",
     "counts": { "actors": 58, "items": 20, "scenes": 49, "macros": 92, "journal": 98 },
-    "activeModules": ["foundry-mcp@0.4.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.11"],
+    "activeModules": ["foundry-mcp@0.5.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.11"],
     "windowVisibility": "visible"
   },
   "logs": [],
   "logSeq": 12
 }
 ```
+
+### `foundry_documents`, `foundry_document`, `foundry_settings`
+
+Three read-only tools for plain lookups. They run no code from the client, so they stay available with
+`allowEval: false`, and `allowRead: false` removes them.
+
+- `foundry_documents` lists. With no arguments it returns the world's collections with their sizes and its
+  compendium packs. With `type` (`"Actor"`, `"JournalEntry"`, ...) it lists that collection, and with `pack` the
+  entries of that compendium. Optional `name` (text the name must contain) and `limit` (default 50, at most 500).
+  ```json
+  // arguments: { "type": "Actor", "name": "tyrant" }
+  { "result": { "type": "Actor", "total": 1, "documents": [
+    { "id": "ZsaSGuRfxgI7ltMz", "name": "Aberrant Tyrant", "type": "npc", "folder": "REIbHyFCUL6GpE3p", "uuid": "Actor.ZsaSGuRfxgI7ltMz" }
+  ] }, "logs": [], "logSeq": 12 }
+  ```
+- `foundry_document` reads one document by `uuid`, from the world or a compendium, embedded documents included
+  (`Actor.<id>.Item.<id>`). It returns the stored data (`toObject()`), not values the game system derives at run
+  time. Optional `fields` is a list of dot paths, so that a large document need not be returned whole.
+  ```json
+  // arguments: { "uuid": "Actor.ZsaSGuRfxgI7ltMz", "fields": ["name", "system.attributes.hp.max"] }
+  { "result": { "uuid": "Actor.ZsaSGuRfxgI7ltMz", "documentName": "Actor",
+    "fields": { "name": "Aberrant Tyrant", "system.attributes.hp.max": 180 } }, "logs": [], "logSeq": 12 }
+  ```
+- `foundry_settings` reads registered settings: namespace, key, scope, display name and value. Optional
+  `namespace` (`"core"`, the system id or a module id), `contains` and `limit` (default 100, at most 500). A text
+  value whose key is named like a credential (password, secret, cookie, api key, or ending in `token` or `key`) is
+  returned as `withheld` instead. That is best effort: a secret stored under another name, or inside an object, is
+  returned. Stored settings cannot be read through the two document tools. Reading a setting Foundry has
+  deprecated makes Foundry print a warning, which then appears in `foundry_logs`.
 
 ### `foundry_eval`
 
@@ -122,6 +152,9 @@ example.
    ```
    New-Item -ItemType Junction -Path "<Foundry user data>\Data\modules\foundry-mcp" -Target "<checkout>\foundry-mcp"
    ```
+   No release has been published yet. Once one is, Foundry's **Install Module** dialog will also accept the
+   manifest URL `https://github.com/Lipton1010/foundry-mcp/releases/latest/download/module.json`. The hub is not
+   part of the module and still comes from this repository; keep the two on the same version.
 6. **Enable the module in the test world only** (Manage Modules ► Foundry MCP), then open Configure Settings ►
    Foundry MCP, paste the token into **Hub token**, save and reload. The hub prints
    `Foundry connected: world=<id> (allowed)`.
@@ -142,7 +175,8 @@ example.
 | `worlds` | `FOUNDRY_MCP_WORLDS` | none | World ids code may run in. `*` allows any world; avoid it. |
 | `origins` | `FOUNDRY_MCP_ORIGINS` | `http://localhost:30000`, `http://127.0.0.1:30000` | Page origins allowed to connect as Foundry: scheme, host and port only, matching the address in the GM's browser. Capital letters and a trailing `/` are tidied up; a path or `*` stops the hub with a message. |
 | `token` | `FOUNDRY_MCP_TOKEN` (hub only; do not reuse this name for clients) | generated on first start | Shared secret. MCP clients send it as `Authorization: Bearer <token>`; the module proves it knows it. Set it to `""` to run without authentication (not recommended). A blank value, or one containing a line break, stops the hub with a message. |
-| `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes `foundry_eval`, leaving clients able to read status and logs only. |
+| `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes `foundry_eval`: clients can still read status, logs, documents and settings, but cannot run code or change anything. |
+| `allowRead` | `FOUNDRY_MCP_ALLOW_READ` | `true` | `false` removes `foundry_documents`, `foundry_document` and `foundry_settings`. With `allowEval` also `false`, clients can read status and logs only. |
 | `logLimit` | `FOUNDRY_MCP_LOG_LIMIT` | `1000` | Log entries kept in memory, from 1 to 10000. |
 
 Module settings (stored per browser): **MCP hub address** (default `ws://127.0.0.1:30123/foundry`; only loopback
@@ -260,9 +294,13 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   the code after a timeout, a wrong token is refused, and a hub reached without the bearer token answers 401.
 - A hub whose allowlist does not include the open world refuses its connection, runs nothing and keeps no logs.
 - A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
+- The code of the three read-only tools, on 15 November 2026, sent through `foundry_eval` rather than by calling
+  the tools: the collection and compendium overview (14 collections, 85 packs), a name search, a compendium
+  listing, an actor read whole and by field, an embedded item, a compendium document, both error messages, and
+  all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 52 checks)
+### Tested in simulation only (`npm test`, 57 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -270,12 +308,15 @@ origin, Host and method checks, malformed socket messages, a second GM tab, the 
 one), a relay altering the reported world or moving text between the reported fields, a module refusing an unsigned or replayed command or a hub that cannot prove it knows
 the token or whose proof is wrong, a client that disconnects mid-call, a call in flight when Foundry disconnects, a socket that fails to send,
 the official MCP client on the 2026-07-28 revision, configuration validation, a port already in use, a non-GM
-user, `allowEval: false`, token generation with file permissions, and a config file that cannot be saved or made
-private.
+user, the read-only tools (listing, searching, reading by UUID and by field, withheld settings, hostile
+arguments), `allowEval: false`, `allowRead: false`, agreement between the version numbers and the manifest's
+download address, token generation with file permissions, and a config file that cannot be saved or made private.
 
 ### Not tested
 
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
+- The read-only tools called by name from a client against a real world (their code has been; see above), and
+  installation through the manifest URL, which needs a published release.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, and real Foundry on Linux or in a browser other than
   the desktop app. CI runs the simulated tests on Linux, and the hub's handling of its config file has been run
@@ -293,8 +334,8 @@ private.
 
 ### Planned, not built
 
-- Installation through a Foundry manifest URL and packaged releases.
-- Narrow read-only tools (documents, settings) so that more can be done with `allowEval: false`.
+- A published release. The manifest fields and the release workflow are in place, but no version has been tagged,
+  so the manifest URL does not work yet. A listing on foundryvtt.com is a separate step after that.
 - Persisting logs across hub restarts (deliberately absent for now, for privacy).
 
 ## Development
@@ -302,6 +343,11 @@ private.
 `npm test` in `server` takes about 45 seconds. `PROTOCOL` in `foundry-mcp/scripts/bridge.js` and `MODULE_PROTOCOL`
 in `server/index.js` must be bumped together whenever the messages between them change. CI runs the tests on Linux
 and Windows with Node 20 and 24.
+
+To release: set the same version in `foundry-mcp/module.json` (`version` and `download`), `server/package.json`,
+`server/package-lock.json` and the `McpServer` line in `server/index.js` (`npm test` checks that they agree), then
+push a tag `v<version>`. The release workflow runs the tests and attaches `module.json` and `module.zip` to a
+GitHub release. Foundry can only download them from a public repository.
 
 ## License
 

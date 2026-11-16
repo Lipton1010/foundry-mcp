@@ -3,5 +3,6 @@
   "worlds": ["my-test-world-id"],
   "origins": ["http://localhost:30000", "http://127.0.0.1:30000"],
   "allowEval": true,
+  "allowRead": true,
   "logLimit": 1000
 }

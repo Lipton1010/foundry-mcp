@@ -28,7 +28,7 @@ If you run the hub with `"token": ""`, leave out the `headers` / bearer settings
 | OpenCode | 2.3.0 | streamable HTTP (`remote`) | yes | **Tested end to end**, with and without token |
 | Antigravity | 2.32.1 | streamable HTTP (`serverUrl`) | yes, per documentation | **Tested end to end** without token. The `headers` form is from the documentation and has not been run |
 
-"End to end" means the client listed the three tools, called `foundry_status` and got the test world back, and read
+"End to end" means the client listed the hub's tools (three at the time; there are six now), called `foundry_status` and got the test world back, and read
 `foundry_logs`. Every test used a read-only call.
 
 ## Claude Code
@@ -108,5 +108,5 @@ curl -s -X POST http://127.0.0.1:30123/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
-A list of three tools means the hub and token are right. `401` means the token is missing or wrong. The command
+A list of six tools (fewer if the hub has `allowEval` or `allowRead` turned off) means the hub and token are right. `401` means the token is missing or wrong. The command
 is written for bash; in Windows PowerShell 5 use `curl.exe` and put it on one line.

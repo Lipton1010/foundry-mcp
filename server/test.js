@@ -11,13 +11,15 @@ import { pathToFileURL } from 'node:url';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setMaxListeners } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 
 const PORT = 30199; // no token, small log buffer
 const TOKEN_PORT = 30198; // token required
-const BARE_PORT = 30197; // no token, eval disabled, nothing connected: stands in for an impostor hub
+const BARE_PORT = 30197; // no token, eval and read tools disabled, nothing connected: stands in for an impostor hub
+const READ_PORT = 30192; // no token, eval disabled, read tools left on
 const FRESH_PORT = 30196; // a config copied from the example: no token, no worlds, world-readable
 const FAULT_PORT = 30194; // no token; its sockets can be made to fail on send (test-fixtures/fault-send.mjs)
 const FAKE_PORT = 30195; // a hand-rolled hub that knows the token but sends an unsigned command
@@ -41,7 +43,8 @@ function startHub(env, nodeArgs = []) {
 const hubs = [
   startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_LOG_LIMIT: 60 }),
   startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: `${TOKEN} ` }), // trailing space, as a shell can add
-  startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false', FOUNDRY_MCP_ORIGINS: 'http://LOCALHOST:30000/' }), // origin as a person might type it
+  startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false', FOUNDRY_MCP_ALLOW_READ: 'false', FOUNDRY_MCP_ORIGINS: 'http://LOCALHOST:30000/' }), // origin as a person might type it
+  startHub({ FOUNDRY_MCP_PORT: READ_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
   startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
   startHub({ FOUNDRY_MCP_PORT: FAULT_PORT, FOUNDRY_MCP_TOKEN: '' }, ['--import', new URL('./test-fixtures/fault-send.mjs', import.meta.url).href]),
 ];
@@ -68,21 +71,67 @@ const toolNames = async (options) => (await mcp('tools/list', {}, options)).resu
 
 // --- Stub the slice of Foundry and the browser the module touches.
 const hooks = {};
-const settings = { 'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '' };
+const settings = {
+  'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '',
+  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': 'metric',
+};
+// What the read-only tools look at. A Foundry Collection is a Map that iterates its values.
+class Collection extends Map {
+  [Symbol.iterator]() {
+    return this.values();
+  }
+}
+const goblin = {
+  id: 'g1', uuid: 'Actor.g1', documentName: 'Actor', name: 'Goblin Boss', type: 'npc', folder: { id: 'f1' },
+  toObject: () => ({ _id: 'g1', name: 'Goblin Boss', system: { attributes: { hp: { value: 21, max: 21 } } }, items: [{ name: 'Scimitar' }] }),
+};
+// A world setting as Foundry stores it: a document holding the raw value.
+const storedSetting = { id: 's1', uuid: 'Setting.s1', documentName: 'Setting', name: null, toObject: () => ({ key: 'weather.apiKey', value: '"sk-weather-123"' }) };
+const registered = new Map(
+  [
+    ['foundry-mcp', 'token', 'client', 'Hub token'],
+    ['core', 'defaultToken', 'world', 'SETTINGS.DefaultToken'],
+    ['weather', 'apiKey', 'world', 'API key'],
+    ['weather', 'units', 'world', 'Units'],
+    ['weather', 'broken', 'world', undefined],
+  ].map(([namespace, key, scope, name]) => [`${namespace}.${key}`, { namespace, key, scope, name }])
+);
 const actor = { name: 'Test Actor', flags: {}, toObject() { return { name: this.name, flags: this.flags }; } };
 globalThis.Hooks = { once: (name, fn) => (hooks[name] = fn) };
 globalThis.game = {
-  settings: { register() {}, get: (module, key) => settings[`${module}.${key}`] },
+  settings: {
+    register() {},
+    settings: registered,
+    get: (module, key) => {
+      if (key === 'broken') throw new Error('weather.broken is not a registered setting');
+      return settings[`${module}.${key}`];
+    },
+  },
+  i18n: { localize: (text) => text.replace('SETTINGS.DefaultToken', 'Default Token') },
+  collections: new Collection([
+    ['Actor', new Collection([['g1', goblin], ['g2', { id: 'g2', uuid: 'Actor.g2', name: 'Goblin', type: 'npc', folder: null }]])],
+    ['ChatMessage', new Collection([['c1', { id: 'c1', uuid: 'ChatMessage.c1' }]])],
+    ['Setting', new Collection([['s1', storedSetting]])],
+  ]),
+  packs: new Collection([
+    ['sys.monsters', {
+      collection: 'sys.monsters', documentName: 'Actor', metadata: { label: 'Monsters' },
+      index: new Collection([['m1', { _id: 'm1', name: 'Aberrant Tyrant', type: 'npc', uuid: 'Compendium.sys.monsters.Actor.m1' }], ['m2', { _id: 'm2', name: 'Zombie' }]]),
+      getUuid: (id) => `Compendium.sys.monsters.Actor.${id}`,
+    }],
+  ]),
   user: { isGM: true, name: 'Gamemaster' },
   world: { id: 'test-world', title: 'Test World' },
   system: { id: 'some-system', title: 'Some System', version: '1.0.0' },
   version: '14.370',
   actors: Object.assign(new Map([['a1', actor]]), { getName: () => actor }),
   items: new Map(), scenes: Object.assign(new Map(), { active: null }), macros: new Map(), journal: new Map(),
-  modules: [{ id: 'foundry-mcp', version: '0.4.0', active: true }],
+  modules: [{ id: 'foundry-mcp', version: '0.5.0', active: true }],
 };
+globalThis.fromUuid = async (uuid) => ({ 'Actor.g1': goblin, 'Setting.s1': storedSetting })[uuid] ?? null;
 globalThis.canvas = { scene: null };
 globalThis.window = new EventTarget();
+setMaxListeners(50, globalThis.window); // every module copy a check loads adds its listeners
 globalThis.location = { origin: ORIGIN };
 // The browser's WebSocket, played by the `ws` client (Node 20 has none built in),
 // which also lets the test set the Origin header a browser would send.
@@ -155,7 +204,7 @@ const check = async (name, fn) => {
 
 try {
   // Wait until every hub answers instead of guessing how long start-up takes.
-  for (const port of [PORT, TOKEN_PORT, BARE_PORT, FRESH_PORT, FAULT_PORT]) {
+  for (const port of [PORT, TOKEN_PORT, BARE_PORT, READ_PORT, FRESH_PORT, FAULT_PORT]) {
     for (let tries = 0; ; tries++) {
       try {
         await fetch(`http://127.0.0.1:${port}/`);
@@ -193,14 +242,91 @@ try {
     assert.equal(logs.entries[0].level, 'error');
   });
 
-  await check('lists the three tools', async () => {
-    assert.deepEqual(await toolNames(), ['foundry_status', 'foundry_eval', 'foundry_logs']);
+  await check('lists the six tools', async () => {
+    assert.deepEqual(await toolNames(), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_logs']);
   });
 
   await check('status reports world and system without assuming dnd5e', async () => {
     const status = payload(await callTool('foundry_status')).result;
     assert.equal(status.world, 'test-world');
     assert.equal(status.system, 'some-system');
+  });
+
+  // --------------------------------------------------------- read-only tools
+  await check('documents are listed by collection and compendium, searched by name, and read by UUID', async () => {
+    const read = async (name, args) => payload(await callTool(name, args)).result;
+    assert.deepEqual(await read('foundry_documents', {}), {
+      collections: { Actor: 2, ChatMessage: 1 },
+      packs: [{ id: 'sys.monsters', label: 'Monsters', documentName: 'Actor', size: 2 }],
+    });
+    assert.deepEqual(await read('foundry_documents', { type: 'Actor', name: 'BOSS' }), {
+      type: 'Actor', total: 1, documents: [{ id: 'g1', name: 'Goblin Boss', type: 'npc', folder: 'f1', uuid: 'Actor.g1' }],
+    });
+    const limited = await read('foundry_documents', { type: 'Actor', limit: 1 });
+    assert.equal(limited.total, 2);
+    assert.equal(limited.documents.length, 1);
+    // A document with no name (a chat message) is listed, and matches no name search.
+    assert.deepEqual((await read('foundry_documents', { type: 'ChatMessage' })).documents, [{ id: 'c1', name: null, type: null, folder: null, uuid: 'ChatMessage.c1' }]);
+    assert.equal((await read('foundry_documents', { type: 'ChatMessage', name: 'x' })).total, 0);
+    assert.deepEqual((await read('foundry_documents', { pack: 'sys.monsters' })).documents, [
+      { id: 'm1', name: 'Aberrant Tyrant', type: 'npc', folder: null, uuid: 'Compendium.sys.monsters.Actor.m1' },
+      { id: 'm2', name: 'Zombie', type: null, folder: null, uuid: 'Compendium.sys.monsters.Actor.m2' },
+    ]);
+    assert.equal((await read('foundry_document', { uuid: 'Actor.g1' })).data.items[0].name, 'Scimitar');
+    assert.deepEqual(await read('foundry_document', { uuid: 'Actor.g1', fields: ['name', 'system.attributes.hp', 'system.nothing.here', 'constructor', 'name.length'] }), {
+      uuid: 'Actor.g1', documentName: 'Actor',
+      fields: { name: 'Goblin Boss', 'system.attributes.hp': { value: 21, max: 21 }, 'system.nothing.here': null, constructor: null, 'name.length': null },
+    });
+    for (const [name, args, expected] of [
+      ['foundry_documents', { type: 'Nonsense' }, /No world collection of "Nonsense". This world has: Actor, ChatMessage/],
+      ['foundry_documents', { pack: 'no.such' }, /No compendium "no.such"/],
+      ['foundry_document', { uuid: 'Actor.gone' }, /Nothing found at "Actor.gone"/],
+      // Stored settings hold raw values, so they are not reachable as documents: that would sidestep foundry_settings.
+      ['foundry_documents', { type: 'Setting' }, /Settings are read with foundry_settings/],
+      ['foundry_document', { uuid: 'Setting.s1' }, /Settings are read with foundry_settings/],
+    ]) {
+      const result = await callTool(name, args);
+      assert.equal(result.isError, true);
+      assert.match(payload(result).error.message, expected);
+    }
+    // Arguments of the wrong shape never reach Foundry.
+    assert.equal((await callTool('foundry_documents', { limit: 100000 })).isError, true);
+    assert.equal((await callTool('foundry_document', {})).isError, true);
+  });
+
+  await check('arguments to the read-only tools are data, never code', async () => {
+    const hostile = '"); globalThis.injected = true; ("\'`${globalThis.injected = true}`\n\u2028</script>\\';
+    const missing = await callTool('foundry_document', { uuid: hostile, fields: [hostile, '__proto__.polluted'] });
+    assert.equal(payload(missing).error.message, `Nothing found at "${hostile}".`);
+    assert.equal(payload(await callTool('foundry_documents', { type: 'Actor', name: hostile })).result.total, 0);
+    assert.match(payload(await callTool('foundry_documents', { pack: hostile })).error.message, /No compendium/);
+    assert.equal(payload(await callTool('foundry_settings', { namespace: hostile, contains: hostile })).result.total, 0);
+    // A key the tool does not define is dropped before the code is built.
+    assert.equal(payload(await callTool('foundry_documents', { type: 'Actor', code: 'globalThis.injected = true' })).result.total, 2);
+    assert.equal(globalThis.injected, undefined);
+    assert.equal({}.polluted, undefined);
+  });
+
+  await check('settings are read, a text value under a credential-like key is withheld, and an unreadable setting does not cost the rest', async () => {
+    settings['foundry-mcp.token'] = 'the-hub-token-itself';
+    try {
+      const all = payload(await callTool('foundry_settings')).result;
+      assert.equal(all.total, 5);
+      const byKey = Object.fromEntries(all.settings.map((setting) => [`${setting.namespace}.${setting.key}`, setting]));
+      assert.match(byKey['foundry-mcp.token'].withheld, /credential/);
+      assert.match(byKey['weather.apiKey'].withheld, /credential/);
+      assert.ok(!JSON.stringify(all).includes('the-hub-token-itself') && !JSON.stringify(all).includes('sk-weather-123'));
+      // "Token" is an everyday word in Foundry: a setting that is not text is shown.
+      assert.deepEqual(byKey['core.defaultToken'], { namespace: 'core', key: 'defaultToken', scope: 'world', name: 'Default Token', value: { displayName: 20 } });
+      assert.equal(byKey['weather.units'].value, 'metric');
+      assert.match(byKey['weather.broken'].unreadable, /not a registered setting/);
+      assert.equal(byKey['weather.broken'].name, null);
+      assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
+      assert.deepEqual(payload(await callTool('foundry_settings', { contains: 'default token' })).result.settings.map((setting) => setting.key), ['defaultToken']);
+      assert.equal(payload(await callTool('foundry_settings', { limit: 2 })).result.settings.length, 2);
+    } finally {
+      settings['foundry-mcp.token'] = '';
+    }
   });
 
   await check('eval reads an actor, writes a flag and returns console output', async () => {
@@ -575,7 +701,7 @@ try {
   await check('the official MCP client connects, lists the tools and calls one', async () => {
     const client = new Client({ name: 'foundry-mcp-test', version: '1.0.0' });
     await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`)));
-    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['foundry_status', 'foundry_eval', 'foundry_logs']);
+    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_logs']);
     const reply = await client.callTool({ name: 'foundry_eval', arguments: { code: 'return 6 * 7' } });
     assert.equal(JSON.parse(reply.content[0].text).result, 42);
     await client.close();
@@ -654,7 +780,7 @@ try {
   await check('a hub with a token refuses MCP calls without it', async () => {
     assert.equal((await mcp('tools/list', {}, { port: TOKEN_PORT })).status, 401);
     assert.equal((await mcp('tools/list', {}, bearer('wrong'))).status, 401);
-    assert.equal((await toolNames(bearer(TOKEN))).length, 3);
+    assert.equal((await toolNames(bearer(TOKEN))).length, 6);
   });
 
   await check('a module without the right token cannot connect to a token hub', async () => {
@@ -763,8 +889,28 @@ try {
   });
 
   // ----------------------------------------------------------------- options
-  await check('allowEval: false removes foundry_eval and nothing else', async () => {
+  await check('allowEval: false removes foundry_eval and keeps the read-only tools working', async () => {
+    assert.deepEqual(await toolNames({ port: READ_PORT }), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_logs']);
+    await startModule(`ws://127.0.0.1:${READ_PORT}/foundry`, '');
+    assert.equal(payload(await callTool('foundry_documents', { type: 'Actor' }, { port: READ_PORT })).result.total, 2);
+    const refused = await mcp('tools/call', { name: 'foundry_eval', arguments: { code: 'globalThis.ranWithoutEval = true' } }, { port: READ_PORT });
+    assert.ok(refused.error || refused.result?.isError, 'foundry_eval is not callable');
+    assert.equal(globalThis.ranWithoutEval, undefined);
+  });
+
+  await check('allowRead: false removes the document and settings tools', async () => {
     assert.deepEqual(await toolNames({ port: BARE_PORT }), ['foundry_status', 'foundry_logs']);
+    const refused = await mcp('tools/call', { name: 'foundry_settings', arguments: {} }, { port: BARE_PORT });
+    assert.ok(refused.error || refused.result?.isError, 'foundry_settings is not callable');
+  });
+
+  await check('the manifest, the hub package and the MCP server agree on the version, and the manifest installs that release', async () => {
+    const manifest = JSON.parse(readFileSync(new URL('../foundry-mcp/module.json', import.meta.url), 'utf8'));
+    const hub = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    assert.equal(hub.version, manifest.version);
+    assert.ok(readFileSync(new URL('./index.js', import.meta.url), 'utf8').includes(`name: 'foundry', version: '${manifest.version}'`));
+    assert.equal(manifest.manifest, `${manifest.url}/releases/latest/download/module.json`);
+    assert.equal(manifest.download, `${manifest.url}/releases/download/v${manifest.version}/module.zip`);
   });
 
   await check('a hub whose config has no token creates one, protects the file, and runs code nowhere by default', async () => {
@@ -775,7 +921,7 @@ try {
     assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp')), [], 'no temporary token file is left behind');
     const auth = { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } };
     assert.equal((await mcp('tools/list', {}, { port: FRESH_PORT })).status, 401);
-    assert.equal((await toolNames(auth)).length, 3);
+    assert.equal((await toolNames(auth)).length, 6);
     // An authenticated module in a world, with nothing on the allowlist: connected, but no code runs.
     await startModule(`ws://127.0.0.1:${FRESH_PORT}/foundry`, generated);
     assert.equal((await getLogsFrom(auth)).connected, false, 'a world that is not allowed never becomes the connected world');
@@ -803,6 +949,7 @@ try {
       ['eval-string.json', '{ "token": "", "allowEval": "false" }', /"allowEval" must be true or false/],
       ['token-number.json', '{ "token": 5 }', /"token" must be text/],
       ['eval-null.json', '{ "token": "", "allowEval": null }', /"allowEval" must be true or false/],
+      ['read-string.json', '{ "token": "", "allowRead": "false" }', /"allowRead" must be true or false/],
       ['worlds-null.json', '{ "token": "", "worlds": null }', /"worlds" must be a list/],
       ['token-short.json', '{ "token": "abc" }', /too short/],
       ['limit.json', '{ "token": "", "logLimit": "not-a-number" }', /"logLimit" must be/],
@@ -820,6 +967,7 @@ try {
       assert.match(run.stderr, expected, name);
     }
     assert.match(start('env.json', '{ "token": "" }', { FOUNDRY_MCP_ALLOW_EVAL: 'maybe' }).stderr, /"allowEval" must be true or false/);
+    assert.match(start('env.json', '{ "token": "" }', { FOUNDRY_MCP_ALLOW_READ: '0' }).stderr, /"allowRead" must be true or false/);
     assert.match(start('env.json', undefined, { FOUNDRY_MCP_PORT: 'abc' }).stderr, /"port" must be/);
   });
 
