@@ -148,13 +148,14 @@ example.
 - Node.js 20.11 or newer on the same computer as the GM's browser.
 - The GM's browser must open Foundry at an address listed in the hub's `origins` (by default
   `http://localhost:30000`).
-- An MCP client that supports streamable HTTP servers with custom headers.
+- An MCP client that supports streamable HTTP servers with custom headers. Claude Code and Codex run on an existing
+  Claude or ChatGPT plan, so no separate API key is needed; the module itself never talks to an AI provider.
 
 ## Setup
 
 1. **Get the code and install the hub.**
    ```
-   git clone <this repository>
+   git clone https://github.com/Lipton1010/foundry-mcp.git
    cd foundry-mcp/server
    npm ci
    ```
@@ -166,14 +167,15 @@ example.
 4. **Start the hub** with `npm start` and leave it running. On first start it generates a token and saves it in
    `config.json` as `"token"`. A value of the wrong type in `config.json` stops the hub with a message rather than
    being guessed at.
-5. **Install the module.** Copy or link the `foundry-mcp` folder into Foundry's `Data/modules` folder, then restart
-   Foundry so it sees the module. On Windows a junction keeps it in step with your checkout:
+5. **Install the module.** In Foundry's setup screen choose **Add-on Modules ► Install Module** and paste the
+   manifest URL `https://github.com/Lipton1010/foundry-mcp/releases/latest/download/module.json`. The hub is not
+   part of the module and comes from this repository; keep the two on the same version (check out the matching
+   tag, for example `git checkout v0.5.0`). To work on the module itself, copy or link the `foundry-mcp` folder
+   into Foundry's `Data/modules` folder instead and restart Foundry. On Windows a junction keeps it in step with
+   your checkout:
    ```
    New-Item -ItemType Junction -Path "<Foundry user data>\Data\modules\foundry-mcp" -Target "<checkout>\foundry-mcp"
    ```
-   No release has been published yet. Once one is, Foundry's **Install Module** dialog will also accept the
-   manifest URL `https://github.com/Lipton1010/foundry-mcp/releases/latest/download/module.json`. The hub is not
-   part of the module and still comes from this repository; keep the two on the same version.
 6. **Enable the module in the test world only** (Manage Modules ► Foundry MCP), then open Configure Settings ►
    Foundry MCP, paste the token into **Hub token**, save and reload. The hub prints
    `Foundry connected: world=<id> (allowed)`.
@@ -335,7 +337,7 @@ download address, token generation with file permissions, and a config file that
 
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - The read-only tools called by name from a client against a real world (their code has been; see above), and
-  installation through the manifest URL, which needs a published release.
+  installing the module in Foundry through the manifest URL.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, and real Foundry on Linux or in a browser other than
   the desktop app. CI runs the simulated tests on Linux, and the hub's handling of its config file has been run
@@ -353,8 +355,7 @@ download address, token generation with file permissions, and a config file that
 
 ### Planned, not built
 
-- A published release. The manifest fields and the release workflow are in place, but no version has been tagged,
-  so the manifest URL does not work yet. A listing on foundryvtt.com is a separate step after that.
+- A listing on foundryvtt.com. Releases are published on GitHub, and the manifest URL installs from there.
 - Persisting logs across hub restarts (deliberately absent for now, for privacy).
 
 ## Development
