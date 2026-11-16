@@ -471,7 +471,46 @@ try {
     const scoped = payload(await callTool('foundry_changes', { since: reply.changesSeq, uuid: 'Actor.h1' }));
     assert.deepEqual(scoped.entries.map((entry) => entry.uuid), ['Actor.h1', 'Actor.h1.Item.i1'], 'a uuid includes the documents embedded in it');
     assert.equal(payload(await callTool('foundry_changes', { documentName: 'Setting' })).matched, 1);
+
+    // Credentials inside arrays and objects, in new values and in the earlier values of a deleted subtree.
+    const vault = { documentName: 'Actor', uuid: 'Actor.v1', name: 'Vault', parent: null, _source: { flags: { mod: { creds: { apiKey: 'zz-old-key-zz', note: 'kept' } } } } };
+    const cursor = payload(await callTool('foundry_changes')).lastSeq;
+    Hooks.fire('preUpdateActor', vault, { flags: { mod: { '-=creds': null } } });
+    Hooks.fire('updateActor', vault, { flags: { mod: { '-=creds': null } } }, {}, 'gm1');
+    Hooks.fire('updateActor', vault, { flags: { mod: { list: [{ password: 'zz-in-array-zz' }], apiKeys: ['zz-key-list-zz'] } } }, {}, 'gm1');
+    const nested = payload(await callTool('foundry_changes', { since: cursor }));
+    assert.ok(!JSON.stringify(nested).includes('zz-'), 'no credential is reported at any depth');
+    assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
+    assert.deepEqual(nested.entries[1].changes, [{ path: 'flags.mod.list', value: [{ password: '[withheld]' }] }, { path: 'flags.mod.apiKeys', value: ['[withheld]'] }]);
+
+    // Updates to one document that overlap cannot be matched to their earlier values, so those are left out.
+    const overlap = payload(await callTool('foundry_changes')).lastSeq;
+    const pair = { documentName: 'Actor', uuid: 'Actor.p2', name: 'Pair', parent: null, _source: { system: { hp: 1 } } };
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 2 } });
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 3 } });
+    Hooks.fire('updateActor', pair, { system: { hp: 2 } }, {}, 'gm1');
+    Hooks.fire('updateActor', pair, { system: { hp: 3 } }, {}, 'gm1');
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 5 } });
+    Hooks.fire('updateActor', pair, { system: { hp: 4 } }, {}, 'p1'); // another user's update lands first
+    Hooks.fire('updateActor', pair, { system: { hp: 5 } }, {}, 'gm1');
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 6 } });
+    Hooks.fire('updateActor', pair, { system: { hp: 6 } }, {}, 'gm1');
+    const rows = payload(await callTool('foundry_changes', { since: overlap })).entries.map((entry) => entry.changes[0]);
+    assert.deepEqual(rows, [{ path: 'system.hp', value: 2 }, { path: 'system.hp', value: 3 }, { path: 'system.hp', value: 4 }, { path: 'system.hp', value: 5 }, { path: 'system.hp', value: 6, before: 1 }]);
     assert.equal(handlers.updateActor.length, 1, 'the hooks are installed once');
+  });
+
+  await check('evaluations that overlap never list the same change twice', async () => {
+    await evalCode('return 0;'); // takes up the previous check's changes
+    const slow = evalCode(`
+      await new Promise((resolve) => (globalThis.releaseSlow = resolve));
+      return 'slow';`);
+    while (!globalThis.releaseSlow) await new Promise((resolve) => setTimeout(resolve, 10));
+    const fast = await evalCode(`Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 7 } }, {}, 'gm1'); return 'fast';`);
+    globalThis.releaseSlow();
+    const late = await slow;
+    assert.deepEqual(fast.changes?.map((change) => change.changes[0].value), [7]);
+    assert.equal(late.changes, undefined, 'the call that finished later does not list it again');
   });
 
   await check('a tab clock that runs behind still credits a change to its call, and no change is credited twice', async () => {
@@ -541,6 +580,41 @@ try {
     assert.deepEqual(await dice({ seed: null }), { seed: null, queued: [], forced: 2, active: false });
     assert.equal(CONFIG.Dice.randomUniform, ownRandom);
     assert.equal(CONFIG.Dice.fulfillment.methods.mersenne.handler, ownHandler);
+    assert.equal(DiceTerm.prototype.mapRandomFace, ownMap);
+
+    // Another module wraps the random source and the Mersenne handler while dice control is on. Its wrappers stay,
+    // through a reseed too, and once control is off they roll with Foundry's own random source again.
+    const mersenne = CONFIG.Dice.fulfillment.methods.mersenne;
+    await dice({ seed: 7 });
+    const ours = CONFIG.Dice.randomUniform;
+    const wrapped = function (...rest) { return ours.apply(this, rest); };
+    const ourHandler = mersenne.handler;
+    const wrappedHandler = (term) => ourHandler(term);
+    CONFIG.Dice.randomUniform = wrapped;
+    mersenne.handler = wrappedHandler;
+    await dice({ seed: 8 });
+    assert.equal(CONFIG.Dice.randomUniform, wrapped, 'reseeding leaves the other module\'s wrapper in place');
+    assert.equal(mersenne.handler, wrappedHandler);
+    assert.equal((await dice({ seed: null })).active, false);
+    let ownRolls = 0;
+    const realRandom = Math.random;
+    Math.random = () => (ownRolls++, 0.5);
+    try {
+      CONFIG.Dice.randomUniform();
+      mersenne.handler(new DiceTerm(20));
+    } finally {
+      Math.random = realRandom;
+    }
+    assert.equal(ownRolls, 2, 'the wrapped functions pass rolls to Foundry\'s own once control is off');
+    CONFIG.Dice.randomUniform = ownRandom;
+    mersenne.handler = ownHandler;
+
+    // Asking for the state changes nothing, even once the queue has been used up.
+    await dice({ next: [{ result: 4 }] });
+    assert.equal(new DiceTerm(6).randomFace(), 4);
+    assert.deepEqual(await dice({}), { seed: null, queued: [], forced: 1, active: false });
+    assert.equal((await dice({})).forced, 1, 'a report does not reset the count');
+    await dice({ clear: true });
     assert.equal(DiceTerm.prototype.mapRandomFace, ownMap);
     const refused = await mcp('tools/call', { name: 'foundry_dice', arguments: { seed: -1 } });
     assert.ok(refused.error || refused.result?.isError, 'a negative seed is refused');
@@ -1036,6 +1110,9 @@ try {
     const manifest = JSON.parse(readFileSync(new URL('../foundry-mcp/module.json', import.meta.url), 'utf8'));
     const hub = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
     assert.equal(hub.version, manifest.version);
+    const lock = JSON.parse(readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8'));
+    assert.equal(lock.version, manifest.version);
+    assert.equal(lock.packages[''].version, manifest.version);
     assert.ok(readFileSync(new URL('./index.js', import.meta.url), 'utf8').includes(`name: 'foundry', version: '${manifest.version}'`));
     assert.equal(manifest.manifest, `${manifest.url}/releases/latest/download/module.json`);
     assert.equal(manifest.download, `${manifest.url}/releases/download/v${manifest.version}/module.zip`);

@@ -125,7 +125,8 @@ return { hp: actor.system.attributes?.hp?.value, flag: actor.getFlag('world', 'c
 - `changes` lists the documents created, updated or deleted while the call ran, whether by your code or by
   something it set off, such as a hook, a module or another user (at most 100; `changesOmitted` counts the rest).
   Browsers can report time coarsely, so a change made up to half a second before the call, and not already listed
-  by an earlier call, is included too.
+  by an earlier call, is included too. Calls that overlap see each other's changes; whichever finishes first lists
+  them, and no change is listed by two calls.
   `changesSeq` is a cursor for `foundry_changes`, for changes that land after the call returned:
   ```json
   "changes": [{ "seq": 7, "action": "update", "documentName": "Actor", "uuid": "Actor.ZsaSGuRfxgI7ltMz",
@@ -141,13 +142,14 @@ Lists document changes the GM's tab has seen, from any user or module, newest la
 (default 50). It is listed when `allowRead` is on.
 
 - An update lists each changed path with its new value. `before` is there for changes made from the GM's tab;
-  Foundry tells other clients only the result. A field removed with Foundry's deletion operator reads
+  Foundry tells other clients only the result. It is left out when updates to one document overlap, since Foundry
+  gives no way to tell which earlier values belong to which update. A field removed with Foundry's deletion operator reads
   `"deleted": true`.
 - A deletion carries the deleted document's data, if it is under 20,000 characters, so it can be created again.
 - Tracking starts with the first call to `foundry_eval` or `foundry_changes` and lasts until the page reloads. The
   newest 500 changes are kept, in the browser's memory only; `evicted` counts the rest. Long text values are cut.
 - A text value under a credential-like name (password, secret, api key, a name ending in `token` or `key`, and so
-  on) is `[withheld]`, as are the values of settings named that way. This is best effort, as in `foundry_settings`.
+  on) is `[withheld]`, at any depth inside an object or list, as are the values of settings named that way. This is best effort, as in `foundry_settings`.
 
 ### `foundry_dice`
 
@@ -163,7 +165,9 @@ listed when `allowEval` is on.
   the same rolls in the same order give the same results. `null` restores Foundry's own.
 - `next` queues exact results. Each is used by the first die it fits: one with that many `faces`, if given, and a
   result within the die's range. Dice it does not fit roll normally. `clear` empties the queue first.
-- With no arguments it reports the state. Setting `seed` to `null` with an empty queue puts everything back.
+- With no arguments it reports the state and changes nothing. Setting `seed` to `null` with an empty queue puts
+  everything back. If another module has wrapped Foundry's random source since, its wrapper stays, and rolls pass
+  through it to Foundry's own.
 - Only rolls evaluated in the GM's tab are affected. Players' own rolls, and code that calls `Math.random`
   itself, are not. A world reload undoes it.
 
@@ -243,8 +247,8 @@ example.
 | `worlds` | `FOUNDRY_MCP_WORLDS` | none | World ids code may run in. `*` allows any world; avoid it. |
 | `origins` | `FOUNDRY_MCP_ORIGINS` | `http://localhost:30000`, `http://127.0.0.1:30000` | Page origins allowed to connect as Foundry: scheme, host and port only, matching the address in the GM's browser. Capital letters and a trailing `/` are tidied up; a path or `*` stops the hub with a message. |
 | `token` | `FOUNDRY_MCP_TOKEN` (hub only; do not reuse this name for clients) | generated on first start | Shared secret. MCP clients send it as `Authorization: Bearer <token>`; the module proves it knows it. Set it to `""` to run without authentication (not recommended). A blank value, or one containing a line break, stops the hub with a message. |
-| `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes `foundry_eval`: clients can still read status, logs, documents and settings, but cannot run code or change anything. |
-| `allowRead` | `FOUNDRY_MCP_ALLOW_READ` | `true` | `false` removes `foundry_documents`, `foundry_document` and `foundry_settings`. With `allowEval` also `false`, clients can read status and logs only. |
+| `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes `foundry_eval` and `foundry_dice`: clients can still read status, logs, documents and settings, but cannot run code or change anything. |
+| `allowRead` | `FOUNDRY_MCP_ALLOW_READ` | `true` | `false` removes `foundry_documents`, `foundry_document`, `foundry_settings` and `foundry_changes`. With `allowEval` also `false`, clients can read status and logs only. |
 | `logLimit` | `FOUNDRY_MCP_LOG_LIMIT` | `1000` | Log entries kept in memory, from 1 to 10000. |
 
 Module settings (stored per browser): **MCP hub address** (default `ws://127.0.0.1:30123/foundry`; only loopback
@@ -368,7 +372,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 60 checks)
+### Tested in simulation only (`npm test`, 61 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -385,10 +389,11 @@ the change tracker and dice control (below).
 
 - **`foundry_changes` and `foundry_dice` against real Foundry.** In simulation, the tracker records updates with
   their earlier values, creations, deletions with their data, Foundry's deletion operator and the older `-=key`
-  form, withholds credential-like values, installs its hooks once, credits a change to its call when the tab's
-  clock runs behind, and never lists one change for two calls; dice control seeds both
-  `CONFIG.Dice.randomUniform` and Foundry's "Mersenne" fulfillment method, fits queued results to dice, refuses an
-  invalid seed and restores Foundry's own functions. Both were written against Foundry 14.370's source, and seeding
+  form, withholds credential-like values at any depth, leaves out earlier values when updates overlap, installs its
+  hooks once, credits a change to its call when the tab's clock runs behind, and never lists one change for two
+  calls, overlapping or not; dice control seeds both `CONFIG.Dice.randomUniform` and Foundry's "Mersenne"
+  fulfillment method, fits queued results to dice, refuses an invalid seed, restores Foundry's own functions, and
+  passes rolls through when another module has wrapped them. Both were written against Foundry 14.370's source, and seeding
   was checked against its own `MersenneTwister`, but neither has run in a world yet.
 
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.

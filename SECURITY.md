@@ -21,8 +21,9 @@ players. It also means:
 2. Keep the generated **token** on. It is the default.
 3. List only the test world in `worlds`. Do not use `*`.
 4. Keep your client's **approval prompts** for `foundry_eval` on, at least until you trust a workflow.
-5. Set `allowEval: false` when the agent only needs to read. It can then list and read documents and settings but
-   cannot run code or change anything. Add `allowRead: false` when you only need to watch status and logs.
+5. Set `allowEval: false` when the agent only needs to read. It can then list and read documents, settings and
+   changes but cannot run code, fix dice or change anything. Add `allowRead: false` when you only need to watch
+   status and logs.
 6. Run the hub only while you are working, and disable the module when you are done with a world.
 
 ## Threats and safeguards
@@ -56,8 +57,8 @@ that code as JSON data. What this does not change:
 - **The module is unchanged.** It still evaluates whatever its hub sends; read-only is a property of the hub. Use
   the token so that only your hub can be that hub.
 - **`foundry_changes` reports what everyone does.** It lists changes from every user, players included, while the
-  tab is open. Its buffer lives in the GM's browser memory only, and credential-like text values are withheld on
-  the same best-effort rule as settings.
+  tab is open. Its buffer lives in the GM's browser memory only, and credential-like text values are withheld, at
+  any depth, on the same best-effort rule as settings.
 
 ## The token
 

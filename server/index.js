@@ -485,10 +485,13 @@ const CLOCK_SLACK_MS = 500;
 async function evalTool(code, timeoutMs) {
   const logSeq = lastSeq;
   const connection = foundry;
-  if (connection && !connection.trackingTried) {
-    connection.trackingTried = true;
-    const installed = await changes({ install: true });
-    if (installed) connection.seenSeq = installed.seq;
+  // Every call waits for the one installation, so calls made together on a fresh page all see their changes.
+  // Only a call that never got an answer (a timeout, a disconnect) is retried by the next call.
+  if (connection) {
+    connection.tracking ??= callFoundry(withArgs(CHANGES, { install: true }), 10_000, requestScope.getStore()).then(
+      (reply) => { if (reply.ok && reply.result) connection.seenSeq = Math.max(connection.seenSeq ?? 0, reply.result.seq); },
+      () => { connection.tracking = undefined; });
+    await connection.tracking;
   }
   const startTime = Date.now() - CLOCK_SLACK_MS;
   const seqAtStart = connection?.seenSeq ?? 0;
@@ -497,8 +500,18 @@ async function evalTool(code, timeoutMs) {
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
     const found = await changes({ since: seqAtStart, sinceTime: startTime, limit: 100 });
-    if (found && connection) connection.seenSeq = Math.max(connection.seenSeq ?? 0, found.lastSeq);
-    const changed = found?.matched ? { changes: found.entries, ...(found.matched > found.entries.length ? { changesOmitted: found.matched - found.entries.length } : {}) } : {};
+    let changed = {};
+    if (found && connection) {
+      connection.seenSeq = Math.max(connection.seenSeq ?? 0, found.lastSeq);
+      // Calls that overlap see the same changes; whichever finishes first lists them, so none is listed twice.
+      // The tab keeps 500 changes, so older sequence numbers can be forgotten.
+      const reported = (connection.reported ??= new Set());
+      const fresh = found.entries.filter((entry) => !reported.has(entry.seq));
+      for (const entry of fresh) reported.add(entry.seq);
+      for (const seq of reported) if (seq <= found.lastSeq - 1000) reported.delete(seq);
+      const omitted = found.matched - found.entries.length;
+      if (fresh.length || omitted > 0) changed = { changes: fresh, ...(omitted > 0 ? { changesOmitted: omitted } : {}) };
+    }
     const keep = found ? { logSeq, changesSeq: found.cursor } : { logSeq };
     return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };
   } catch (error) {
@@ -613,13 +626,14 @@ const CHANGES = `
       for (const path of Object.keys(out)) if (path === '_id' || path === '_stats' || path.startsWith('_stats.')) delete out[path];
       return out;
     };
-    const scrub = (data, documentName) => {
+    // Withholds credential-like text anywhere inside a value; key is the name the value is stored under.
+    const scrub = (data, key = '') => {
       const walk = (value, key) => {
         if (Array.isArray(value)) return value.map((item) => walk(item, key));
         if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, k)]));
-        return documentName !== 'Setting' && secret(key, value) ? '[withheld]' : value;
+        return secret(key, value) ? '[withheld]' : value;
       };
-      return walk(data, '');
+      return walk(data, key);
     };
     const describe = (doc, userId) => ({
       time: new Date().toISOString(), documentName: doc.documentName, uuid: doc.uuid, name: doc.name ?? null,
@@ -634,23 +648,31 @@ const CHANGES = `
     // A setting's value is withheld when its key is named like a credential, as foundry_settings does.
     const settingSecret = (doc) => doc.documentName === 'Setting' && credential.test(String(doc.key ?? '').split('.').at(-1));
     const guard = (fn) => (...args) => { try { fn(...args); } catch {} }; // never return false: that would cancel the change
+    // A value as reported: cut down, with credential-like text withheld at any depth. A Setting's own fields
+    // (its "key" among them) are not credentials; its value is withheld whole when its key is named like one.
+    const clean = (doc, path, value) => settingSecret(doc) ? '[withheld]' : doc.documentName === 'Setting' ? cap(value) : scrub(cap(value), path.split('.').at(-1));
     for (const type of CONST.ALL_DOCUMENT_TYPES) {
+      // Earlier values are taken before the GM's own update is sent. Foundry gives no way to match an update
+      // to its snapshot, so when updates to one document overlap (two pending, or another user's in between),
+      // the earlier values are left out rather than risk reporting the wrong ones.
       Hooks.on('preUpdate' + type, guard((doc, change) => {
         const before = {};
         for (const path of Object.keys(paths(change))) before[path] = cap(foundry.utils.getProperty(doc._source ?? {}, path));
-        t.before.set(doc, before);
+        t.before.set(doc, t.before.has(doc) ? { ambiguous: true } : { before });
       }));
       Hooks.on('update' + type, guard((doc, change, options, userId) => {
-        const before = t.before.get(doc);
-        t.before.delete(doc);
+        const pending = t.before.get(doc);
+        const self = userId === game.user?.id;
+        if (pending && self) t.before.delete(doc);
+        else if (pending) t.before.set(doc, { ambiguous: true });
+        const before = self && pending && !pending.ambiguous ? pending.before : undefined;
         const changed = Object.entries(paths(change));
         if (!changed.length) return;
-        const hide = settingSecret(doc);
         add({ action: 'update', ...describe(doc, userId), changes: changed.map(([path, { value, deleted }]) => {
           const row = { path };
           if (deleted) row.deleted = true;
-          else row.value = hide || (doc.documentName !== 'Setting' && secret(path, value)) ? '[withheld]' : cap(value);
-          if (before && Object.hasOwn(before, path)) row.before = hide || (doc.documentName !== 'Setting' && secret(path, before[path])) ? '[withheld]' : before[path];
+          else row.value = clean(doc, path, value);
+          if (before && Object.hasOwn(before, path)) row.before = clean(doc, path, before[path]);
           return row;
         }) });
       }));
@@ -659,7 +681,7 @@ const CHANGES = `
         const entry = { action: 'delete', ...describe(doc, userId), type: doc.type ?? null };
         // The deleted data, so the change can be undone by creating it again.
         let data = null;
-        try { data = settingSecret(doc) ? null : scrub(doc.toObject(), doc.documentName); } catch {}
+        try { data = settingSecret(doc) ? null : doc.documentName === 'Setting' ? doc.toObject() : scrub(doc.toObject()); } catch {}
         const json = data && JSON.stringify(data);
         if (json && json.length <= 20000) entry.data = data;
         else if (json) entry.dataChars = json.length;
@@ -689,45 +711,49 @@ const DICE = `
   const mersenne = CONFIG.Dice.fulfillment?.methods?.mersenne;
   let s = globalThis[KEY];
   if (!s && (args.seed !== undefined && args.seed !== null || args.next?.length)) {
-    s = globalThis[KEY] = { seed: null, queue: [], forced: 0, random: null };
-    s.original = { randomUniform: CONFIG.Dice.randomUniform, handler: mersenne?.handler, mapRandomFace: DiceTerm.prototype.mapRandomFace };
-    const original = s.original.mapRandomFace;
+    s = globalThis[KEY] = { seed: null, twister: null, queue: [], forced: 0, installed: false };
+    const original = s.original = { randomUniform: CONFIG.Dice.randomUniform, handler: mersenne?.handler, mapRandomFace: DiceTerm.prototype.mapRandomFace };
+    // If another module wraps these after they are installed, they cannot be taken out again. So once dice
+    // control is off, each hands every roll straight to the function it replaced.
+    s.random = function (...rest) { return s.twister ? s.twister.random() : original.randomUniform.apply(this, rest); };
+    s.handler = function (term, ...rest) { return s.twister ? term.mapRandomFace(s.twister.random()) : original.handler.call(this, term, ...rest); };
     // A queued result is used by the first die it fits: right number of faces (if given) and within the die's range.
-    s.mapRandomFace = function (randomUniform) {
+    s.mapRandomFace = function (...rest) {
       const low = this.minValue ?? 1;
       const index = s.queue.findIndex((entry) => (entry.faces === undefined || entry.faces === this.faces) && entry.result >= low && entry.result <= low + this.faces - 1);
       if (index >= 0) {
         s.forced += 1;
         return s.queue.splice(index, 1)[0].result;
       }
-      return original.call(this, randomUniform);
+      return original.mapRandomFace.apply(this, rest);
     };
     DiceTerm.prototype.mapRandomFace = s.mapRandomFace;
   }
-  if (s) {
-    if (args.seed === null && s.seed !== null) {
-      if (CONFIG.Dice.randomUniform === s.random) CONFIG.Dice.randomUniform = s.original.randomUniform;
-      if (mersenne && mersenne.handler === s.handler) mersenne.handler = s.original.handler;
-      s.seed = null;
-    } else if (args.seed !== undefined && args.seed !== null) {
-      const twister = new foundry.dice.MersenneTwister(args.seed);
-      s.random = () => twister.random();
-      CONFIG.Dice.randomUniform = s.random;
-      // Foundry's "Digital (Mersenne)" fulfillment method calls the twister directly, not randomUniform.
-      if (mersenne) mersenne.handler = s.handler = (term) => term.mapRandomFace(s.random());
-      s.seed = args.seed;
-    }
-    if (args.clear) s.queue.length = 0;
-    for (const entry of args.next ?? []) s.queue.push(entry.faces === undefined ? { result: entry.result } : { faces: entry.faces, result: entry.result });
-    if (s.seed === null && !s.queue.length) {
-      // Nothing left to control: put Foundry's own function back, unless something else has replaced it since.
-      if (DiceTerm.prototype.mapRandomFace === s.mapRandomFace) DiceTerm.prototype.mapRandomFace = s.original.mapRandomFace;
-      delete globalThis[KEY];
-      return { seed: null, queued: [], forced: s.forced, active: false };
-    }
-    return { seed: s.seed, queued: s.queue, forced: s.forced, active: true };
+  if (!s) return { seed: null, queued: [], forced: 0, active: false };
+  if (args.seed === null && s.seed !== null) {
+    s.twister = null;
+    s.seed = null;
+    // Put Foundry's own functions back, unless something else has wrapped them since; then they pass rolls through.
+    if (CONFIG.Dice.randomUniform === s.random) CONFIG.Dice.randomUniform = s.original.randomUniform;
+    if (mersenne && mersenne.handler === s.handler) mersenne.handler = s.original.handler;
+  } else if (args.seed !== undefined && args.seed !== null) {
+    s.twister = new foundry.dice.MersenneTwister(args.seed);
+    s.seed = args.seed;
+    // Installed once; reseeding only swaps the twister, so a wrapper another module added stays in place.
+    if (CONFIG.Dice.randomUniform !== s.random && !s.installed) CONFIG.Dice.randomUniform = s.random;
+    // Foundry's "Digital (Mersenne)" fulfillment method calls the twister directly, not randomUniform.
+    if (mersenne && mersenne.handler !== s.handler && !s.installed) mersenne.handler = s.handler;
+    s.installed = true;
   }
-  return { seed: null, queued: [], forced: 0, active: false };`;
+  if (args.clear) s.queue.length = 0;
+  for (const entry of args.next ?? []) s.queue.push(entry.faces === undefined ? { result: entry.result } : { faces: entry.faces, result: entry.result });
+  const active = s.seed !== null || s.queue.length > 0;
+  // Only a call that asks for a change tears down; one without arguments just reports.
+  if (!active && (args.seed !== undefined || args.clear)) {
+    if (DiceTerm.prototype.mapRandomFace === s.mapRandomFace) DiceTerm.prototype.mapRandomFace = s.original.mapRandomFace;
+    delete globalThis[KEY];
+  }
+  return { seed: s.seed, queued: s.queue, forced: s.forced, active };`;
 
 const INSTRUCTIONS =
   'Controls a live Foundry VTT world through the GM\'s browser session. Call foundry_status first: it reports the Foundry ' +
@@ -1006,6 +1032,6 @@ http.listen(config.port, '127.0.0.1', () => {
   if (tokenGenerated) say(`Generated a hub token and saved it to ${configFile}. MCP clients and the module's "Hub token" setting need it.`);
   else if (config.token) say('Token required from MCP clients and from the module.');
   else say('WARNING: no token ("token": ""). Any program or account on this computer can use the hub.');
-  if (!config.allowEval) say(`foundry_eval is disabled (allowEval: false); clients can read ${config.allowRead ? 'status, logs, documents and settings but cannot run code' : 'status and logs only'}.`);
-  else if (!config.allowRead) say('The document and settings tools are disabled (allowRead: false); foundry_eval can still read everything.');
+  if (!config.allowEval) say(`foundry_eval and foundry_dice are disabled (allowEval: false); clients can read ${config.allowRead ? 'status, logs, documents, settings and changes but cannot run code' : 'status and logs only'}.`);
+  else if (!config.allowRead) say('The document, settings and changes tools are disabled (allowRead: false); foundry_eval can still read everything.');
 });
