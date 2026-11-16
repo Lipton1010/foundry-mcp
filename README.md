@@ -11,6 +11,25 @@ and Antigravity (see [docs/clients.md](docs/clients.md)).
 > reads from your world is sent to the AI provider behind your client. Use a copy of your world and read
 > [SECURITY.md](SECURITY.md) first.
 
+## How it differs from other Foundry MCP servers
+
+Most Foundry MCP servers help a GM run a game: they offer dozens or hundreds of tools for actors, tokens, combat and
+dice. This one is for writing and debugging the code behind a game, and it is small on purpose.
+
+- **It runs your code where Foundry runs it.** `foundry_eval` executes JavaScript in the GM's own tab, with every
+  module and system loaded, rather than through a fixed list of tools or a separate API.
+- **It reports what broke and which module broke it.** Warnings, errors and unhandled rejections are captured in the
+  tab, including ones raised after a call has returned (a hook, a midi-qol workflow, a timer). Each is tagged with the
+  modules on its stack and with whether your evaluated code was involved.
+- **It keeps everything on your computer.** No hosted relay, no account and no paid tiers: the hub listens on
+  loopback only, and nothing leaves your machine except what your MCP client sends to its AI provider.
+- **It treats full GM power as the risk it is.** A hub token, a signed command channel between hub and module, a
+  world allowlist that is empty by default, credential redaction in logs, and a read-only mode. See
+  [SECURITY.md](SECURITY.md) for what is and is not protected.
+- **It works with any game system and any streamable-HTTP MCP client.** Several clients share one hub.
+
+If you want an assistant that runs combat or builds encounters for you, a GM-oriented server will suit you better.
+
 ## How it works
 
 ```
