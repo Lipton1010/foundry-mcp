@@ -369,7 +369,7 @@ function redact(text, opaque = true) {
     // escapes included.
     // A quoted value runs to its closing quote, across line breaks; one whose closing quote was cut off with the end
     // of a long line runs to the end of the text.
-    .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\]|\\[\s\S])*(?:"|\\?$)|'(?:[^'\\]|\\[\s\S])*(?:'|\\?$)|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
+    .replace(/([\w-]{0,74}(?:password|passwd|passcode|passphrase|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\]|\\[\s\S])*(?:"|\\?$)|'(?:[^'\\]|\\[\s\S])*(?:'|\\?$)|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
       const quote = value[0] === '"' || value[0] === "'" ? value[0] : '';
       const closed = quote !== '' && value.length > 1 && value.endsWith(quote) && !value.endsWith(`\\${quote}`);
       if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='), quote ? value.slice(1, closed ? -1 : undefined) : value)) return match;
@@ -395,8 +395,8 @@ function redact(text, opaque = true) {
 // Written as plain `token: value`, the value decides: one that looks machine-made (six or more
 // characters with a digit, or twelve or more of anything) is taken for a credential, a short word is not.
 function isCredentialKey(key, assignment, value) {
-  const name = key.toLowerCase().replace(/(key|token|secret|password)s$/, '$1'); // a list of them: apiKeys, tokens
-  if (/(?:password|passwd|api[-_]?key|secret[-_]?key|private[-_]?key|authorization|cookie)$/.test(name)) return true;
+  const name = key.toLowerCase().replace(/(key|token|secret|password|passcode)s$/, '$1'); // a list of them: apiKeys, tokens
+  if (/(?:password|passwd|passcode|passphrase|api[-_]?key|secret[-_]?key|private[-_]?key|authorization|cookie)$/.test(name)) return true;
   if (/(?:token|secret)$/.test(name)) return assignment || name.length > 6 || value.length >= 12 || (value.length >= 6 && /\d/.test(value));
   return false;
 }

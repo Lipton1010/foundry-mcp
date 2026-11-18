@@ -704,8 +704,8 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
         keep.changesSeq = found.cursor;
         // Calls that overlap see the same changes; whichever finishes first lists them, so none is listed twice.
         const reported = (connection.reported ??= new Set());
+        // Marked as reported only once the reply is fitted below, so an entry cut from this reply can be listed by another.
         const fresh = found.entries.filter((entry) => !reported.has(entry.seq));
-        for (const entry of fresh) reported.add(entry.seq);
         for (const seq of reported) if (seq <= found.lastSeq - 1000) reported.delete(seq);
         const omitted = found.matched - found.entries.length;
         if (fresh.length || omitted > 0 || found.evictedSince) {
@@ -732,6 +732,7 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
       const cut = changed.changes.length - rows.length;
       changed = { ...changed, changes: rows, changesOmitted: (changed.changesOmitted ?? 0) + cut };
     }
+    if (connection?.reported && Array.isArray(changed.changes)) for (const entry of changed.changes) connection.reported.add(entry.seq);
     return { content: [{ type: 'text', text: asText({ ...body, ...logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };
   } catch (error) {
     return textReply(error.message, true);

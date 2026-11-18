@@ -81,7 +81,7 @@ export async function readDocument(args) {
  * so only text is withheld (an on/off setting such as "find-my-token" is shown).
  */
 export function readSettings(args) {
-  const credential = /pass(?:word|wd)|secret|credential|authorization|cookie|api[-_]?key|private[-_]?key|(?:token|key)$/i;
+  const credential = /pass(?:word|wd|code|phrase)|secret|credential|authorization|cookie|api[-_]?key|private[-_]?key|(?:token|key)$/i;
   const label = (setting) => (typeof setting.name === 'string' ? game.i18n.localize(setting.name) : null);
   const needle = args.contains?.toLowerCase();
   const offset = args.offset ?? 0;
@@ -96,6 +96,19 @@ export function readSettings(args) {
   const clean = (value, depth, key = '') => {
     if (typeof value === 'string') {
       if (key && credential.test(key) && value) return '[withheld]';
+      // JSON encoded as a string more than once is unwrapped and cleaned too.
+      if (/^\s*"/.test(value) && value.length <= 100_000 && depth <= 20) {
+        let inner;
+        try {
+          inner = JSON.parse(value);
+        } catch {
+          inner = undefined;
+        }
+        if (typeof inner === 'string') {
+          const cleaned = clean(inner, depth + 1);
+          return cleaned === inner ? value : JSON.stringify(cleaned);
+        }
+      }
       // Text holding JSON (a profile stored as a string) is read and cleaned the same way; unreadable such text is withheld.
       if (/^\s*[[{]/.test(value) && /"\s*:/.test(value)) {
         if (value.length > 100_000 || depth > 20) return '[withheld: too long to check for credentials]';
@@ -152,7 +165,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 7; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
+  const VERSION = 8; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -168,7 +181,7 @@ export function installChanges() {
   const OP = '__$OPERATOR$__';
   // Sequence numbers continue from an older tracker, so cursors the hub holds stay meaningful.
   const t = globalThis[KEY] = { version: VERSION, seq: old?.seq ?? 0, entries: [], bytes: 0, evicted: 0, since: Date.now(), snapshots: new Map(), hookIds: [] };
-  const credential = /pass(?:word|wd)|secret|credential|authorization|cookie|salt|api[-_]?key|private[-_]?key|(?:token|key)$/i;
+  const credential = /pass(?:word|wd|code|phrase)|secret|credential|authorization|cookie|salt|api[-_]?key|private[-_]?key|(?:token|key)$/i;
   const ID = /^[A-Za-z0-9]{16}$/;
   const DOC_UUID = /^(?:Compendium\.[\w.-]+\.)?[A-Z][A-Za-z]*\.[A-Za-z0-9]{16}(?:\.[A-Z][A-Za-z]*\.[A-Za-z0-9]{16})*$/;
   const ATTRIBUTE = /^[\w$@-]{1,40}(?:\.[\w$@-]{1,40})+$/;
@@ -413,7 +426,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 7) return { installed: false }; // the same number as VERSION in installChanges
+  if (t?.version !== 8) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 
@@ -855,7 +868,11 @@ export async function undoUpdate(args, signal) {
       // Embedded documents that were there before the edit and are gone now, however late they went: not restored.
       ...(() => {
         const missing = Object.entries(args.embedded ?? {}).flatMap(([name, ids]) => ids.filter((id) => !doc.collections?.[name]?.has?.(id)).map((id) => doc.uuid + '.' + (doc.collections?.[name]?.documentClass?.documentName ?? name) + '.' + id));
-        return missing.length ? { missingSinceEdit: missing, missingNote: 'These embedded documents existed before the edit and are gone now (the system may have removed them because of it). Undo does not recreate them; foundry_changes has their data if they were deleted while it was tracking.' } : {};
+        const added = Object.entries(doc.collections ?? {}).flatMap(([name, collection]) => [...(collection?.keys?.() ?? [])].filter((id) => !(args.embedded?.[name] ?? []).includes(id)).map((id) => doc.uuid + '.' + (collection?.documentClass?.documentName ?? name) + '.' + id));
+        return {
+          ...(missing.length ? { missingSinceEdit: missing, missingNote: 'These embedded documents existed before the edit and are gone now (the system may have removed them because of it). Undo does not recreate them; foundry_changes has their data if they were deleted while it was tracking.' } : {}),
+          ...(added.length && args.embedded ? { addedSinceEdit: added, addedNote: 'These embedded documents were added since the edit (by it or by anyone). Undo does not remove them.' } : {}),
+        };
       })(),
       ...(linked.length ? { linkedChanged: linked } : {}),
     };
