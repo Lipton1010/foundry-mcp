@@ -400,7 +400,9 @@ the change tracker and dice control (below).
   overlap, evaluations that truly overlap in time, and another module wrapping the dice functions.
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - The read-only tools called by name from a client against a real world (their code has been; see above), and
-  installing the module in Foundry through the manifest URL.
+  installing the module through Foundry's own Install Module dialog. The v0.6.0 manifest and the zip it points to
+  were downloaded and checked as Foundry reads them (module.json at the root, matching version, every script
+  present, compatible with 14), but not installed by Foundry itself.
 - Any game system other than dnd5e. Nothing depends on dnd5e, but no other system has been run.
 - Foundry 13 or earlier (the manifest requires 14), macOS, and real Foundry on Linux or in a browser other than
   the desktop app. CI runs the simulated tests on Linux, and the hub's handling of its config file has been run
