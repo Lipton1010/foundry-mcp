@@ -392,6 +392,20 @@ try {
       assert.match(byKey['weather.broken'].unreadable, /not a registered setting/);
       assert.equal(byKey['weather.broken'].name, null);
       assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
+      // A module's session and a supporter tier are private too (Moulinette's session_ID, DDB Importer's patreon-tier).
+      registered.set('moulinette.session_ID', { namespace: 'moulinette', key: 'session_ID', scope: 'world', name: 'Session' });
+      registered.set('ddb-importer.patreon-tier', { namespace: 'ddb-importer', key: 'patreon-tier', scope: 'world', name: 'Tier' });
+      settings['moulinette.session_ID'] = 'zz-session-zz';
+      settings['ddb-importer.patreon-tier'] = 'GOD';
+      try {
+        for (const namespace of ['moulinette', 'ddb-importer']) {
+          const [row] = payload(await callTool('foundry_settings', { namespace })).result.settings;
+          assert.match(row.withheld, /credential/, namespace);
+        }
+      } finally {
+        registered.delete('moulinette.session_ID');
+        registered.delete('ddb-importer.patreon-tier');
+      }
       // Doubly encoded JSON too long to unwrap is withheld whole.
       const units = settings['weather.units'];
       settings['weather.units'] = { huge: JSON.stringify(JSON.stringify({ apiKey: 'zz-huge-zz', pad: 'x'.repeat(110_000) })) };
@@ -598,6 +612,8 @@ try {
     // JSON encoded as a string twice over.
     Hooks.fire('updateActor', vault, { flags: { mod: { wrapped: JSON.stringify(JSON.stringify({ password: 'zz-wrapped-zz', user: 'gm' })) } } }, {}, 'gm1');
     // A webhook URL carries its secret in itself, whatever the field is called.
+    // Moulinette keeps the GM's cloud session in a setting; it is withheld whole, before and after.
+    Hooks.fire('updateSetting', { documentName: 'Setting', uuid: 'Setting.s5', key: 'moulinette.session_ID' }, { value: JSON.stringify('zz-moul-session-zz') }, {}, 'gm1');
     // DDB Importer keeps the GM's Patreon email in a world setting.
     Hooks.fire('updateSetting', { documentName: 'Setting', uuid: 'Setting.s6', key: 'ddb-importer.patreon-user' }, { value: JSON.stringify('zz.patron@example.com') }, {}, 'gm1');
     // dddice keeps a private room's passcode in its settings.
@@ -628,7 +644,9 @@ try {
       { path: 'flags.mod.label', value: '[Homebrew] Sword' },
     ]);
     assert.deepEqual(nested.entries[8].changes, [{ path: 'flags.mod.wrapped', value: JSON.stringify(JSON.stringify({ password: '[withheld]', user: 'gm' })) }]);
-    assert.deepEqual(nested.entries[9].changes, [{ path: 'value', value: JSON.stringify('[withheld: email]') }]);
+    assert.deepEqual(nested.entries[9].changes, [{ path: 'value', value: '[withheld]' }]);
+    nested.entries.splice(9, 1);
+    assert.deepEqual(nested.entries[9].changes, [{ path: 'value', value: '[withheld]' }], 'withheld whole by its name');
     nested.entries.splice(9, 1);
     assert.deepEqual(nested.entries[9].changes, [{ path: 'value', value: JSON.stringify(JSON.stringify({ slug: 'table', passcode: '[withheld]' })) }]);
     nested.entries.splice(9, 1);
@@ -705,7 +723,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 9);
+    assert.equal(globalThis[KEY].version, 11);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');

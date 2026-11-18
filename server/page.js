@@ -81,7 +81,7 @@ export async function readDocument(args) {
  * so only text is withheld (an on/off setting such as "find-my-token" is shown).
  */
 export function readSettings(args) {
-  const credential = /pass(?:word|wd|code|phrase)|secret|credential|authorization|cookie|api[-_]?key|private[-_]?key|(?:token|key)$/i;
+  const credential = /pass(?:word|wd|code|phrase)|secret|credential|session|patreon|e[-_]?mail|account|licen[cs]e|signature|cloud|(?:^|[-_])user[-_]?id$|authorization|cookie|api[-_]?key|private[-_]?key|(?:token|key)$/i;
   const label = (setting) => (typeof setting.name === 'string' ? game.i18n.localize(setting.name) : null);
   const needle = args.contains?.toLowerCase();
   const offset = args.offset ?? 0;
@@ -169,7 +169,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 9; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
+  const VERSION = 11; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -185,7 +185,7 @@ export function installChanges() {
   const OP = '__$OPERATOR$__';
   // Sequence numbers continue from an older tracker, so cursors the hub holds stay meaningful.
   const t = globalThis[KEY] = { version: VERSION, seq: old?.seq ?? 0, entries: [], bytes: 0, evicted: 0, since: Date.now(), snapshots: new Map(), hookIds: [] };
-  const credential = /pass(?:word|wd|code|phrase)|secret|credential|authorization|cookie|salt|api[-_]?key|private[-_]?key|(?:token|key)$/i;
+  const credential = /pass(?:word|wd|code|phrase)|secret|credential|session|patreon|e[-_]?mail|account|licen[cs]e|signature|cloud|(?:^|[-_])user[-_]?id$|authorization|cookie|salt|api[-_]?key|private[-_]?key|(?:token|key)$/i;
   const ID = /^[A-Za-z0-9]{16}$/;
   const DOC_UUID = /^(?:Compendium\.[\w.-]+\.)?[A-Z][A-Za-z]*\.[A-Za-z0-9]{16}(?:\.[A-Z][A-Za-z]*\.[A-Za-z0-9]{16})*$/;
   const ATTRIBUTE = /^[\w$@-]{1,40}(?:\.[\w$@-]{1,40})+$/;
@@ -432,7 +432,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 9) return { installed: false }; // the same number as VERSION in installChanges
+  if (t?.version !== 11) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 

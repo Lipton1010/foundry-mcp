@@ -55,7 +55,7 @@ data. What this does not change:
 - **Reading is still disclosure.** Everything these tools return goes to the AI provider behind the client:
   journals, chat, GM notes, user names and settings.
 - **Withholding secrets in settings is best effort.** A text value is withheld when its key, or the key it sits
-  under inside an object, is named like a credential (password, passcode, passphrase, secret, cookie, api key, or ending in `token` or
+  under inside an object, is named like a credential or a private account detail (password, passcode, passphrase, secret, session, cookie, api key, email, account, licence, signature, cloud, Patreon, a user id, or ending in `token` or
   `key`), and URLs that carry their secret in themselves (webhooks, passwords in addresses, tokens in queries) have
   that part withheld. Email addresses are withheld too, in settings and in the change feed. A secret in any other form is returned. Stored settings are not readable through the document tools, which would
   sidestep this. The module's pairing token itself is withheld by this rule.
