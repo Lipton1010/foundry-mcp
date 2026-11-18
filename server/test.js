@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHmac, randomUUID } from 'node:crypto';
-import { chmodSync, copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -15,39 +15,55 @@ import { setMaxListeners } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import * as page from './page.js';
 
-const PORT = 30199; // no token, small log buffer
-const TOKEN_PORT = 30198; // token required
-const BARE_PORT = 30197; // no token, eval and read tools disabled, nothing connected: stands in for an impostor hub
-const READ_PORT = 30192; // no token, eval disabled, read tools left on
-const FRESH_PORT = 30196; // a config copied from the example: no token, no worlds, world-readable
-const FAULT_PORT = 30194; // no token; its sockets can be made to fail on send (test-fixtures/fault-send.mjs)
-const FAKE_PORT = 30195; // a hand-rolled hub that knows the token but sends an unsigned command
-const TOKEN = 'correct-horse-battery';
+// Every hub listens on a port the system picks and reports the one it got, so overlapping runs cannot meet.
+let PORT; // no tokens, small log buffer
+let TOKEN_PORT; // client token and pairing token required
+let BARE_PORT; // no tokens, eval and read tools disabled, nothing connected: stands in for an impostor hub
+let READ_PORT; // no tokens, eval disabled, read tools left on
+let FRESH_PORT; // a config copied from the example: no tokens, no worlds, world-readable
+let FAULT_PORT; // pairing token required; its sockets can be made to fail on send (test-fixtures/fault-send.mjs)
+const TOKEN = 'correct-horse-battery'; // what MCP clients send
+const MODULE_TOKEN = 'module-pairing-secret'; // what the module and the hub prove to each other
 const ORIGIN = 'http://localhost:30000';
 const tmp = mkdtempSync(join(tmpdir(), 'foundry-mcp-test-'));
 const freshConfig = join(tmp, 'config.json');
 writeFileSync(freshConfig, '{ "worlds": [] }');
 chmodSync(freshConfig, 0o644);
 
+const hubs = [];
+// Starts a hub and resolves with the port it reports once it is listening.
 function startHub(env, nodeArgs = []) {
   const base = { ...process.env };
   for (const key of Object.keys(base)) if (key.startsWith('FOUNDRY_MCP_')) delete base[key];
-  return spawn(process.execPath, [...nodeArgs, 'index.js'], {
+  const child = spawn(process.execPath, [...nodeArgs, 'index.js'], {
     cwd: import.meta.dirname,
     // Point at a config file that does not exist so a local config.json is never read.
-    env: { ...base, FOUNDRY_MCP_CONFIG: join(tmp, 'none.json'), FOUNDRY_MCP_WORLDS: 'test-world', ...env },
-    stdio: 'inherit',
+    env: { ...base, FOUNDRY_MCP_CONFIG: join(tmp, 'none.json'), FOUNDRY_MCP_WORLDS: 'test-world', FOUNDRY_MCP_PORT: '0', ...env },
+    stdio: ['ignore', 'inherit', 'pipe'],
+  });
+  hubs.push(child);
+  return new Promise((resolve, reject) => {
+    let seen = '';
+    child.stderr.on('data', (chunk) => {
+      process.stderr.write(chunk);
+      seen += chunk;
+      const port = seen.match(/MCP endpoint {2}http:\/\/127\.0\.0\.1:(\d+)\/mcp/)?.[1];
+      if (port) resolve(Number(port));
+    });
+    child.on('exit', (code) => reject(new Error(`a hub exited with code ${code} before listening:\n${seen}`)));
   });
 }
-const hubs = [
-  startHub({ FOUNDRY_MCP_PORT: PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_LOG_LIMIT: 60 }),
-  startHub({ FOUNDRY_MCP_PORT: TOKEN_PORT, FOUNDRY_MCP_TOKEN: `${TOKEN} ` }), // trailing space, as a shell can add
-  startHub({ FOUNDRY_MCP_PORT: BARE_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false', FOUNDRY_MCP_ALLOW_READ: 'false', FOUNDRY_MCP_ORIGINS: 'http://LOCALHOST:30000/' }), // origin as a person might type it
-  startHub({ FOUNDRY_MCP_PORT: READ_PORT, FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
-  startHub({ FOUNDRY_MCP_PORT: FRESH_PORT, FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
-  startHub({ FOUNDRY_MCP_PORT: FAULT_PORT, FOUNDRY_MCP_TOKEN: '' }, ['--import', new URL('./test-fixtures/fault-send.mjs', import.meta.url).href]),
-];
+const noTokens = { FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_MODULE_TOKEN: '' };
+[PORT, TOKEN_PORT, BARE_PORT, READ_PORT, FRESH_PORT, FAULT_PORT] = await Promise.all([
+  startHub({ ...noTokens, FOUNDRY_MCP_LOG_LIMIT: 60 }),
+  startHub({ FOUNDRY_MCP_TOKEN: `${TOKEN} `, FOUNDRY_MCP_MODULE_TOKEN: MODULE_TOKEN }), // trailing space, as a shell can add
+  startHub({ ...noTokens, FOUNDRY_MCP_ALLOW_EVAL: 'false', FOUNDRY_MCP_ALLOW_READ: 'false', FOUNDRY_MCP_ORIGINS: 'http://LOCALHOST:30000/' }), // origin as a person might type it
+  startHub({ ...noTokens, FOUNDRY_MCP_ALLOW_EVAL: 'false' }),
+  startHub({ FOUNDRY_MCP_CONFIG: freshConfig, FOUNDRY_MCP_WORLDS: '' }),
+  startHub({ FOUNDRY_MCP_TOKEN: '', FOUNDRY_MCP_MODULE_TOKEN: MODULE_TOKEN }, ['--import', new URL('./test-fixtures/fault-send.mjs', import.meta.url).href]),
+]);
 
 async function mcp(method, params, { headers = {}, port = PORT, httpMethod = 'POST' } = {}) {
   const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
@@ -68,11 +84,15 @@ const evalCode = async (code, extra = {}, options) => payload(await callTool('fo
 const getLogs = async (args = {}) => payload(await callTool('foundry_logs', args));
 const getLogsFrom = async (options) => payload(await callTool('foundry_logs', { limit: 1 }, options));
 const toolNames = async (options) => (await mcp('tools/list', {}, options)).result.tools.map((t) => t.name);
+const ALL_TOOLS = [
+  'foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_scene', 'foundry_screenshot',
+  'foundry_eval', 'foundry_update', 'foundry_undo', 'foundry_dice', 'foundry_changes', 'foundry_logs',
+];
 
 // --- Stub the slice of Foundry and the browser the module touches.
 const hooks = {};
 const settings = {
-  'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '',
+  'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '', 'foundry-mcp.allowNoToken': true,
   'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': 'metric',
 };
 // What the read-only tools look at. A Foundry Collection is a Map that iterates its values.
@@ -126,7 +146,7 @@ globalThis.game = {
   version: '14.370',
   actors: Object.assign(new Map([['a1', actor]]), { getName: () => actor }),
   items: new Map(), scenes: Object.assign(new Map(), { active: null }), macros: new Map(), journal: new Map(),
-  modules: [{ id: 'foundry-mcp', version: '0.6.0', active: true }],
+  modules: [{ id: 'foundry-mcp', version: '0.7.0', active: true }],
 };
 globalThis.fromUuid = async (uuid) => ({ 'Actor.g1': goblin, 'Setting.s1': storedSetting })[uuid] ?? null;
 globalThis.canvas = { scene: null };
@@ -145,9 +165,10 @@ globalThis.WebSocket = class extends NodeWebSocket {
 };
 // Loads another copy of the real module script, as a second browser tab would.
 let copies = 0;
-async function startModule(url, token, beforeReady) {
+async function startModule(url, token, beforeReady, { allowNoToken = true } = {}) {
   settings['foundry-mcp.url'] = url;
   settings['foundry-mcp.token'] = token;
+  settings['foundry-mcp.allowNoToken'] = allowNoToken;
   // A real second instance needs a second file: Node reuses the module for a URL that differs only by query.
   const copy = join(tmp, `bridge-${++copies}.mjs`);
   copyFileSync(new URL('../foundry-mcp/scripts/bridge.js', import.meta.url), copy);
@@ -166,21 +187,53 @@ const sign = (key, text) => createHmac('sha256', key).update(text).digest();
 const bindingOf = (hello, hubNonce) => [hello.nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
 function rawSocket(port, origin, token, { firstMessage, claimedWorld, reported = {}, relayed = {} } = {}) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
-  const hello = { protocol: 5, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc', ...reported };
+  const hello = { protocol: 6, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc', ...reported };
   const sent = { ...hello, world: claimedWorld ?? hello.world, ...relayed };
   return new Promise((resolve) => {
     ws.addEventListener('open', () => ws.send(firstMessage ?? JSON.stringify({ hello: sent })));
     ws.addEventListener('message', (event) => {
       const msg = JSON.parse(event.data);
       if (msg.challenge) {
-        const expected = sign(TOKEN, `hub\n${bindingOf(sent, msg.challenge.nonce)}`).toString('hex');
-        assert.equal(msg.challenge.proof, expected, 'the hub proves it knows the token');
+        const expected = sign(MODULE_TOKEN, `hub\n${bindingOf(sent, msg.challenge.nonce)}`).toString('hex');
+        assert.equal(msg.challenge.proof, expected, 'the hub proves it knows the pairing token');
         ws.send(JSON.stringify({ proof: sign(token ?? '', `module\n${bindingOf(hello, msg.challenge.nonce)}`).toString('hex') }));
       } else resolve({ ws, outcome: msg.welcome ? 'welcomed' : 'other' });
     });
     ws.addEventListener('close', (event) => resolve({ outcome: 'closed', code: event.code }));
     ws.addEventListener('error', () => resolve({ outcome: 'rejected' }));
   });
+}
+// The slice of foundry.utils and foundry.data.operators the page code uses, behaving as Foundry 14's do.
+const own = (object, key) => object !== null && typeof object === 'object' && Object.hasOwn(object, key);
+const foundryUtils = {
+  getProperty: (object, path) => path.split('.').reduce((value, key) => (own(value, key) ? value[key] : undefined), object),
+  hasProperty: (object, path) => {
+    let value = object;
+    for (const key of path.split('.')) {
+      if (!own(value, key)) return false;
+      value = value[key];
+    }
+    return true;
+  },
+  setProperty: (object, path, value) => {
+    const keys = path.split('.');
+    const last = keys.pop();
+    let target = object;
+    for (const key of keys) target = own(target, key) && typeof target[key] === 'object' ? target[key] : (target[key] = {});
+    target[last] = value;
+    return true;
+  },
+  deepClone: (value) => (value === undefined ? undefined : structuredClone(value)),
+  expandObject: (object) => {
+    const out = {};
+    for (const [path, value] of Object.entries(object)) foundryUtils.setProperty(out, path, value);
+    return out;
+  },
+};
+class ForcedDeletion {
+  toJSON() {
+    return { __$OPERATOR$__: 'ForcedDeletion' };
+  }
 }
 const fixture = await import('./test-fixtures/modules/fake-automation/scripts/workflow.js');
 globalThis.fakeAutomation = fixture;
@@ -203,18 +256,6 @@ const check = async (name, fn) => {
 };
 
 try {
-  // Wait until every hub answers instead of guessing how long start-up takes.
-  for (const port of [PORT, TOKEN_PORT, BARE_PORT, READ_PORT, FRESH_PORT, FAULT_PORT]) {
-    for (let tries = 0; ; tries++) {
-      try {
-        await fetch(`http://127.0.0.1:${port}/`);
-        break;
-      } catch (error) {
-        if (tries > 100) throw new Error(`hub on port ${port} did not start`, { cause: error });
-        await sleep(100);
-      }
-    }
-  }
   await import('../foundry-mcp/scripts/bridge.js');
   hooks.init();
 
@@ -242,14 +283,32 @@ try {
     assert.equal(logs.entries[0].level, 'error');
   });
 
-  await check('lists the eight tools', async () => {
-    assert.deepEqual(await toolNames(), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_dice', 'foundry_changes', 'foundry_logs']);
+  await check('lists the twelve tools', async () => {
+    assert.deepEqual(await toolNames(), ALL_TOOLS);
   });
 
-  await check('status reports world and system without assuming dnd5e', async () => {
+  await check('status reports world, page session and system without assuming dnd5e', async () => {
     const status = payload(await callTool('foundry_status')).result;
     assert.equal(status.world, 'test-world');
     assert.equal(status.system, 'some-system');
+    assert.match(status.session, /^[a-z0-9]+$/);
+    assert.equal(status.viewedLevel, null);
+  });
+
+  await check('a call meant for another world or an earlier page runs nothing', async () => {
+    const { session } = payload(await callTool('foundry_status')).result;
+    for (const [args, expected] of [
+      [{ expectedWorld: 'other-world' }, /expected world "other-world", but "test-world" is connected/],
+      [{ expectedSession: 'stale' }, /expected page session "stale"/],
+    ]) {
+      const refused = await callTool('foundry_eval', { code: 'globalThis.ranInWrongWorld = true; return 1', ...args });
+      assert.equal(refused.isError, true);
+      assert.match(refused.content[0].text, expected);
+      const dice = await callTool('foundry_dice', { seed: 1, ...args });
+      assert.match(dice.content[0].text, expected);
+    }
+    assert.equal(globalThis.ranInWrongWorld, undefined);
+    assert.equal((await evalCode('return 9', { expectedWorld: 'test-world', expectedSession: session })).result, 9);
   });
 
   // --------------------------------------------------------- read-only tools
@@ -265,6 +324,9 @@ try {
     const limited = await read('foundry_documents', { type: 'Actor', limit: 1 });
     assert.equal(limited.total, 2);
     assert.equal(limited.documents.length, 1);
+    assert.equal(limited.nextOffset, 1, 'a page that is not the last says where the next starts');
+    const second = await read('foundry_documents', { type: 'Actor', limit: 1, offset: limited.nextOffset });
+    assert.deepEqual([second.total, second.documents.map((d) => d.id), second.nextOffset], [2, ['g2'], undefined]);
     // A document with no name (a chat message) is listed, and matches no name search.
     assert.deepEqual((await read('foundry_documents', { type: 'ChatMessage' })).documents, [{ id: 'c1', name: null, type: null, folder: null, uuid: 'ChatMessage.c1' }]);
     assert.equal((await read('foundry_documents', { type: 'ChatMessage', name: 'x' })).total, 0);
@@ -323,7 +385,10 @@ try {
       assert.equal(byKey['weather.broken'].name, null);
       assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
       assert.deepEqual(payload(await callTool('foundry_settings', { contains: 'default token' })).result.settings.map((setting) => setting.key), ['defaultToken']);
-      assert.equal(payload(await callTool('foundry_settings', { limit: 2 })).result.settings.length, 2);
+      const firstPage = payload(await callTool('foundry_settings', { limit: 2 })).result;
+      assert.deepEqual([firstPage.total, firstPage.settings.length, firstPage.nextOffset], [5, 2, 2]);
+      const lastPage = payload(await callTool('foundry_settings', { limit: 2, offset: 4 })).result;
+      assert.deepEqual([lastPage.settings.map((setting) => setting.key), lastPage.nextOffset], [['broken'], undefined]);
     } finally {
       settings['foundry-mcp.token'] = '';
     }
@@ -420,27 +485,32 @@ try {
   });
 
   // ------------------------------------------------- document changes and dice
-  await check('eval lists the document changes it caused; later ones, secrets withheld, come from foundry_changes', async () => {
+  await check('eval lists the document changes seen while it ran; later ones, secrets withheld, come from foundry_changes', async () => {
     const before = await evalCode('return 1;');
     assert.equal(before.changes, undefined, 'no tracking without Foundry hooks');
     assert.equal(before.changesSeq, undefined);
+    assert.match(before.changesUnavailable, /no hooks/);
     // The hook and document API the tracker uses, as Foundry 14 provides it.
     const handlers = {};
-    Hooks.on = (name, fn) => (handlers[name] ??= []).push(fn);
-    Hooks.fire = (name, ...args) => (handlers[name] ?? []).forEach((fn) => fn(...args));
+    let hookId = 0;
+    Hooks.on = (name, fn) => ((handlers[name] ??= []).push({ id: ++hookId, fn }), hookId);
+    Hooks.off = (name, id) => (handlers[name] = (handlers[name] ?? []).filter((entry) => entry.id !== id));
+    Hooks.fire = (name, ...args) => (handlers[name] ?? []).forEach((entry) => entry.fn(...args));
+    globalThis.handlers = handlers;
     globalThis.CONST = { ALL_DOCUMENT_TYPES: ['Actor', 'Item', 'User', 'Setting'] };
-    globalThis.foundry = { utils: { getProperty: (object, path) => path.split('.').reduce((value, key) => value?.[key], object) } };
+    globalThis.foundry = { utils: foundryUtils, data: { operators: { ForcedDeletion } } };
     game.user.id = 'gm1';
-    game.users = new Map([['gm1', { name: 'Gamemaster' }], ['p1', { name: 'Player' }]]);
+    game.users = new Collection([['gm1', { name: 'Gamemaster', isGM: true }], ['p1', { name: 'Player', isGM: false }]]);
     globalThis.testHero = { documentName: 'Actor', uuid: 'Actor.h1', name: 'Hero', parent: null, type: 'character', _source: { system: { hp: 10 } } };
-    // In Foundry the hooks exist before the first call; here they arrived late, so start tracking explicitly.
+    // In Foundry the hooks exist before the first call; here they arrived late, so the next call sets tracking up.
     assert.equal(payload(await callTool('foundry_changes')).matched, 0);
 
     const reply = await evalCode(`
       const hero = globalThis.testHero;
-      Hooks.fire('preUpdateActor', hero, { system: { hp: 4 } });
+      const options = {}; // Foundry passes one options object to an update's preUpdate and update hooks
+      Hooks.fire('preUpdateActor', hero, { system: { hp: 4 } }, options, 'gm1');
       hero._source.system.hp = 4;
-      Hooks.fire('updateActor', hero, { _id: 'h1', system: { hp: 4 }, _stats: { modifiedTime: 1 } }, {}, 'gm1');
+      Hooks.fire('updateActor', hero, { _id: 'h1', system: { hp: 4 }, _stats: { modifiedTime: 1 } }, options, 'gm1');
       Hooks.fire('updateActor', hero, { _id: 'h1', _stats: { modifiedTime: 2 } }, {}, 'gm1'); // nothing changed: not recorded
       Hooks.fire('createItem', { documentName: 'Item', uuid: 'Actor.h1.Item.i1', name: 'Sword', type: 'weapon', parent: hero }, {}, 'gm1');
       return 'done';`);
@@ -451,37 +521,57 @@ try {
     assert.equal(reply.changes[0].self, true);
     assert.equal(reply.changes[1].parent, 'Actor.h1');
     assert.equal(typeof reply.changesSeq, 'number');
+    assert.equal(reply.session, payload(await callTool('foundry_status')).result.session);
 
-    // After the call returned: a player's changes, with Foundry's deletion operator, a deleted document and secrets.
-    const deletion = { toJSON: () => ({ __$OPERATOR$__: 'ForcedDeletion' }) };
-    Hooks.fire('updateUser', { documentName: 'User', uuid: 'User.p1', name: 'Player' }, { password: 'hunter2hunter2', flags: { mod: { old: deletion }, x: { '-=gone': null } } }, {}, 'p1');
+    // After the call returned: a player's changes, with Foundry's deletion operator, a deleted document and secrets,
+    // including secrets inside a setting's stored value.
+    Hooks.fire('updateUser', { documentName: 'User', uuid: 'User.p1', name: 'Player' }, { password: 'hunter2hunter2', flags: { mod: { old: new ForcedDeletion() }, x: { '-=gone': null } } }, {}, 'p1');
     Hooks.fire('updateSetting', { documentName: 'Setting', uuid: 'Setting.s9', key: 'weather.apiKey' }, { value: '"sk-live-1"' }, {}, 'gm1');
+    const service = { documentName: 'Setting', uuid: 'Setting.s8', key: 'weather.service', toObject: () => ({ key: 'weather.service', value: '{"url":"https://w.example","auth":{"password":"zz-pw-zz"}}' }) };
+    Hooks.fire('updateSetting', service, { value: '{"url":"https://w.example","auth":{"password":"zz-pw-zz"}}' }, {}, 'gm1');
+    Hooks.fire('deleteSetting', service, {}, 'gm1');
     Hooks.fire('deleteActor', { documentName: 'Actor', uuid: 'Actor.h2', name: 'Old', type: 'npc', toObject: () => ({ name: 'Old', flags: { mod: { apiKey: 'abc123secret', note: 'kept' } } }) }, {}, 'p1');
 
-    const later = payload(await callTool('foundry_changes', { since: reply.changesSeq }));
-    assert.equal(later.matched, 5);
-    const [, , user, setting, removed] = later.entries;
+    const later = payload(await callTool('foundry_changes', { since: reply.changesSeq, session: reply.session }));
+    assert.equal(later.matched, 7);
+    assert.equal(later.pageReloaded, undefined);
+    const [, , user, setting, serviceUpdate, serviceDeleted, removed] = later.entries;
     assert.equal(user.self, false);
     assert.equal(user.user, 'Player');
     assert.deepEqual(user.changes, [{ path: 'password', value: '[withheld]' }, { path: 'flags.mod.old', deleted: true }, { path: 'flags.x.gone', deleted: true }]);
     assert.deepEqual(setting.changes, [{ path: 'value', value: '[withheld]' }]);
+    assert.deepEqual(serviceUpdate.changes, [{ path: 'value', value: '{"url":"https://w.example","auth":{"password":"[withheld]"}}' }]);
+    assert.deepEqual(serviceDeleted.data, { key: 'weather.service', value: '{"url":"https://w.example","auth":{"password":"[withheld]"}}' });
     assert.deepEqual(removed.data, { name: 'Old', flags: { mod: { apiKey: '[withheld]', note: 'kept' } } });
-    assert.ok(!JSON.stringify(later).includes('hunter2') && !JSON.stringify(later).includes('sk-live') && !JSON.stringify(later).includes('abc123secret'));
+    for (const secret of ['hunter2', 'sk-live', 'abc123secret', 'zz-pw-zz']) assert.ok(!JSON.stringify(later).includes(secret), secret);
+
+    // A cursor from a page that has since reloaded is not applied to the new page's numbering.
+    const stale = payload(await callTool('foundry_changes', { since: 10_000, session: 'an-earlier-page' }));
+    assert.match(stale.pageReloaded, /reloaded/);
+    assert.equal(stale.matched, later.lastSeq, 'every change on this page is listed instead');
 
     const scoped = payload(await callTool('foundry_changes', { since: reply.changesSeq, uuid: 'Actor.h1' }));
     assert.deepEqual(scoped.entries.map((entry) => entry.uuid), ['Actor.h1', 'Actor.h1.Item.i1'], 'a uuid includes the documents embedded in it');
-    assert.equal(payload(await callTool('foundry_changes', { documentName: 'Setting' })).matched, 1);
+    assert.equal(payload(await callTool('foundry_changes', { documentName: 'Setting' })).matched, 3);
+    // Paging back from the newest.
+    const newest = payload(await callTool('foundry_changes', { since: reply.changesSeq, limit: 2 }));
+    assert.deepEqual(newest.entries.map((entry) => entry.action), ['delete', 'delete']);
+    const older = payload(await callTool('foundry_changes', { since: reply.changesSeq, limit: 2, before: newest.olderBefore }));
+    assert.deepEqual(older.entries.map((entry) => entry.documentName), ['Setting', 'Setting']);
 
     // Credentials inside arrays and objects, in new values and in the earlier values of a deleted subtree.
     const vault = { documentName: 'Actor', uuid: 'Actor.v1', name: 'Vault', parent: null, _source: { flags: { mod: { creds: { apiKey: 'zz-old-key-zz', note: 'kept' } } } } };
     const cursor = payload(await callTool('foundry_changes')).lastSeq;
-    Hooks.fire('preUpdateActor', vault, { flags: { mod: { '-=creds': null } } });
-    Hooks.fire('updateActor', vault, { flags: { mod: { '-=creds': null } } }, {}, 'gm1');
+    const own = {};
+    Hooks.fire('preUpdateActor', vault, { flags: { mod: { '-=creds': null } } }, own, 'gm1');
+    Hooks.fire('updateActor', vault, { flags: { mod: { '-=creds': null } } }, own, 'gm1');
     Hooks.fire('updateActor', vault, { flags: { mod: { list: [{ password: 'zz-in-array-zz' }], apiKeys: ['zz-key-list-zz'] } } }, {}, 'gm1');
-    // Foundry's own "token" and "key" fields: a chat speaker's token id and an Active Effect change's attribute path.
+    // Foundry's own "token" and "key" fields (a chat speaker's token id, an Active Effect change's attribute path) are kept;
+    // the same names anywhere else, or holding something else, are withheld.
     Hooks.fire('updateActor', vault, { flags: { mod: { speaker: { token: 'KxeEuSgHRRZueFXj', accessToken: 'zz-access-zz' }, changes: [{ key: 'system.attributes.ac.bonus', value: '2' }] } } }, {}, 'gm1');
+    Hooks.fire('updateActor', vault, { flags: { integration: { token: 'zzSecret01234567', key: 'zz-plain-key-zz' }, mod: { speaker: { token: 'zz-not-an-id-zz' }, changes: [{ key: 'zz-no-path-zz' }] } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
-    assert.ok(!JSON.stringify(nested).includes('zz-'), 'no credential is reported at any depth');
+    assert.ok(!/zz-|zzSecret/.test(JSON.stringify(nested)), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
     assert.deepEqual(nested.entries[1].changes, [{ path: 'flags.mod.list', value: [{ password: '[withheld]' }] }, { path: 'flags.mod.apiKeys', value: ['[withheld]'] }]);
     assert.deepEqual(nested.entries[2].changes, [
@@ -489,22 +579,77 @@ try {
       { path: 'flags.mod.speaker.accessToken', value: '[withheld]' },
       { path: 'flags.mod.changes', value: [{ key: 'system.attributes.ac.bonus', value: '2' }] },
     ]);
+    assert.deepEqual(nested.entries[3].changes, [
+      { path: 'flags.integration.token', value: '[withheld]' },
+      { path: 'flags.integration.key', value: '[withheld]' },
+      { path: 'flags.mod.speaker.token', value: '[withheld]' },
+      { path: 'flags.mod.changes', value: [{ key: '[withheld]' }] },
+    ]);
 
-    // Updates to one document that overlap cannot be matched to their earlier values, so those are left out.
+    // Each update made from this tab is matched to its own earlier values, however updates to one document overlap;
+    // one made elsewhere (another user, or the same account in another tab) gets none rather than someone else's.
     const overlap = payload(await callTool('foundry_changes')).lastSeq;
     const pair = { documentName: 'Actor', uuid: 'Actor.p2', name: 'Pair', parent: null, _source: { system: { hp: 1 } } };
-    Hooks.fire('preUpdateActor', pair, { system: { hp: 2 } });
-    Hooks.fire('preUpdateActor', pair, { system: { hp: 3 } });
-    Hooks.fire('updateActor', pair, { system: { hp: 2 } }, {}, 'gm1');
-    Hooks.fire('updateActor', pair, { system: { hp: 3 } }, {}, 'gm1');
-    Hooks.fire('preUpdateActor', pair, { system: { hp: 5 } });
-    Hooks.fire('updateActor', pair, { system: { hp: 4 } }, {}, 'p1'); // another user's update lands first
-    Hooks.fire('updateActor', pair, { system: { hp: 5 } }, {}, 'gm1');
-    Hooks.fire('preUpdateActor', pair, { system: { hp: 6 } });
-    Hooks.fire('updateActor', pair, { system: { hp: 6 } }, {}, 'gm1');
+    const [a, b, c] = [{}, {}, {}];
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 2 } }, a, 'gm1');
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 3 } }, b, 'gm1');
+    Hooks.fire('updateActor', pair, { system: { hp: 2 } }, a, 'gm1');
+    pair._source.system.hp = 2;
+    Hooks.fire('preUpdateActor', pair, { system: { hp: 8 } }, c, 'gm1');
+    Hooks.fire('updateActor', pair, { system: { hp: 3 } }, b, 'gm1');
+    pair._source.system.hp = 3;
+    Hooks.fire('updateActor', pair, { system: { hp: 4 } }, {}, 'p1');
+    Hooks.fire('updateActor', pair, { system: { hp: 5 } }, { foundryMcpChange: 'set-in-another-tab' }, 'gm1');
+    Hooks.fire('updateActor', pair, { system: { hp: 8 } }, c, 'gm1');
     const rows = payload(await callTool('foundry_changes', { since: overlap })).entries.map((entry) => entry.changes[0]);
-    assert.deepEqual(rows, [{ path: 'system.hp', value: 2 }, { path: 'system.hp', value: 3 }, { path: 'system.hp', value: 4 }, { path: 'system.hp', value: 5 }, { path: 'system.hp', value: 6, before: 1 }]);
+    assert.deepEqual(rows, [
+      { path: 'system.hp', value: 2, before: 1 },
+      { path: 'system.hp', value: 3, before: 1 },
+      { path: 'system.hp', value: 4 },
+      { path: 'system.hp', value: 5 },
+      { path: 'system.hp', value: 8, before: 2 },
+    ]);
     assert.equal(handlers.updateActor.length, 1, 'the hooks are installed once');
+  });
+
+  await check('the change buffer is bounded by size as well as count, and eval tells evicted changes from cut ones', async () => {
+    await evalCode('return 0;'); // takes up the previous check's changes
+    // One update with 400 changed fields keeps its first 100, each value cut to 2000 characters.
+    const wide = { documentName: 'Actor', uuid: 'Actor.w1', name: 'Wide', parent: null, _source: {} };
+    const fields = Object.fromEntries(Array.from({ length: 400 }, (_, i) => [`f${i}`, 'x'.repeat(5000)]));
+    Hooks.fire('updateActor', wide, { flags: fields }, {}, 'gm1');
+    // Called directly: the tracker's code is an ordinary function, as it runs in the page.
+    const [entry] = page.queryChanges({ uuid: 'Actor.w1' }).entries;
+    assert.equal(entry.changes.length, 100);
+    assert.match(entry.morePaths, /first 100/);
+    assert.ok(JSON.stringify(entry).length < 250_000, `one entry keeps ${JSON.stringify(entry).length} characters`);
+    // Big entries push out old ones before 500 are reached.
+    const evictedBefore = page.queryChanges({}).evicted;
+    for (let i = 0; i < 30; i++) Hooks.fire('updateActor', wide, { flags: fields }, {}, 'gm1');
+    const after = page.queryChanges({ limit: 1 });
+    assert.ok(after.evicted - evictedBefore >= 10, `evicted ${after.evicted - evictedBefore}`);
+    assert.ok(page.queryChanges({ uuid: 'Actor.w1' }).matched < 31, 'not all thirty-one big entries are kept');
+    // 520 small changes in one call: 500 kept, 100 listed, 400 cut from the reply and 20 no longer held.
+    await evalCode('return 0;');
+    const flood = await evalCode(`for (let i = 0; i < 520; i++) Hooks.fire('updateActor', globalThis.testHero, { system: { hp: i } }, {}, 'gm1'); return 1;`);
+    assert.equal(flood.changes.length, 100);
+    assert.equal(flood.changesOmitted, 400);
+    assert.equal(flood.changesEvicted, 20);
+  });
+
+  await check('a tracker left by an older hub is replaced without a reload', async () => {
+    const KEY = Symbol.for('foundry-mcp.changes');
+    const current = globalThis[KEY];
+    const oldHook = Hooks.on('updateActor', () => {});
+    globalThis[KEY] = { seq: current.seq, entries: [], hookIds: [['updateActor', oldHook]] }; // no version: 0.6
+    const installed = page.installChanges();
+    assert.equal(installed.seq, current.seq, 'its numbering continues');
+    assert.equal(globalThis[KEY].version, 2);
+    assert.ok(!handlers.updateActor.some((hook) => hook.id === oldHook), 'its hooks are removed');
+    // The replaced tracker's own hooks were removed too, so each change is recorded once.
+    for (const [name, id] of current.hookIds) Hooks.off(name, id);
+    Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
+    assert.equal(page.queryChanges({ since: installed.seq }).matched, 1);
   });
 
   await check('evaluations that overlap never list the same change twice', async () => {
@@ -628,6 +773,185 @@ try {
     assert.equal(CONFIG.Dice.randomUniform, ownRandom);
   });
 
+  await check('dice control survives a cleared seed, keeps other modules\' wrappers in the chain, and caps its queue', async () => {
+    const { DiceTerm, MersenneTwister } = { DiceTerm: foundry.dice.terms.DiceTerm, MersenneTwister: foundry.dice.MersenneTwister };
+    const mersenne = CONFIG.Dice.fulfillment.methods.mersenne;
+    const ownRandom = CONFIG.Dice.randomUniform;
+    const ownHandler = mersenne.handler;
+    const dice = async (args) => payload(await callTool('foundry_dice', args)).result;
+    const seeded = (seed) => {
+      const twister = new MersenneTwister(seed);
+      return [twister.random(), twister.random()];
+    };
+
+    // A seed cleared while results were still queued, then set again, is used again.
+    await dice({ next: [{ faces: 20, result: 20 }] });
+    await dice({ seed: 5 });
+    assert.equal((await dice({ seed: null })).active, true, 'the queued result keeps control on');
+    assert.equal(CONFIG.Dice.randomUniform, ownRandom, 'the random source is put back while only the queue is in use');
+    await dice({ seed: 5 });
+    assert.deepEqual([CONFIG.Dice.randomUniform(), mersenne.handler({ mapRandomFace: (value) => value })], seeded(5));
+    await dice({ seed: null, clear: true });
+    assert.equal(CONFIG.Dice.randomUniform, ownRandom);
+    assert.equal(mersenne.handler, ownHandler);
+
+    // A module that wraps the random source while only the queue is in use stays in the chain through a seed and a reset.
+    await dice({ next: [{ result: 2 }] });
+    let theirCalls = 0;
+    const theirs = function (...rest) {
+      theirCalls += 1;
+      return ownRandom.apply(this, rest);
+    };
+    CONFIG.Dice.randomUniform = theirs;
+    await dice({ seed: 3 });
+    assert.equal(CONFIG.Dice.randomUniform(), seeded(3)[0]);
+    await dice({ seed: null, clear: true });
+    assert.equal(CONFIG.Dice.randomUniform, theirs, 'their wrapper is put back, not lost');
+    CONFIG.Dice.randomUniform();
+    assert.equal(theirCalls, 1);
+    CONFIG.Dice.randomUniform = ownRandom;
+
+    // Something that replaces ours outright, instead of wrapping it, is noticed when the seed is set again.
+    await dice({ seed: 4 });
+    CONFIG.Dice.randomUniform = ownRandom;
+    await dice({ seed: 4 });
+    assert.equal(CONFIG.Dice.randomUniform(), seeded(4)[0]);
+    await dice({ seed: null });
+    assert.equal(CONFIG.Dice.randomUniform, ownRandom);
+
+    // At most 200 results wait in the queue; a request that would go over changes nothing.
+    assert.equal((await dice({ next: Array.from({ length: 200 }, () => ({ result: 1 })) })).queued.length, 200);
+    const over = await callTool('foundry_dice', { next: [{ result: 1 }] });
+    assert.equal(over.isError, true);
+    assert.match(payload(over).error.message, /At most 200/);
+    assert.equal((await dice({})).queued.length, 200);
+    assert.equal((await dice({ clear: true, next: [{ result: 1 }] })).queued.length, 1, 'clearing makes room in the same call');
+    await dice({ clear: true });
+    assert.equal(DiceTerm.prototype.mapRandomFace.name, 'mapRandomFace');
+  });
+
+  // ------------------------------------------------ previews, undo, scenes and screenshots
+  // A document as far as foundry_update needs one: source data, a copy that validates changes, and update().
+  const merge = (target, change) => {
+    for (const [key, value] of Object.entries(change)) {
+      if (value instanceof ForcedDeletion) delete target[key];
+      else if (value && typeof value === 'object' && !Array.isArray(value)) merge((target[key] = own(target, key) && typeof target[key] === 'object' ? target[key] : {}), value);
+      else target[key] = value;
+    }
+  };
+  const validate = (change) => {
+    if (change.config?.dim !== undefined && typeof change.config.dim !== 'number') throw new Error('AmbientLight validation errors: config.dim: must be a number');
+  };
+  const torch = {
+    documentName: 'AmbientLight', uuid: 'Scene.s1.AmbientLight.l1', name: 'Torch',
+    _source: { x: 300, y: 300, elevation: 0, levels: ['L0'], hidden: false, config: { dim: 20, bright: 10, darkness: { min: 0, max: 1 }, animation: { type: 'torch' } }, flags: {} },
+    clone() {
+      const copy = { _source: structuredClone(this._source), updateSource: (change) => (validate(change), merge(copy._source, change)) };
+      return copy;
+    },
+    async update(change) {
+      validate(change);
+      merge(this._source, change);
+    },
+  };
+  const upper = { documentName: 'AmbientLight', uuid: 'Scene.s1.AmbientLight.l2', name: 'Lantern', _source: { x: 900, y: 900, elevation: 12, levels: [], hidden: false, config: { dim: 15, bright: 5, darkness: { min: 0, max: 0.5 } } } };
+  const rogue = {
+    documentName: 'Token', uuid: 'Scene.s1.Token.t1', name: 'Rogue',
+    _source: { x: 200, y: 200, width: 1, height: 1, level: 'L0', elevation: 0, hidden: false, sight: { enabled: true, range: 0, angle: 360, visionMode: 'basic' }, detectionModes: [], light: { dim: 0, bright: 0 } },
+    actor: { system: { attributes: { senses: { darkvision: 0 } } }, testUserPermission: () => false },
+  };
+  const listOf = (...items) => Object.assign(items, { size: items.length });
+  const crypt = {
+    documentName: 'Scene', uuid: 'Scene.s1', name: 'Crypt', active: true, grid: { size: 100, distance: 5, units: 'ft' },
+    _source: { tokenVision: true, fog: { exploration: true }, environment: { darknessLevel: 0.8, darknessLock: false, globalLight: { enabled: false, darkness: { min: 0, max: 1 } } } },
+    levels: [{ id: 'L0', name: 'Ground', _source: { elevation: { bottom: 0, top: 10 } } }, { id: 'L1', name: 'Upper', _source: { elevation: { bottom: 10, top: 20 } } }],
+    lights: listOf(torch, upper), tokens: listOf(rogue), walls: listOf({}, {}, {}), regions: listOf(), tiles: listOf(),
+  };
+  const lookUp = globalThis.fromUuid;
+  globalThis.fromUuid = async (uuid) => ({ 'Scene.s1': crypt, 'Scene.s1.AmbientLight.l1': torch, 'Scene.s1.Token.t1': rogue })[uuid] ?? lookUp(uuid);
+
+  await check('foundry_update previews a change, applies it only over the values it was shown, and foundry_undo reverses it', async () => {
+    const update = async (args) => callTool('foundry_update', { uuid: torch.uuid, ...args });
+    const preview = payload(await update({ set: { 'config.dim': 30, 'flags.mod.note': 'lit' } })).result;
+    assert.deepEqual([preview.valid, preview.current, preview.proposed], [true, { 'config.dim': 20, 'flags.mod.note': null }, { 'config.dim': 30, 'flags.mod.note': 'lit' }]);
+    assert.equal(torch._source.config.dim, 20, 'a preview changes nothing');
+    const invalid = payload(await update({ set: { 'config.dim': 'bright' } })).result;
+    assert.equal(invalid.valid, false);
+    assert.match(invalid.error, /must be a number/);
+    assert.match((await update({ set: { 'config.dim': 30 }, apply: true })).content[0].text, /needs `expected`/);
+    assert.match((await update({ set: { _id: 'x' } })).content[0].text, /cannot be changed/);
+    assert.match((await update({ set: { 'config.dim': 30 }, apply: true, expected: {}, expectedWorld: 'elsewhere' })).content[0].text, /expected world "elsewhere"/);
+    assert.equal(torch._source.config.dim, 20);
+
+    const applied = payload(await update({ set: { 'config.dim': 30, 'flags.mod.note': 'lit' }, apply: true, expected: preview.current })).result;
+    assert.equal(applied.applied, true);
+    assert.equal(typeof applied.editId, 'number');
+    assert.deepEqual(applied.after, { 'config.dim': 30, 'flags.mod.note': 'lit' });
+    assert.equal(torch._source.flags.mod.note, 'lit');
+    // Applying again over the values from before the first apply: someone else's view of the document is out of date.
+    const stale = payload(await update({ set: { 'config.dim': 40 }, apply: true, expected: { 'config.dim': 20 } })).result;
+    assert.deepEqual([stale.applied, stale.conflicts], [false, [{ path: 'config.dim', expected: 20, now: 30 }]]);
+
+    // Someone changes the light after the edit: undo refuses rather than overwrite them.
+    torch._source.config.dim = 45;
+    const blocked = payload(await callTool('foundry_undo', {})).result;
+    assert.equal(blocked.undone, false);
+    assert.deepEqual(blocked.conflicts, [{ path: 'config.dim', expected: 30, now: 45 }]);
+    assert.equal(torch._source.config.dim, 45);
+    torch._source.config.dim = 30;
+    const undone = payload(await callTool('foundry_undo', { editId: applied.editId })).result;
+    assert.equal(undone.undone, true);
+    assert.equal(torch._source.config.dim, 20);
+    assert.deepEqual(torch._source.flags, {}, 'a path that did not exist is removed again, with the object the edit made for it');
+    assert.match((await callTool('foundry_undo', { editId: applied.editId })).content[0].text, /already been undone/);
+    const { edits } = JSON.parse((await callTool('foundry_undo', { list: true })).content[0].text);
+    assert.deepEqual(edits.map((edit) => [edit.id, edit.uuid, edit.undone, edit.paths]), [[applied.editId, torch.uuid, true, ['config.dim', 'flags.mod.note']]]);
+  });
+
+  await check('foundry_scene explains a scene, a token\'s vision and the lights on a level in one call each', async () => {
+    const scene = async (args) => payload(await callTool('foundry_scene', { scene: 'Scene.s1', ...args })).result;
+    const overview = await scene({});
+    assert.deepEqual(overview.levels.map((level) => [level.id, level.tokens, level.lights]), [['L0', 1, 1], ['L1', 0, 1]]);
+    assert.deepEqual(overview.lighting.globalLight, { enabled: false, darknessRange: { min: 0, max: 1 }, litNow: false, bright: null });
+    assert.equal(overview.counts.walls, 3);
+    const vision = await scene({ check: 'vision', token: 'Rogue' });
+    assert.equal(vision.token.level.name, 'Ground');
+    assert.deepEqual(vision.lightsReachingToken.map((light) => [light.name, light.distance, light.litNow]), [['Torch', 3.5, true]]);
+    for (const reason of [/Sight range is 0/, /vision mode is basic/, /No player owns/]) assert.ok(vision.notes.some((note) => reason.test(note)), reason);
+    assert.deepEqual((await scene({ check: 'vision', token: 'Scene.s1.Token.t1' })).token.name, 'Rogue');
+    const lights = await scene({ check: 'lights', level: 'L1' });
+    assert.deepEqual(lights.lights.map((light) => [light.name, light.litNow]), [['Lantern', false]], 'darker than its range: not lit now');
+    const missing = await callTool('foundry_scene', { scene: 'Scene.s1', check: 'vision', token: 'Nobody' });
+    assert.match(payload(missing).error.message, /No token "Nobody"/);
+  });
+
+  await check('foundry_screenshot returns the canvas as an image with what it shows', async () => {
+    assert.match((await callTool('foundry_screenshot')).content[0].text, /canvas is not ready/);
+    const saved = { canvas: globalThis.canvas, document: globalThis.document, PIXI: globalThis.PIXI };
+    let drawn = null;
+    globalThis.PIXI = { Rectangle: class { constructor(x, y, width, height) { Object.assign(this, { x, y, width, height }); } } };
+    globalThis.canvas = {
+      ready: true, scene: { name: 'Crypt' }, level: { id: 'L0', name: 'Ground' },
+      stage: { pivot: { x: 1200, y: 800 }, scale: { x: 0.5 } },
+      app: { stage: {}, renderer: { screen: { width: 2560, height: 1440 }, extract: { canvas: (target, frame) => ({ width: frame.width * 1.5, height: frame.height * 1.5 }) } } },
+    };
+    globalThis.document = {
+      visibilityState: 'visible',
+      createElement: () => ({ getContext: () => ({ drawImage: (source, x, y, width, height) => (drawn = [width, height]) }), toDataURL: (type) => `data:${type};base64,${'QUJD'.repeat(500)}` }),
+    };
+    try {
+      const shot = await callTool('foundry_screenshot', { maxWidth: 800 });
+      assert.equal(shot.isError, undefined);
+      const [text, image] = shot.content;
+      assert.deepEqual([image.type, image.mimeType, image.data.length], ['image', 'image/jpeg', 2000]);
+      const about = JSON.parse(text.text).result;
+      assert.deepEqual([about.scene, about.level.name, about.width, about.height, about.view.scale], ['Crypt', 'Ground', 800, 450, 0.5]);
+      assert.deepEqual(drawn, [800, 450]);
+    } finally {
+      Object.assign(globalThis, saved);
+    }
+  });
+
   // -------------------------------------------------------------------- logs
   await check('an error logged after eval returned is found with since=logSeq and marked fromEval', async () => {
     const reply = await evalCode(`setTimeout(() => console.error('late', new Error('late failure')), 100); return 'returned';`);
@@ -736,6 +1060,36 @@ try {
     assert.deepEqual(entry.text.split('\n'), cases.map(([, output]) => output));
   });
 
+  await check('a credential is redacted even when its line is cut before the value ends, and in logged objects', async () => {
+    const before = (await getLogs()).lastSeq;
+    // The closing quote of the password lies beyond what a log entry keeps.
+    console.error(`${'x'.repeat(1900)} {"password":"${'S'.repeat(3000)}"}`);
+    console.warn('settings', { endpoint: 'https://w.example', apiKey: 'K'.repeat(30_000), nested: { password: 'P'.repeat(40) } });
+    const entries = await until(async () => { const logs = await getLogs({ since: before }); return logs.entries.length === 2 && logs.entries; }, 'both entries');
+    assert.match(entries[0].text, /"password":"\[redacted\]$/);
+    assert.ok(!/SSSS/.test(entries[0].text));
+    assert.equal(entries[1].text, 'settings {"endpoint":"https://w.example","apiKey":"[redacted]","nested":{"password":"[redacted]"}}');
+    const reply = await evalCode(`console.log(${JSON.stringify(`${'y'.repeat(7900)} password="${'Q'.repeat(3000)}"`)}); return 1;`);
+    assert.match(reply.logs[0].text, /password="\[redacted\]$/);
+  });
+
+  await check('a warning raised inside one of the hub\'s own tools is not marked as coming from eval', async () => {
+    const before = (await getLogs()).lastSeq;
+    const lookUp = globalThis.fromUuid;
+    globalThis.fromUuid = async (uuid) => {
+      console.warn('looked up during a fixed tool');
+      return lookUp(uuid);
+    };
+    try {
+      await callTool('foundry_document', { uuid: 'Actor.g1' });
+    } finally {
+      globalThis.fromUuid = lookUp;
+    }
+    const [entry] = await until(async () => { const logs = await getLogs({ since: before, contains: 'fixed tool' }); return logs.entries.length && logs.entries; }, 'the warning');
+    assert.equal(entry.fromEval, false);
+    assert.ok(entry.stack.some((frame) => frame.includes('foundry-mcp-tool.js')), 'the tool is named in the stack');
+  });
+
   await check('level, text and limit filters work; console.log is not retained', async () => {
     const before = (await getLogs()).lastSeq;
     console.log('just chatter');
@@ -749,6 +1103,8 @@ try {
     const limited = await getLogs({ since: before, limit: 1 });
     assert.equal(limited.matched, 3);
     assert.deepEqual(limited.entries.map((e) => e.text), ['second warning']);
+    const older = await getLogs({ since: before, limit: 1, before: limited.olderBefore });
+    assert.deepEqual([older.entries.map((e) => e.text), older.matched], [['an error'], 2]);
   });
 
   await check('a repeating error collapses into one entry with a count, but not across different sources', async () => {
@@ -850,6 +1206,35 @@ try {
     assert.equal((await rawSocket(PORT, 'https://evil.example')).outcome, 'rejected');
   });
 
+  await check('a module of another protocol version is turned away at once and does not hold the GM slot', async () => {
+    const old = await rawSocket(BARE_PORT, ORIGIN, undefined, { reported: { protocol: 5 } });
+    assert.equal(old.code, 4006);
+    assert.equal(payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, false);
+    const current = await rawSocket(BARE_PORT, ORIGIN);
+    assert.equal(current.outcome, 'welcomed', 'a matching module can still connect');
+    current.ws.close();
+    await until(async () => !payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, 'the hub to notice the close');
+  });
+
+  await check('connections that have not proved themselves are few and small', async () => {
+    // A first message far larger than any hello ends the connection before it is parsed.
+    const big = await rawSocket(BARE_PORT, ORIGIN, undefined, { firstMessage: JSON.stringify({ hello: { world: 'x'.repeat(10_000) } }) });
+    assert.equal(big.outcome, 'closed');
+    assert.equal(big.code, 1006);
+    // Four sockets that say nothing fill the handshake slots; a fifth is refused until one goes.
+    const idle = await Promise.all(Array.from({ length: 4 }, () => new Promise((resolve) => {
+      const ws = new NodeWebSocket(`ws://127.0.0.1:${BARE_PORT}/foundry`, { headers: { origin: ORIGIN } });
+      ws.on('open', () => resolve(ws));
+    })));
+    assert.deepEqual(await rawSocket(BARE_PORT, ORIGIN), { outcome: 'closed', code: 4005 });
+    idle.forEach((ws) => ws.close());
+    await sleep(200);
+    const tab = await rawSocket(BARE_PORT, ORIGIN);
+    assert.equal(tab.outcome, 'welcomed');
+    tab.ws.close();
+    await until(async () => !payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, 'the hub to notice the close');
+  });
+
   await check('malformed socket messages close that socket and leave the hub running', async () => {
     // Broken input closes the socket with 4002; input that is merely not a hello is ignored until the handshake deadline.
     for (const [firstMessage, expected] of [
@@ -882,10 +1267,15 @@ try {
     await until(async () => !payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, 'the hub to notice the close');
   });
 
-  await check('a socket that fails to send costs one call, not the hub', async () => {
-    // A stand-in tab that never answers, on a hub whose sockets fail on demand.
-    const tab = await rawSocket(FAULT_PORT, ORIGIN);
+  await check('a socket that fails to send costs one call, not the hub, and the signed sequence has no gap', async () => {
+    // A stand-in tab that never answers, on a hub that signs its commands and whose sockets fail on demand.
+    const tab = await rawSocket(FAULT_PORT, ORIGIN, MODULE_TOKEN);
     assert.equal(tab.outcome, 'welcomed');
+    const seqs = [];
+    tab.ws.on('message', (data) => {
+      const msg = JSON.parse(data);
+      if (msg.method) seqs.push(msg.seq);
+    });
     const options = { port: FAULT_PORT };
     const unsent = await callTool('foundry_eval', { code: '/* FAULT_SEND */ return 1' }, options);
     assert.equal(unsent.isError, true);
@@ -893,11 +1283,15 @@ try {
     // The cancel that follows a timeout is sent from a timer, where a throw would end the process.
     const timedOut = await callTool('foundry_eval', { code: '/* FAULT_CANCEL */ return 1', timeoutMs: 1000 }, options);
     assert.match(timedOut.content[0].text, /Timed out/);
-    // Still running, and neither call kept a slot: sixteen more are accepted and the seventeenth is refused.
+    // Still running, and neither call kept a slot. Of the sixteen slots, one holds the change tracker's installation,
+    // which this silent tab never answers: fifteen more are accepted and the other two refused.
     const more = Array.from({ length: 17 }, () => callTool('foundry_eval', { code: 'return 1', timeoutMs: 1000 }, options));
     const replies = await Promise.all(more);
-    assert.equal(replies.filter((r) => /already running/.test(r.content[0].text)).length, 1);
-    assert.equal(replies.filter((r) => /Timed out/.test(r.content[0].text)).length, 16);
+    assert.equal(replies.filter((r) => /already running/.test(r.content[0].text)).length, 2);
+    assert.equal(replies.filter((r) => /Timed out/.test(r.content[0].text)).length, 15);
+    // Sends that failed used no sequence number, so a real module would still accept every command after them.
+    assert.ok(seqs.length >= 17);
+    assert.deepEqual(seqs, seqs.map((_, i) => i + 1));
     tab.ws.close();
   });
 
@@ -910,7 +1304,7 @@ try {
   await check('the official MCP client connects, lists the tools and calls one', async () => {
     const client = new Client({ name: 'foundry-mcp-test', version: '1.0.0' });
     await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${PORT}/mcp`)));
-    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_eval', 'foundry_dice', 'foundry_changes', 'foundry_logs']);
+    assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name), ALL_TOOLS);
     const reply = await client.callTool({ name: 'foundry_eval', arguments: { code: 'return 6 * 7' } });
     assert.equal(JSON.parse(reply.content[0].text).result, 42);
     await client.close();
@@ -956,7 +1350,7 @@ try {
     assert.deepEqual(logs.entries.map((e) => [e.source, e.text.slice(0, 25)]), [
       ['console', 'before the reload'],
       ['bridge', 'Foundry disconnected (wor'],
-      ['bridge', 'Foundry connected (new pa'],
+      ['bridge', 'Foundry reconnected (same'],
       ['console', 'raised while disconnected'],
     ]);
     assert.equal((await evalCode('return 2')).result, 2);
@@ -989,21 +1383,27 @@ try {
   await check('a hub with a token refuses MCP calls without it', async () => {
     assert.equal((await mcp('tools/list', {}, { port: TOKEN_PORT })).status, 401);
     assert.equal((await mcp('tools/list', {}, bearer('wrong'))).status, 401);
-    assert.equal((await toolNames(bearer(TOKEN))).length, 8);
+    assert.equal((await toolNames(bearer(TOKEN))).length, ALL_TOOLS.length);
+    assert.equal((await mcp('tools/list', {}, bearer(MODULE_TOKEN))).status, 401, 'the pairing token is not a client token');
   });
 
   await check('a module without the right token cannot connect to a token hub', async () => {
     assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, 'wrong'), { outcome: 'closed', code: 4003 });
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN), { outcome: 'closed', code: 4003 }, 'the client token does not pair a module');
     const before = moduleSockets.length;
     await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, ''); // real module, no token configured
     assert.equal(moduleSockets.length, before + 1);
     assert.equal(moduleSockets.at(-1).closeCode, 4003, 'the module itself gave up, with the token-trouble code');
     assert.match((await callTool('foundry_status', {}, bearer(TOKEN))).content[0].text, /not connected/);
+    // Without a pairing token, and without being told that is intended, the module does not connect at all.
+    const sockets = moduleSockets.length;
+    await startModule(`ws://127.0.0.1:${PORT}/foundry`, '', undefined, { allowNoToken: false });
+    assert.equal(moduleSockets.length, sockets);
   });
 
   await check('a relay cannot change the world the module reported', async () => {
     // The proof is computed over "test-world", but the hello that reaches the hub says otherwise.
-    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { claimedWorld: 'another-world' }), { outcome: 'closed', code: 4003 });
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, MODULE_TOKEN, { claimedWorld: 'another-world' }), { outcome: 'closed', code: 4003 });
   });
 
   await check('a relay cannot move text between the fields the module reported', async () => {
@@ -1011,18 +1411,18 @@ try {
     const reported = { world: 'test-world\nx', core: 'x', system: '14', session: 'sess' };
     const relayed = { world: 'test-world', core: 'x', system: 'x', session: '14\nsess' };
     assert.equal(bindingOf({ nonce: 'abc', protocol: 5, ...reported }, 'n'), bindingOf({ nonce: 'abc', protocol: 5, ...relayed }, 'n'));
-    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { reported, relayed }), { outcome: 'closed', code: 4002 });
-    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, TOKEN, { reported }), { outcome: 'closed', code: 4002 });
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, MODULE_TOKEN, { reported, relayed }), { outcome: 'closed', code: 4002 });
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, MODULE_TOKEN, { reported }), { outcome: 'closed', code: 4002 });
   });
 
   await check('a module with the token proves itself, checks the hub, and then works', async () => {
     // Something prints the token during world start-up, before the module has read its own setting.
-    await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, TOKEN, () => console.error(`startup leak ${TOKEN} end`));
+    await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, MODULE_TOKEN, () => console.error(`startup leak ${MODULE_TOKEN} end`));
     const startup = payload(await callTool('foundry_logs', { contains: 'startup leak' }, bearer(TOKEN)));
     assert.deepEqual(startup.entries.map((e) => e.text), ['startup leak [redacted] end']);
     assert.equal((await evalCode('return 40 + 2', {}, bearer(TOKEN))).result, 42);
     // Signed commands keep working in sequence, and the hub token is scrubbed from output.
-    const reply = await evalCode(`console.log('leaked ${TOKEN} here'); return 'second';`, {}, bearer(TOKEN));
+    const reply = await evalCode(`console.log('leaked ${MODULE_TOKEN} here'); return 'second';`, {}, bearer(TOKEN));
     assert.equal(reply.result, 'second');
     assert.deepEqual(reply.logs, [{ level: 'log', text: 'leaked [redacted] here' }]);
     // A signed cancel reaches the code it refers to, even though it is a much shorter message than the eval.
@@ -1037,7 +1437,8 @@ try {
   // without knowing the token; otherwise it completes the handshake honestly and then sends an
   // unsigned command, as something sitting between the module and the real hub would.
   const fakeHub = async ({ wrongProof, replay, badId }) => {
-    const fake = new WebSocketServer({ port: FAKE_PORT, host: '127.0.0.1' });
+    const fake = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise((resolve) => fake.on('listening', resolve));
     const closed = new Promise((resolve) => {
       fake.on('connection', (ws) => {
         let hello;
@@ -1046,12 +1447,12 @@ try {
           const msg = JSON.parse(data);
           if (msg.hello) {
             hello = msg.hello;
-            const proof = wrongProof ? '00'.repeat(32) : sign(TOKEN, `hub\n${bindingOf(msg.hello, 'hubnonce')}`).toString('hex');
+            const proof = wrongProof ? '00'.repeat(32) : sign(MODULE_TOKEN, `hub\n${bindingOf(msg.hello, 'hubnonce')}`).toString('hex');
             ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof } }));
           } else if (msg.proof) {
             ws.send(JSON.stringify({ welcome: true }));
-            const key = sign(TOKEN, `session\n${bindingOf(hello, 'hubnonce')}`);
-            const signed = (id, code) => JSON.stringify({ id, method: 'eval', params: { code }, seq: 1, mac: sign(key, JSON.stringify([1, 'eval', id, code])).toString('hex') });
+            const key = sign(MODULE_TOKEN, `session\n${bindingOf(hello, 'hubnonce')}`);
+            const signed = (id, code) => JSON.stringify({ id, method: 'eval', params: { code, source: 'eval' }, seq: 1, mac: sign(key, JSON.stringify([1, 'eval', id, code, 'eval'])).toString('hex') });
             if (replay) {
               // One genuinely signed command, sent twice.
               const command = signed(randomUUID(), 'globalThis.replayed = (globalThis.replayed ?? 0) + 1;');
@@ -1060,12 +1461,12 @@ try {
             } else if (badId) {
               // Correctly signed, but the id is not a UUID: the shape a field-shifting relay would need.
               ws.send(signed('not-a-uuid\nreturn;', 'globalThis.injected = true;'));
-            } else ws.send(JSON.stringify({ id: randomUUID(), method: 'eval', params: { code: 'globalThis.injected = true;' }, seq: 1, mac: '00' }));
+            } else ws.send(JSON.stringify({ id: randomUUID(), method: 'eval', params: { code: 'globalThis.injected = true;', source: 'eval' }, seq: 1, mac: '00' }));
           }
         });
       });
     });
-    await startModule(`ws://127.0.0.1:${FAKE_PORT}/foundry`, TOKEN);
+    await startModule(`ws://127.0.0.1:${fake.address().port}/foundry`, MODULE_TOKEN);
     const code = await closed;
     await new Promise((resolve) => fake.close(resolve));
     return code;
@@ -1092,14 +1493,14 @@ try {
 
   await check('a module with a token refuses a hub that cannot prove it knows the token', async () => {
     // BARE_PORT has no token, as a program squatting on the hub port would not.
-    await startModule(`ws://127.0.0.1:${BARE_PORT}/foundry`, TOKEN);
+    await startModule(`ws://127.0.0.1:${BARE_PORT}/foundry`, MODULE_TOKEN);
     assert.equal(moduleSockets.at(-1).closeCode, 4003);
     assert.match((await callTool('foundry_status', {}, { port: BARE_PORT })).content[0].text, /not connected/);
   });
 
   // ----------------------------------------------------------------- options
   await check('allowEval: false removes foundry_eval and keeps the read-only tools working', async () => {
-    assert.deepEqual(await toolNames({ port: READ_PORT }), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_changes', 'foundry_logs']);
+    assert.deepEqual(await toolNames({ port: READ_PORT }), ['foundry_status', 'foundry_documents', 'foundry_document', 'foundry_settings', 'foundry_scene', 'foundry_screenshot', 'foundry_changes', 'foundry_logs']);
     await startModule(`ws://127.0.0.1:${READ_PORT}/foundry`, '');
     assert.equal(payload(await callTool('foundry_documents', { type: 'Actor' }, { port: READ_PORT })).result.total, 2);
     const refused = await mcp('tools/call', { name: 'foundry_eval', arguments: { code: 'globalThis.ranWithoutEval = true' } }, { port: READ_PORT });
@@ -1125,17 +1526,21 @@ try {
     assert.equal(manifest.download, `${manifest.url}/releases/download/v${manifest.version}/module.zip`);
   });
 
-  await check('a hub whose config has no token creates one, protects the file, and runs code nowhere by default', async () => {
-    const generated = JSON.parse(readFileSync(freshConfig, 'utf8')).token;
+  await check('a hub whose config has no tokens creates both, protects the file, and runs code nowhere by default', async () => {
+    const saved = JSON.parse(readFileSync(freshConfig, 'utf8'));
+    const generated = saved.token;
     assert.ok(generated.length >= 32);
+    assert.ok(saved.moduleToken.length >= 32);
+    assert.notEqual(saved.moduleToken, generated);
+    assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.lock')), [], 'no lock file is left behind');
     // The config was world-readable before the token was added (0644), as a copied example would be.
     if (process.platform !== 'win32') assert.equal(statSync(freshConfig).mode & 0o077, 0, 'config is private after the token is written');
     assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp')), [], 'no temporary token file is left behind');
     const auth = { port: FRESH_PORT, headers: { authorization: `Bearer ${generated}` } };
     assert.equal((await mcp('tools/list', {}, { port: FRESH_PORT })).status, 401);
-    assert.equal((await toolNames(auth)).length, 8);
+    assert.equal((await toolNames(auth)).length, ALL_TOOLS.length);
     // An authenticated module in a world, with nothing on the allowlist: connected, but no code runs.
-    await startModule(`ws://127.0.0.1:${FRESH_PORT}/foundry`, generated);
+    await startModule(`ws://127.0.0.1:${FRESH_PORT}/foundry`, saved.moduleToken);
     assert.equal((await getLogsFrom(auth)).connected, false, 'a world that is not allowed never becomes the connected world');
     const refused = await callTool('foundry_eval', { code: 'globalThis.ranAnyway = true; return 1' }, auth);
     assert.match(refused.content[0].text, /not on this hub's allowlist/);
@@ -1173,6 +1578,12 @@ try {
       ['token-blank.json', '{ "token": "   " }', /"token" is blank/],
       ['token-newline.json', '{ "token": "abcdefgh12345678\\nijklmnop" }', /line break or control character/],
       ['limit-huge.json', '{ "token": "", "logLimit": 5000000 }', /"logLimit" must be a whole number from 1 to 10000/],
+      // "null" is the origin of every sandboxed page and local file, so it would admit them all.
+      ['origin-null.json', '{ "token": "", "origins": ["null"] }', /"null", which is not a page origin/],
+      ['origin-file.json', '{ "token": "", "origins": ["file:///C:/game"] }', /which is not a page origin/],
+      ['origin-bare.json', '{ "token": "", "origins": ["localhost:30000"] }', /which is not a page origin/],
+      ['module-same.json', '{ "token": "abcdefgh12345678", "moduleToken": "abcdefgh12345678" }', /"moduleToken" must differ from "token"/],
+      ['module-short.json', '{ "token": "", "moduleToken": "abc" }', /"moduleToken" is too short/],
     ]) {
       const run = start(name, content);
       assert.equal(run.status, 1, name);
@@ -1186,21 +1597,21 @@ try {
   await check('a config file that cannot be saved or made private stops the hub', async () => {
     // What happens when the file or its folder belongs to another account, simulated by a preload.
     const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
-    const start = (name, content, fault) => {
+    const start = (name, content, fault, port = '30193') => {
       const file = join(tmp, name);
       writeFileSync(file, content);
       return spawnSync(process.execPath, ['--import', new URL('./test-fixtures/fault-fs.mjs', import.meta.url).href, 'index.js'], {
         cwd: import.meta.dirname,
-        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: '30193', FAULT_FS: fault },
+        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: port, FAULT_FS: fault },
         encoding: 'utf8',
         timeout: 5000,
       });
     };
-    const unsaved = start('unsaved.json', '{ "worlds": [] }', 'write');
+    const unsaved = start('unsaved.json', '{ "worlds": [] }', 'write', '0');
     assert.equal(unsaved.status, 1);
     assert.match(unsaved.stderr, /Cannot save a new token/);
     assert.equal(readFileSync(join(tmp, 'unsaved.json'), 'utf8'), '{ "worlds": [] }', 'the old settings survive');
-    assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp')), []);
+    assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp') || name.endsWith('.lock')), []);
     // Windows has no file modes, so the hub does not try to change them there.
     if (process.platform !== 'win32') {
       const exposed = start('exposed.json', '{ "token": "abcdefgh12345678ijkl" }', 'chmod');
@@ -1218,8 +1629,19 @@ try {
       timeout: 5000,
     });
     assert.equal(run.status, 1);
-    assert.match(run.stderr, /Port 30199 is already in use/);
+    assert.match(run.stderr, new RegExp(`Port ${PORT} is already in use`));
     assert.doesNotMatch(run.stderr, /Unhandled 'error' event/);
+    assert.equal(existsSync(join(tmp, 'none.json')), false, 'a hub that did not get its port saves nothing');
+  });
+
+  await check('two hubs started at once on one new config agree on the secrets they save', async () => {
+    const shared = join(tmp, 'shared.json');
+    writeFileSync(shared, '{ "worlds": [] }');
+    const ports = await Promise.all([startHub({ FOUNDRY_MCP_CONFIG: shared }), startHub({ FOUNDRY_MCP_CONFIG: shared })]);
+    const saved = JSON.parse(readFileSync(shared, 'utf8'));
+    for (const port of ports) {
+      assert.equal((await mcp('tools/list', {}, { port, headers: { authorization: `Bearer ${saved.token}` } })).result.tools.length, ALL_TOOLS.length, `hub on ${port} uses the saved token`);
+    }
   });
 
   await check('a player\'s browser never connects', async () => {

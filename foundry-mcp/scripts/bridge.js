@@ -4,9 +4,10 @@
 // need to change.
 
 const MODULE_ID = 'foundry-mcp';
-const PROTOCOL = 5; // bump together with MODULE_PROTOCOL in server/index.js
+const PROTOCOL = 6; // bump together with MODULE_PROTOCOL in server/index.js
 const SESSION = Math.random().toString(36).slice(2, 10); // identifies this page load
-const EVAL_SOURCE = 'foundry-mcp-eval.js'; // name evaluated code gets in stack traces
+const EVAL_SOURCE = 'foundry-mcp-eval.js'; // name a caller's code gets in stack traces
+const TOOL_SOURCE = 'foundry-mcp-tool.js'; // and the hub's own fixed tools
 const LOOPBACK = ['127.0.0.1', 'localhost', '[::1]'];
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
@@ -25,12 +26,21 @@ Hooks.once('init', () => {
     default: 'ws://127.0.0.1:30123/foundry',
   });
   game.settings.register(MODULE_ID, 'token', {
-    name: 'Hub token',
-    hint: 'The "token" value from the hub\'s config.json. Leave empty only if the hub runs without one. Stored in this browser. Reload after changing.',
+    name: 'Hub pairing token',
+    hint: 'The "moduleToken" value from the hub\'s config.json. It lets this tab and the hub prove themselves to each other. Stored in this browser. Reload after changing.',
     scope: 'client',
     config: true,
     type: String,
     default: '',
+  });
+  // Without a pairing token, whatever answers at the hub address is trusted to run code as the GM. That has to be a choice.
+  game.settings.register(MODULE_ID, 'allowNoToken', {
+    name: 'Connect without a pairing token',
+    hint: 'Only for a hub whose "moduleToken" is "". This tab then cannot tell the hub from another program on this computer. Reload after changing.',
+    scope: 'client',
+    config: true,
+    type: Boolean,
+    default: false,
   });
 });
 
@@ -56,6 +66,10 @@ function connect() {
   }
   const token = game.settings.get(MODULE_ID, 'token').trim();
   hubToken = token;
+  if (!token && !game.settings.get(MODULE_ID, 'allowNoToken')) {
+    console.log(`${MODULE_ID} | not connecting: paste the hub's "moduleToken" into the "Hub pairing token" setting, then reload`);
+    return;
+  }
   const nonce = randomHex();
   const hello = { protocol: PROTOCOL, session: SESSION, world: game.world.id, core: game.version, system: game.system.id, nonce };
   // What both proofs cover: the nonces and what we said about ourselves, so a
@@ -118,14 +132,17 @@ function connect() {
     if (socket !== ws) return; // obey nothing until the handshake is complete
     if (msg.method !== 'eval' && msg.method !== 'cancel') return;
     const code = msg.method === 'eval' ? msg.params?.code : '';
-    // Exact shapes only: an id is a UUID and code is text. Anything else is not from our hub.
-    if (typeof msg.id !== 'string' || !UUID.test(msg.id) || typeof code !== 'string') return refuse('a malformed command arrived');
+    const source = msg.method === 'eval' ? msg.params?.source : '';
+    // Exact shapes only: an id is a UUID, code is text, and the source is one of two words. Anything else is not from our hub.
+    if (typeof msg.id !== 'string' || !UUID.test(msg.id) || typeof code !== 'string' || (msg.method === 'eval' && source !== 'eval' && source !== 'tool')) {
+      return refuse('a malformed command arrived');
+    }
     if (sessionKey) {
       // Every command must carry the next sequence number and the hub's signature,
       // so nothing between us and the hub can insert, replay, reorder or alter one.
       // The signed text is a JSON array, so no field can borrow characters from its neighbour.
       const expected = ++received;
-      const signatureOk = msg.seq === expected && msg.mac === toHex(await hmac(sessionKey, JSON.stringify([expected, msg.method, msg.id, code])));
+      const signatureOk = msg.seq === expected && msg.mac === toHex(await hmac(sessionKey, JSON.stringify([expected, msg.method, msg.id, code, source])));
       if (refused) return; // the connection closed while the signature was being checked: do not start anything
       if (!signatureOk) return refuse('a command arrived that the hub did not sign');
     }
@@ -136,7 +153,7 @@ function connect() {
     const controller = new AbortController();
     running.set(msg.id, controller);
     // Not awaited: the queue moves on while this evaluation runs.
-    evaluate(code, controller.signal)
+    evaluate(code, controller.signal, source)
       .catch(() => ({ ok: false, error: { message: 'The evaluation failed in a way that could not be reported.' }, logs: [] }))
       .then((reply) => {
         if (!send({ id: msg.id, ...reply }, ws)) {
@@ -185,7 +202,7 @@ function send(message, ws = socket) {
 
 // `signal` aborts if the hub gives up waiting. Nothing can force running code
 // to stop; this only helps code that checks it.
-async function evaluate(code, signal) {
+async function evaluate(code, signal, source) {
   const logs = [];
   logs.dropped = 0;
   captures.add(logs);
@@ -193,7 +210,7 @@ async function evaluate(code, signal) {
   signal.addEventListener('abort', () => captures.delete(logs));
   const withLogs = (reply) => (logs.dropped ? { ...reply, logs, logsDropped: logs.dropped } : { ...reply, logs });
   try {
-    const result = await new AsyncFunction('signal', `${code}\n//# sourceURL=${EVAL_SOURCE}`)(signal);
+    const result = await new AsyncFunction('signal', `${code}\n//# sourceURL=${source === 'eval' ? EVAL_SOURCE : TOOL_SOURCE}`)(signal);
     let serialized;
     try {
       serialized = serialize(result);
@@ -331,10 +348,12 @@ function redact(text, opaque = true) {
     // key=value, key: value and "key":"value". The key is one bounded word ending in a credential-like
     // word and is judged by name afterwards; a quoted value is taken up to its own closing quote,
     // escapes included.
-    .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
+    // A quoted value whose closing quote was cut off with the end of a long line runs to the end of the text.
+    .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\\n]|\\.)*(?:"|\\?$)|'(?:[^'\\\n]|\\.)*(?:'|\\?$)|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
       const quote = value[0] === '"' || value[0] === "'" ? value[0] : '';
-      if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='), quote ? value.slice(1, -1) : value)) return match;
-      return `${key}${separator}${quote}[redacted]${quote}`;
+      const closed = quote !== '' && value.length > 1 && value.endsWith(quote) && !value.endsWith(`\\${quote}`);
+      if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='), quote ? value.slice(1, closed ? -1 : undefined) : value)) return match;
+      return `${key}${separator}${quote}[redacted]${closed ? quote : ''}`;
     })
     .replace(/([?&](?:key|token|sig|signature|auth|code|secret|password)=)[^&\s"'#]+/gi, '$1[redacted]') // URL query strings
     // scheme://user:password@host. The user may be empty (redis://:password@host), and the password
@@ -369,7 +388,8 @@ const LOG_ARG_LIMITS = { budget: 5000, chars: 20_000 };
 function formatLogArg(arg) {
   if (typeof arg === 'string') return arg;
   try {
-    return JSON.stringify(serialize(arg, LOG_ARG_LIMITS));
+    // Values under credential-like keys are withheld while the object becomes text, before any of it can be cut off.
+    return JSON.stringify(serialize(arg, { ...LOG_ARG_LIMITS, redactKeys: true }));
   } catch {
     return String(arg);
   }
@@ -383,8 +403,9 @@ function formatLogArg(arg) {
 
 // `budget` counts values of any kind; `chars` counts text across all strings and keys (the hub
 // cuts replies far below the default anyway).
-function serialize(value, { budget = 50_000, chars = 400_000 } = {}) {
+function serialize(value, { budget = 50_000, chars = 400_000, redactKeys = false } = {}) {
   const ancestors = new WeakSet();
+  const hidden = (key, item) => redactKeys && typeof item === 'string' && isCredentialKey(String(key), true, item);
   const text = (v) => {
     const kept = v.length > chars ? `${v.slice(0, chars)}[Truncated ${v.length - chars} chars]` : v;
     chars = Math.max(0, chars - v.length);
@@ -415,7 +436,7 @@ function serialize(value, { budget = 50_000, chars = 400_000 } = {}) {
             entries['[Truncated]'] = `${v.size - seen} more entries omitted`;
             break;
           }
-          entries[text(String(key))] = walk(item, depth + 1);
+          entries[text(String(key))] = hidden(key, item) ? '[redacted]' : walk(item, depth + 1);
           seen += 1;
         }
         return entries;
@@ -465,7 +486,7 @@ function serialize(value, { budget = 50_000, chars = 400_000 } = {}) {
         } catch {
           item = '[Unreadable]'; // a getter that throws must not fail the whole reply
         }
-        out[text(key)] = walk(item, depth + 1);
+        out[text(key)] = hidden(key, item) ? '[redacted]' : walk(item, depth + 1);
       }
       return out;
     } finally {

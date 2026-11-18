@@ -22,7 +22,13 @@ await actor.createEmbeddedDocuments('Item', [{
   system: { activities: { mcpdemo000000001: { _id: 'mcpdemo000000001', type: 'utility', name: 'Demo', activation: { type: 'action' } } } },
   flags: { 'midi-qol': { onUseMacroName: `[postActiveEffects]Macro.${macro.uuid}` } },
 }]);
-globalThis.mcpDemo = { tag, startedAt: Date.now() };
+// Everything is found again by the UUIDs saved here, never by name: an earlier run may have left documents with
+// the same name, and cleaning up by name would delete those instead.
+globalThis.mcpDemo = { actorUuid: actor.uuid, macroUuid: macro.uuid, itemUuid: actor.items.contents[0].uuid, messageIds: [] };
+// Record the chat messages this demo's workflows create, so exactly those are deleted at the end.
+mcpDemo.hook = Hooks.on('createChatMessage', (message) => {
+  if (message.speaker?.actor === actor.id) mcpDemo.messageIds.push(message.id);
+});
 return 'created';
 ```
 
@@ -31,7 +37,7 @@ The macro has a typo: `bonuss`.
 ## 2. Use the feature and wait for the workflow
 
 ```js
-const item = game.actors.getName(mcpDemo.tag).items.getName(mcpDemo.tag);
+const item = await fromUuid(mcpDemo.itemUuid);
 const workflow = await MidiQOL.completeItemUse(item, {}, { configure: false }, {});
 return { state: workflow?.currentAction?.name, aborted: workflow?.aborted };
 ```
@@ -79,10 +85,10 @@ real but unrelated; `contains` keeps them out of the way.
 ## 4. Fix it and confirm
 
 ```js
-await game.macros.getName(mcpDemo.tag).update({
+await (await fromUuid(mcpDemo.macroUuid)).update({
   command: "const bonus = 2;\nconst total = actor.system.attributes.prof + bonus;\nconsole.log(`MCP demo total ${total}`);",
 });
-const item = game.actors.getName(mcpDemo.tag).items.getName(mcpDemo.tag);
+const item = await fromUuid(mcpDemo.itemUuid);
 await MidiQOL.completeItemUse(item, {}, { configure: false }, {});
 return 'used again';
 ```
@@ -92,20 +98,20 @@ return 'used again';
 ## 5. Clean up
 
 ```js
-const { tag, startedAt } = mcpDemo;
-const actor = game.actors.getName(tag);
-const messages = game.messages.filter((m) => m.timestamp >= startedAt && m.speaker?.actor === actor.id);
-await ChatMessage.deleteDocuments(messages.map((m) => m.id));
-await actor.delete();
-await game.macros.getName(tag).delete();
+const { actorUuid, macroUuid, messageIds, hook } = mcpDemo;
+Hooks.off('createChatMessage', hook);
+const messages = messageIds.filter((id) => game.messages.has(id));
+await ChatMessage.deleteDocuments(messages);
+await (await fromUuid(actorUuid))?.delete();
+await (await fromUuid(macroUuid))?.delete();
 delete globalThis.mcpDemo;
 return {
   deletedMessages: messages.length,
-  leftovers: game.actors.filter((a) => a.name === tag).length + game.macros.filter((m) => m.name === tag).length,
+  leftovers: [await fromUuid(actorUuid), await fromUuid(macroUuid)].filter(Boolean).length,
 };
 ```
 
-`leftovers` should be `0`.
+`leftovers` should be `0`. Documents with the same name from an earlier run are left alone.
 
 ## Things this demo taught us
 
