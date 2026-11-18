@@ -397,14 +397,18 @@ try {
       registered.set('ddb-importer.patreon-tier', { namespace: 'ddb-importer', key: 'patreon-tier', scope: 'world', name: 'Tier' });
       settings['moulinette.session_ID'] = 'zz-session-zz';
       settings['ddb-importer.patreon-tier'] = 'GOD';
+      // D&D Beyond Gamelog keeps the D&D Beyond login cookie as a client setting.
+      registered.set('ddb-game-log.ddbCobalt', { namespace: 'ddb-game-log', key: 'ddbCobalt', scope: 'client', name: 'Cobalt' });
+      settings['ddb-game-log.ddbCobalt'] = 'zz-cobalt-cookie-zz';
       try {
-        for (const namespace of ['moulinette', 'ddb-importer']) {
+        for (const namespace of ['moulinette', 'ddb-importer', 'ddb-game-log']) {
           const [row] = payload(await callTool('foundry_settings', { namespace })).result.settings;
           assert.match(row.withheld, /credential/, namespace);
         }
       } finally {
         registered.delete('moulinette.session_ID');
         registered.delete('ddb-importer.patreon-tier');
+        registered.delete('ddb-game-log.ddbCobalt');
       }
       // Doubly encoded JSON too long to unwrap is withheld whole.
       const units = settings['weather.units'];
@@ -723,7 +727,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 11);
+    assert.equal(globalThis[KEY].version, 12);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -1261,6 +1265,23 @@ try {
     const huge = payload(await update({ set: { 'flags.mod.blob': 'x'.repeat(310_000) } })).result;
     assert.equal(huge.valid, false);
     assert.match(huge.error, /too large/);
+  });
+
+  await check('an edit is undone only in the Foundry installation it was made in', async () => {
+    const preview = payload(await callTool('foundry_update', { uuid: torch.uuid, set: { 'config.dim': 11 } })).result;
+    const edit = payload(await callTool('foundry_update', { uuid: torch.uuid, set: { 'config.dim': 11 }, apply: true, expected: preview.expected })).result;
+    // The same world id, served by another installation on this computer, connects in its place.
+    moduleSockets.at(-1).close();
+    await until(async () => !payload(await callTool('foundry_logs', { limit: 1 })).connected, 'the module to disconnect');
+    const other = await rawSocket(PORT, 'http://127.0.0.1:30000');
+    assert.equal(other.outcome, 'welcomed');
+    const refused = await callTool('foundry_undo', { editId: edit.editId });
+    assert.match(refused.content[0].text, /a different copy of the world/);
+    other.ws.close();
+    await until(async () => payload(await callTool('foundry_logs', { limit: 1 })).connected === false, 'the other copy to go');
+    await sleep(6000); // the module reconnects
+    assert.equal(payload(await callTool('foundry_undo', { editId: edit.editId })).result.undone, true);
+    assert.equal(torch._source.config.dim, 20);
   });
 
   await check('foundry_scene explains a scene, a token\'s vision and the lights on a level in one call each', async () => {

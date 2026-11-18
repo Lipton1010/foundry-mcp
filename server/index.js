@@ -385,7 +385,10 @@ const setReceiveLimit = (ws, bytes) => {
   if (typeof ws._receiver?._maxPayload === 'number') ws._receiver._maxPayload = bytes;
 };
 
-function onFoundryConnection(ws) {
+function onFoundryConnection(ws, req) {
+  // The page origin it connected from (already checked against the configured origins): which Foundry installation this is. Two
+  // installations can hold copies of a world with the same id, so edits are tied to the origin as well as the world.
+  ws.origin = String(req?.headers?.origin ?? '');
   // Without a listener, a malformed or oversized frame would take the whole hub down; this comes before anything
   // that can close the socket, since ws can still report an error while it closes.
   ws.on('error', () => ws.terminate());
@@ -490,7 +493,7 @@ function register(ws) {
     return ws.close(4006, `The module (protocol ${ws.hello.protocol}) and the hub (protocol ${MODULE_PROTOCOL}) do not match: update whichever is older`);
   }
   if (foundry) return ws.close(4001, 'Another GM tab is already connected');
-  foundry = { ws, hello: ws.hello };
+  foundry = { ws, hello: ws.hello, origin: ws.origin };
   ws.settled();
   setReceiveLimit(ws, MAX_SOCKET_BYTES); // results can be large
   refusedWorldAt = 0;
@@ -1000,7 +1003,7 @@ function buildMcpServer() {
               if (!saved || !recorded || !fields.every((field) => saved[field] && typeof saved[field] === 'object' && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
                 return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
               }
-              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {}, undone: false };
+              const edit = { id: ++editSeq, world, origin: connection?.origin ?? '', uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {}, undone: false };
               edits.push(edit);
               if (edits.length > MAX_EDITS) edits.shift();
               // editId first; the values are left out when they would not fit beside it.
@@ -1030,12 +1033,15 @@ function buildMcpServer() {
       async (args) => {
         const connection = foundry;
         const world = connection?.hello.world;
+        const origin = connection?.origin ?? '';
         if (args.list) {
           return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, linked, embedded, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
         }
-        const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && !entry.undone);
+        const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && entry.origin === origin && !entry.undone);
         if (!edit) return textReply(args.editId !== undefined ? `No edit ${args.editId} is remembered.` : 'There is no edit to undo in this world.', true);
         if (edit.world !== world) return textReply(`Edit ${edit.id} was made in world "${edit.world}", but "${world ?? 'nothing'}" is connected now.`, true);
+        // The same world id served by another Foundry installation is another copy of the world.
+        if (edit.origin !== origin) return textReply(`Edit ${edit.id} was made in the Foundry at ${edit.origin}, but the one connected now is at ${origin || 'nothing'}: a different copy of the world. Nothing was changed.`, true);
         return oneAtATime(edit.uuid, () => {
           // Checked inside the queue: another undo of the same edit may have just finished.
           if (edit.undone) return textReply(`Edit ${edit.id} has already been undone.`, true);
@@ -1206,7 +1212,7 @@ const sockets = new WebSocketServer({
   // Too many connections still proving themselves are refused before the upgrade, so they never get a socket.
   verifyClient: ({ origin }) => config.origins.includes(origin) && handshaking < MAX_HANDSHAKES,
 });
-sockets.on('connection', onFoundryConnection);
+sockets.on('connection', (ws, req) => onFoundryConnection(ws, req));
 sockets.on('error', startupFailed); // the socket server re-emits the HTTP server's errors
 
 // Drop a tab that vanished without closing (sleep, crash), so a new one can connect.
