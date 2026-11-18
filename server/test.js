@@ -1241,6 +1241,20 @@ try {
     assert.deepEqual(torch._source.flags, { review: { keep: 1, overrides: {} } });
     delete torch._source.flags.review;
 
+    // Something inside an unlinked token's actor: the edit is made, but said to be not undoable.
+    torch.parent = { documentName: 'Actor', isToken: true, uuid: 'Scene.s1.Token.t9.Actor.a9', name: 'Goblin' };
+    const tokenPreview = payload(await update({ set: { 'config.dim': 14 } })).result;
+    const tokenEdit = payload(await update({ set: { 'config.dim': 14 }, apply: true, expected: tokenPreview.expected })).result;
+    delete torch.parent;
+    assert.deepEqual([tokenEdit.applied, tokenEdit.editId], [true, undefined]);
+    assert.match(tokenEdit.undoable, /unlinked token/);
+    torch._source.config.dim = 20;
+
+    // The same origin, but another Foundry under a different route prefix: undo refuses inside the page too.
+    const routed = await page.undoUpdate({ uuid: torch.uuid, before: { 'config.dim': 1 }, existed: { 'config.dim': true }, after: { 'config.dim': 20 }, exists: { 'config.dim': true }, deployment: 'http://localhost:30000/staging/' });
+    assert.deepEqual([routed.undone, torch._source.config.dim], [false, 20]);
+    assert.match(routed.note, /a different copy of the world/);
+
     // A hook that refuses the update: nothing is recorded as applied, and nothing can be undone.
     torch.veto = true;
     const refusedPreview = payload(await update({ set: { 'config.dim': 5 } })).result;

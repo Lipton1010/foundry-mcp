@@ -1003,7 +1003,7 @@ function buildMcpServer() {
               if (!saved || !recorded || !fields.every((field) => saved[field] && typeof saved[field] === 'object' && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
                 return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
               }
-              const edit = { id: ++editSeq, world, origin: connection?.origin ?? '', uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {}, undone: false };
+              const edit = { id: ++editSeq, world, origin: connection?.origin ?? '', uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {}, deployment: typeof saved.deployment === 'string' ? saved.deployment : '', undone: false };
               edits.push(edit);
               if (edits.length > MAX_EDITS) edits.shift();
               // editId first; the values are left out when they would not fit beside it.
@@ -1035,7 +1035,7 @@ function buildMcpServer() {
         const world = connection?.hello.world;
         const origin = connection?.origin ?? '';
         if (args.list) {
-          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, linked, embedded, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
+          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, linked, embedded, deployment, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
         }
         const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && entry.origin === origin && !entry.undone);
         if (!edit) return textReply(args.editId !== undefined ? `No edit ${args.editId} is remembered.` : 'There is no edit to undo in this world.', true);
@@ -1045,8 +1045,8 @@ function buildMcpServer() {
         return oneAtATime(edit.uuid, () => {
           // Checked inside the queue: another undo of the same edit may have just finished.
           if (edit.undone) return textReply(`Edit ${edit.id} has already been undone.`, true);
-          const { before, existed, after, exists, roots, shape, linked, embedded, uuid } = edit;
-          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots, shape, linked, embedded }, {
+          const { before, existed, after, exists, roots, shape, linked, embedded, deployment, uuid } = edit;
+          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots, shape, linked, embedded, deployment }, {
             expect: expectOf(args),
             connection,
             timeoutMs: 120_000,

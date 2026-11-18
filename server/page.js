@@ -716,7 +716,15 @@ export async function updateDocument(args, signal) {
     if (replaced.length) return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), undoable: 'As this was saved, something replaced ' + replaced.join(', ') + ' with a value, so this edit cannot be undone with foundry_undo.' };
     // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
     const elsewhere = linked.length ? { linkedChanged: linked, linkedNote: 'Foundry also changed these linked documents as this was saved (a system can, as dnd5e removes a downed effect on healing). foundry_undo restores this document only, not them.' } : {};
-    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded, saved), linked, embedded });
+    // An unlinked token's actor (or something inside one) is a merge of the base actor and the token's own overrides:
+    // putting the merged values back would leave overrides where the token used to follow the base actor. Say so now.
+    let synthetic = false;
+    for (let node = doc; node; node = node.parent) if (node.documentName === 'Actor' && node.isToken) synthetic = true;
+    if (synthetic) return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...(linked.length ? { linkedChanged: linked } : {}), undoable: 'This belongs to an unlinked token, whose data is the base actor merged with the overrides the token keeps, so this edit cannot be undone exactly with foundry_undo.' };
+    // Which Foundry this is: its address and route prefix. Two installations, or two under one address with different
+    // route prefixes, can hold copies of the world with the same ids; undo checks it is in the same one.
+    const deployment = location.origin + (foundry.utils.getRoute?.('/') ?? '/');
+    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded, saved), linked, embedded, deployment });
     const scope = Object.keys(embedded).length ? { undoScope: 'foundry_undo restores the data of this document itself. Documents embedded in it (effects, items) that the system adds or removes because of this edit, now or a moment later, are reported by foundry_undo, not restored.' } : {};
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
     return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...elsewhere, ...scope, record };
@@ -804,6 +812,8 @@ export async function undoUpdate(args, signal) {
     return sorted.filter((p) => !sorted.some((q) => q !== p && p.startsWith(q + '.')));
   };
   const cancelled = { undone: false, note: 'The call was given up on before the undo was saved, so nothing was changed.' };
+  const here = location.origin + (foundry.utils.getRoute?.('/') ?? '/');
+  if (args.deployment && args.deployment !== here) return { undone: false, note: 'This edit was made in the Foundry at ' + args.deployment + ', but this is ' + here + ': a different copy of the world. Nothing was changed.' };
   if (signal?.aborted) return cancelled;
   const LOCKS = Symbol.for('foundry-mcp.edit-locks');
   const locks = (globalThis[LOCKS] ??= new Map());
