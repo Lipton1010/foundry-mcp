@@ -66,7 +66,7 @@ No arguments. Call it first.
     "user": "Gamemaster", "activeScene": "Tavern", "viewedScene": "Tavern",
     "viewedLevel": { "id": "defaultLevel0000", "name": "Ground floor" },
     "counts": { "actors": 58, "items": 20, "scenes": 49, "macros": 92, "journal": 98 },
-    "activeModules": ["foundry-mcp@0.7.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.12"],
+    "activeModules": ["foundry-mcp@0.7.1", "lib-wrapper@1.13.5.1", "midi-qol@14.6.12"],
     "windowVisibility": "visible",
     "session": "g8qm10yg"
   },
@@ -211,6 +211,10 @@ Listed when `allowEval` is on.
   object holding one of the paths with a value as the change is saved, the reply says the edit cannot be undone.
 - An apply or undo keeps going if the client goes away, so a change that is saved is still recorded (see
   `list: true`). One the hub gives up on after two minutes is cancelled if it has not started saving.
+- If an apply's reply is lost after the save (the two minutes pass, the connection drops or the page reloads), the
+  undo record is not: the GM tab keeps it in a journal (in `localStorage`, the ten newest), written the moment Foundry
+  confirms the save, and the next `foundry_undo` (or `list: true`) picks it up and lists it under `recovered`. The hub
+  asks for it for an hour after the apply, and only from the same Foundry and world.
 - Applying and undoing through this hub happen one at a time per document, so two clients cannot both pass the same
   check. A change made in another tab, by another user or through `foundry_eval` at the same moment is not part of
   that queue; the check just before saving still catches one that has already landed.
@@ -220,7 +224,7 @@ Listed when `allowEval` is on.
   overwritten. An edit is undone only in the Foundry it was made in, opened at the same address (another installation can hold a
   copy of the world with the same id, or two under one address with different route prefixes). An edit to an
   unlinked token's actor, or to something inside it, is made but reported as not undoable: its data is the base actor
-  merged with the overrides the token keeps, and putting merged values back would leave overrides behind. Without `editId` it undoes the most recent edit in the connected world; `list: true` lists the edits
+  merged with the overrides the token keeps, and putting merged values back would leave overrides behind. Without `editId` it undoes the most recent edit made in this very Foundry (its address and route prefix) and world; `list: true` lists the edits
   the hub remembers (the last 100, until it restarts).
 - Settings are changed with `foundry_eval` (`game.settings.set`).
 
@@ -329,7 +333,7 @@ example.
 5. **Install the module.** In Foundry's setup screen choose **Add-on Modules ► Install Module** and paste the
    manifest URL `https://github.com/Lipton1010/foundry-mcp/releases/latest/download/module.json`. The hub is not
    part of the module and comes from this repository; keep the two on the same version (check out the matching
-   tag, for example `git checkout v0.7.0`). To work on the module itself, copy or link the `foundry-mcp` folder
+   tag, for example `git checkout v0.7.1`). To work on the module itself, copy or link the `foundry-mcp` folder
    into Foundry's `Data/modules` folder instead and restart Foundry. On Windows a junction keeps it in step with
    your checkout:
    ```
@@ -516,13 +520,16 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 49 scenes paged five at a time, each once; a dnd5e character raised from 0 to 5 hit points, its reset death
   saves listed in `alsoChanged` and restored by undo (1 success, 2 failures); and a queued 20 then seed 42 matching Foundry's own
   `MersenneTwister`, with none of the three wrappers left in place afterwards.
+- Version 0.7.1, on 18 November 2026: the GM tab reloaded during the watch after a light's edit was saved; the apply's
+  reply was lost, the light kept its new range, and after the reload `foundry_undo` recovered the undo record from the
+  tab's `localStorage` journal, listed it as `recovered`, and put the light back.
 - The code of the three read-only tools, on 15 November 2026, sent through `foundry_eval` rather than by calling
   the tools: the collection and compendium overview (14 collections, 85 packs), a name search, a compendium
   listing, an actor read whole and by field, an embedded item, a compendium document, both error messages, and
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 77 checks)
+### Tested in simulation only (`npm test`, 79 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -561,10 +568,8 @@ a dice wrapper put on top without calling another module's function. After the t
   there. Simulation covers both.
 - **`foundry_scene` on a scene with several levels.** The test world has none, so level estimates for lights and
   tokens on multi-level scenes have only been simulated.
-- **Known gaps in `foundry_undo`, left for a later release.** An apply whose save completes but whose reply is lost
-  (the 120-second limit passes, the page reloads, or the connection drops during the one-second watch after the save)
-  leaves the change made with no undo record. With two copies of one world open at one address under different route
-  prefixes, `foundry_undo` without `editId` can pick the other copy's newer edit and refuse it; pass `editId`.
+- **Recovering an undo record whose reply was lost to a timeout** against a real world. A dropped connection is
+  simulated, and a real page reload was tested (see above); a two-minute save has not been produced for real.
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - Installing the module through Foundry's own Install Module dialog. The v0.6.0 manifest and the zip it points to
   were downloaded and checked as Foundry reads them (module.json at the root, matching version, every script

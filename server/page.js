@@ -552,7 +552,7 @@ export async function updateDocument(args, signal) {
   // Saves `data` and returns what Foundry reports this one update changed: the change its update hook receives for
   // this operation, which includes what the game system or a module added while preparing it (dnd5e resets death
   // saves when hit points rise from 0). Saves made by anyone else in the meantime are separate operations, not part of it.
-  const saveAndCapture = async (data) => {
+  const saveAndCapture = async (data, onSaved) => {
     const MARK = 'foundryMcpEdit';
     const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
     const hook = 'update' + doc.documentName;
@@ -582,6 +582,11 @@ export async function updateDocument(args, signal) {
       const updated = await doc.update(data, { [MARK]: id });
       // What this save left, read at once: anything saved during the watch below is someone else's, never this edit's.
       const saved = updated ? deepClone(doc._source) : null;
+      if (updated && onSaved) {
+        try {
+          onSaved(changed, saved);
+        } catch {}
+      }
       if (updated) await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
       return { updated, changed, linked, saved };
     } finally {
@@ -626,6 +631,21 @@ export async function updateDocument(args, signal) {
     return data;
   };
   const about = { uuid: doc.uuid, documentName: doc.documentName, name: doc.name ?? null };
+  // This tab's journal of undo records, by the hub's id for the call: if the reply is lost after the save (a timeout,
+  // a dropped connection, a reload), the hub can still ask for the record. Kept in localStorage, so a reload keeps it,
+  // with a copy in memory for when storage is full; the ten newest are kept.
+  const journal = (record) => {
+    if (!args.opId || !record) return;
+    const KEY = 'foundry-mcp.edit-journal';
+    const entry = { record, uuid: doc.uuid, name: doc.name ?? null, time: Date.now() };
+    (globalThis[Symbol.for(KEY)] ??= {})[args.opId] = entry;
+    try {
+      const kept = JSON.parse(globalThis.localStorage?.getItem(KEY) ?? '{}') ?? {};
+      kept[args.opId] = entry;
+      for (const id of Object.keys(kept).sort((a, b) => kept[a].time - kept[b].time).slice(0, -10)) delete kept[id];
+      globalThis.localStorage?.setItem(KEY, JSON.stringify(kept));
+    } catch {}
+  };
   if (!args.apply) {
     let proposed;
     try {
@@ -679,9 +699,9 @@ export async function updateDocument(args, signal) {
     // a system can remove one as a result of the edit after the save has returned (dnd5e's downed effect, on healing).
     const embeddedIds = () => Object.fromEntries(Object.entries(doc.collections ?? {}).map(([name, collection]) => [name, [...(collection?.keys?.() ?? [])]]));
     const embedded = embeddedIds();
-    const { updated, changed, linked, saved } = await saveAndCapture(change());
-    // Foundry resolves to nothing when a hook or the server refused the update.
-    if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
+    // The reply, built from what Foundry reports this save changed. It is built once the moment the save is confirmed,
+    // so its undo record can be kept in this tab's journal at once, and again after the watch, with what that saw.
+    const finish = (changed, saved, linked) => {
     // The undo record is made of exactly the paths Foundry reports this one update changed: the leaves an object
     // merge actually set (not the whole object, so a separate save to a sibling is never reverted), anything the game
     // system or a module added while preparing it (dnd5e resets death saves when hit points rise from 0), and any
@@ -728,10 +748,43 @@ export async function updateDocument(args, signal) {
     const scope = Object.keys(embedded).length ? { undoScope: 'foundry_undo restores the data of this document itself. Documents embedded in it (effects, items) that the system adds or removes because of this edit, now or a moment later, are reported by foundry_undo, not restored.' } : {};
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
     return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...elsewhere, ...scope, record };
+    };
+    const { updated, changed, linked, saved } = await saveAndCapture(change(), (changedNow, savedNow) => journal(finish(changedNow, savedNow, []).record));
+    // Foundry resolves to nothing when a hook or the server refused the update.
+    if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
+    const reply = finish(changed, saved, linked);
+    journal(reply.record);
+    return reply;
   } finally {
     release();
     if (locks.get(doc.uuid) === chain) locks.delete(doc.uuid);
   }
+}
+
+/** The undo records this tab's journal holds for the given call ids, taken out of the journal as they are returned. */
+export function recoverEdits(args) {
+  const KEY = 'foundry-mcp.edit-journal';
+  const memory = globalThis[Symbol.for(KEY)] ?? {};
+  let kept = {};
+  try {
+    kept = JSON.parse(globalThis.localStorage?.getItem(KEY) ?? '{}') ?? {};
+  } catch {}
+  const found = {};
+  for (const id of args.opIds ?? []) {
+    const entry = memory[id] ?? kept[id];
+    if (entry) found[id] = entry;
+    delete memory[id];
+    delete kept[id];
+  }
+  try {
+    globalThis.localStorage?.setItem(KEY, JSON.stringify(kept));
+  } catch {}
+  return found;
+}
+
+/** Which Foundry this tab is: its address and route prefix, as foundry_update records it. */
+export function deploymentHere() {
+  return location.origin + (foundry.utils.getRoute?.('/') ?? '/');
 }
 
 /**
@@ -753,7 +806,7 @@ export async function undoUpdate(args, signal) {
   // Saves `data` and returns what Foundry reports this one update changed: the change its update hook receives for
   // this operation, which includes what the game system or a module added while preparing it (dnd5e resets death
   // saves when hit points rise from 0). Saves made by anyone else in the meantime are separate operations, not part of it.
-  const saveAndCapture = async (data) => {
+  const saveAndCapture = async (data, onSaved) => {
     const MARK = 'foundryMcpEdit';
     const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
     const hook = 'update' + doc.documentName;
@@ -783,6 +836,11 @@ export async function undoUpdate(args, signal) {
       const updated = await doc.update(data, { [MARK]: id });
       // What this save left, read at once: anything saved during the watch below is someone else's, never this edit's.
       const saved = updated ? deepClone(doc._source) : null;
+      if (updated && onSaved) {
+        try {
+          onSaved(changed, saved);
+        } catch {}
+      }
       if (updated) await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
       return { updated, changed, linked, saved };
     } finally {

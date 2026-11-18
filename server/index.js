@@ -17,7 +17,7 @@ import { localhostHostValidation, toNodeHandler } from '@modelcontextprotocol/no
 import * as z from 'zod/v4';
 import * as page from './page.js';
 
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 
 // ---------------------------------------------------------------------- config
 // Values come from config.json next to this file (see config.example.json);
@@ -754,6 +754,59 @@ function oneAtATime(uuid, task) {
   return run;
 }
 
+// Turns an undo record from the page into a remembered edit, or returns why it cannot be one. Every part of the
+// record must cover exactly the paths it lists (the paths Foundry reported the update changed).
+function rememberEdit(record, { world, origin, uuid, name, recovered = false }) {
+  let saved;
+  try {
+    saved = JSON.parse(record);
+  } catch {
+    saved = null;
+  }
+  const fields = ['before', 'existed', 'after', 'exists'];
+  const recorded = Array.isArray(saved?.paths) && saved.paths.length && saved.paths.every((path) => typeof path === 'string') ? [...saved.paths].sort() : null;
+  if (!saved || !recorded || !fields.every((field) => saved[field] && typeof saved[field] === 'object' && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
+    return { error: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
+  }
+  const edit = {
+    id: ++editSeq, world, origin, uuid, name, time: new Date().toISOString(),
+    before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists,
+    roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [],
+    embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {},
+    deployment: typeof saved.deployment === 'string' ? saved.deployment : '', undone: false, ...(recovered ? { recovered: true } : {}),
+  };
+  edits.push(edit);
+  if (edits.length > MAX_EDITS) edits.shift();
+  return { edit, saved };
+}
+
+// Applies whose reply never came (the time limit passed, the connection dropped or the page reloaded after the save):
+// the page keeps their undo records in a journal, and the next foundry_undo asks for them. Forgotten after an hour.
+const unanswered = new Map(); // call id -> { world, origin, uuid, since }
+async function recoverUnanswered(connection) {
+  for (const [id, entry] of unanswered) if (Date.now() - entry.since > 3_600_000) unanswered.delete(id);
+  if (!connection) return [];
+  const ids = [...unanswered].filter(([, entry]) => entry.world === connection.hello.world && entry.origin === connection.origin).map(([id]) => id);
+  if (!ids.length) return [];
+  let reply;
+  try {
+    reply = await callFoundry(pageCall(page.recoverEdits, { opIds: ids }), { timeoutMs: 10_000, connection });
+  } catch {
+    return [];
+  }
+  if (!reply.ok || !reply.result || typeof reply.result !== 'object') return [];
+  const recovered = [];
+  for (const id of ids) {
+    const entry = reply.result[id];
+    const pending = unanswered.get(id);
+    if (!entry || typeof entry.record !== 'string') continue;
+    unanswered.delete(id);
+    const made = rememberEdit(entry.record, { world: pending.world, origin: pending.origin, uuid: typeof entry.uuid === 'string' ? entry.uuid : pending.uuid, name: entry.name ?? null, recovered: true });
+    if (made.edit) recovered.push(made.edit.id);
+  }
+  return recovered;
+}
+
 // Edits made with foundry_update, so they can be undone. Held by the hub, not the page: a reload does not lose them.
 const edits = [];
 let editSeq = 0;
@@ -781,7 +834,7 @@ const expectOf = (args) => ({ world: args.expectedWorld, session: args.expectedS
 const jsonValue = z.any();
 
 function buildMcpServer() {
-  const server = new McpServer({ name: 'foundry', version: '0.7.0' }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: 'foundry', version: '0.7.1' }, { instructions: INSTRUCTIONS });
 
   server.registerTool(
     'foundry_status',
@@ -964,6 +1017,12 @@ function buildMcpServer() {
         const world = connection?.hello.world;
         const session = connection?.hello.session;
         const { expectedWorld, expectedSession, ...rest } = args;
+        // An apply gets an id the page keeps its undo record under, in case the reply never arrives.
+        const opId = args.apply ? randomUUID() : undefined;
+        if (opId) {
+          rest.opId = opId;
+          unanswered.set(opId, { world, origin: connection?.origin ?? '', uuid: args.uuid, since: Date.now() });
+        }
         const run = () =>
           runPage(page.updateDocument, rest, {
             expect: expectOf(args),
@@ -989,29 +1048,23 @@ function buildMcpServer() {
                 }
                 return preview;
               }
+              if (opId) unanswered.delete(opId); // the reply came: nothing to recover
               if (!shown.applied || !record) return { ...shown, world, session };
-              // The record is kept by the hub for undo. Its paths must be exactly the ones asked for.
-              let saved;
-              try {
-                saved = JSON.parse(record);
-              } catch {
-                saved = null;
-              }
-              const fields = ['before', 'existed', 'after', 'exists'];
-              // The record lists the paths Foundry reported this update changed; every part of it must cover exactly those.
-              const recorded = Array.isArray(saved?.paths) && saved.paths.length && saved.paths.every((path) => typeof path === 'string') ? [...saved.paths].sort() : null;
-              if (!saved || !recorded || !fields.every((field) => saved[field] && typeof saved[field] === 'object' && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
-                return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
-              }
-              const edit = { id: ++editSeq, world, origin: connection?.origin ?? '', uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {}, deployment: typeof saved.deployment === 'string' ? saved.deployment : '', undone: false };
-              edits.push(edit);
-              if (edits.length > MAX_EDITS) edits.shift();
+              const made = rememberEdit(record, { world, origin: connection?.origin ?? '', uuid: shown.uuid, name: shown.name });
+              if (!made.edit) return { ...shown, world, session, undoable: made.error };
+              const { edit, saved } = made;
               // editId first; the values are left out when they would not fit beside it.
               const values = JSON.stringify([saved.before, saved.after]).length < 40_000 ? { before: saved.before, after: saved.after } : { values: 'Too large to show here; read the document with foundry_document.' };
               return { editId: edit.id, ...shown, world, session, ...values };
             },
           });
-        return args.apply ? oneAtATime(args.uuid, run) : run();
+        if (!args.apply) return run();
+        const reply = await oneAtATime(args.uuid, run);
+        // No reply came (a timeout or a dropped connection): the change may have been saved anyway. Say how to get it back.
+        if (opId && unanswered.has(opId) && reply.isError && !reply.content[0].text.startsWith('{')) {
+          reply.content[0].text += ' If Foundry saved the change, its undo record is kept in the GM tab; foundry_undo picks it up (list: true shows it).';
+        }
+        return reply;
       }
     );
 
@@ -1022,8 +1075,9 @@ function buildMcpServer() {
           'Undo a change made with foundry_update: put back each path\'s earlier value (an object whole), or remove a path, and ' +
           'any object holding it, that the update created. Only if those paths still hold what the update left there; if anyone ' +
           'has changed them since, nothing is undone and the conflicts are listed, so a later change is never overwritten. ' +
-          'Without `editId`, undoes the most recent edit in the connected world that is not undone yet. `list: true` lists the ' +
-          'edits this hub remembers (the last 100, until it restarts).',
+          'Without `editId`, undoes the most recent edit made in the connected Foundry and world that is not undone yet. ' +
+          'An apply whose reply was lost (a timeout, a dropped connection or a reload after the save) is picked up here from ' +
+          'the GM tab. `list: true` lists the edits this hub remembers (the last 100, until it restarts).',
         inputSchema: z.object({
           editId: z.number().int().min(1).optional().describe('The editId foundry_update returned. Default: the most recent.'),
           list: z.boolean().optional().describe('List the remembered edits instead of undoing one.'),
@@ -1034,10 +1088,25 @@ function buildMcpServer() {
         const connection = foundry;
         const world = connection?.hello.world;
         const origin = connection?.origin ?? '';
+        const recovered = await recoverUnanswered(connection);
         if (args.list) {
-          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, linked, embedded, deployment, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
+          return textReply(asText({
+            ...(recovered.length ? { recovered } : {}),
+            edits: edits.map(({ before, existed, after, exists, roots, shape, linked, embedded, ...summary }) => ({ ...summary, paths: Object.keys(after) })),
+          }));
         }
-        const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && entry.origin === origin && !entry.undone);
+        // Without an editId: the newest edit made in this very Foundry (its address and route prefix), not merely in a
+        // world with the same id. Which one this tab is comes from the tab itself.
+        let here = null;
+        if (args.editId === undefined && connection) {
+          try {
+            const reply = await callFoundry(pageCall(page.deploymentHere), { timeoutMs: 10_000, connection });
+            if (reply.ok && typeof reply.result === 'string') here = reply.result;
+          } catch {}
+        }
+        const edit = args.editId !== undefined
+          ? edits.find((entry) => entry.id === args.editId)
+          : edits.findLast((entry) => entry.world === world && entry.origin === origin && (here === null || !entry.deployment || entry.deployment === here) && !entry.undone);
         if (!edit) return textReply(args.editId !== undefined ? `No edit ${args.editId} is remembered.` : 'There is no edit to undo in this world.', true);
         if (edit.world !== world) return textReply(`Edit ${edit.id} was made in world "${edit.world}", but "${world ?? 'nothing'}" is connected now.`, true);
         // The same world id served by another Foundry installation is another copy of the world.

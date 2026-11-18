@@ -146,7 +146,7 @@ globalThis.game = {
   version: '14.370',
   actors: Object.assign(new Map([['a1', actor]]), { getName: () => actor }),
   items: new Map(), scenes: Object.assign(new Map(), { active: null }), macros: new Map(), journal: new Map(),
-  modules: [{ id: 'foundry-mcp', version: '0.7.0', active: true }],
+  modules: [{ id: 'foundry-mcp', version: '0.7.1', active: true }],
 };
 globalThis.fromUuid = async (uuid) => ({ 'Actor.g1': goblin, 'Setting.s1': storedSetting })[uuid] ?? null;
 globalThis.canvas = { scene: null };
@@ -1279,6 +1279,44 @@ try {
     const huge = payload(await update({ set: { 'flags.mod.blob': 'x'.repeat(310_000) } })).result;
     assert.equal(huge.valid, false);
     assert.match(huge.error, /too large/);
+  });
+
+  await check('an apply whose reply is lost after the save is recovered by the next foundry_undo', async () => {
+    // A longer watch after the save, and the connection drops during it: the change is saved, the reply never comes.
+    globalThis.foundryMcpSettleMs = 1500;
+    const preview = payload(await callTool('foundry_update', { uuid: torch.uuid, set: { 'config.dim': 17 } })).result;
+    const pending = callTool('foundry_update', { uuid: torch.uuid, set: { 'config.dim': 17 }, apply: true, expected: preview.expected });
+    await until(() => torch._source.config.dim === 17, 'the save');
+    moduleSockets.at(-1).close();
+    const lost = await pending;
+    globalThis.foundryMcpSettleMs = 60;
+    assert.equal(lost.isError, true);
+    assert.match(lost.content[0].text, /disconnected[\s\S]*foundry_undo picks it up/);
+    await sleep(6000); // the module reconnects, same page
+    const { recovered, edits } = JSON.parse((await callTool('foundry_undo', { list: true })).content[0].text);
+    assert.equal(recovered.length, 1);
+    const edit = edits.find((entry) => entry.id === recovered[0]);
+    assert.deepEqual([edit.recovered, edit.paths], [true, ['config.dim']]);
+    // The settling watch ran out after the drop, so its final record replaced the first; either way undo works.
+    assert.equal(payload(await callTool('foundry_undo', { editId: edit.id })).result.undone, true);
+    assert.equal(torch._source.config.dim, 20);
+  });
+
+  await check('foundry_undo without editId picks the newest edit made in this Foundry, not another route prefix\'s', async () => {
+    const edit = async (dim) => {
+      const preview = payload(await callTool('foundry_update', { uuid: torch.uuid, set: { 'config.dim': dim } })).result;
+      return payload(await callTool('foundry_update', { uuid: torch.uuid, set: { 'config.dim': dim }, apply: true, expected: preview.expected })).result;
+    };
+    const here = await edit(21);
+    // The next edit is made in another Foundry under the same address, with the route prefix /staging/.
+    foundry.utils.getRoute = () => '/staging/';
+    const elsewhere = await edit(22);
+    delete foundry.utils.getRoute;
+    torch._source.config.dim = 21; // that copy's change is not this one's
+    const undone = payload(await callTool('foundry_undo', {})).result;
+    assert.deepEqual([undone.editId, undone.undone], [here.editId, true], 'the edit made here, though the other is newer');
+    assert.equal(torch._source.config.dim, 20);
+    assert.match(payload(await callTool('foundry_undo', { editId: elsewhere.editId })).result.note, /a different copy of the world/);
   });
 
   await check('an edit is undone only in the Foundry installation it was made in', async () => {

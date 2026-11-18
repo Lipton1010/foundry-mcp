@@ -2,7 +2,7 @@
   "id": "foundry-mcp",
   "title": "Foundry MCP",
   "description": "Connects a GM's Foundry session to a local MCP server so coding agents (Claude Code, Codex, Cursor and other MCP clients) can read and change the world. It does nothing without the hub from the project page running on the GM's computer. Enable it only in worlds you want an agent to control.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "compatibility": {
     "minimum": "14",
     "verified": "14.370",
@@ -20,7 +20,7 @@
   "license": "MIT",
   "url": "https://github.com/Lipton1010/foundry-mcp",
   "manifest": "https://github.com/Lipton1010/foundry-mcp/releases/latest/download/module.json",
-  "download": "https://github.com/Lipton1010/foundry-mcp/releases/download/v0.7.0/module.zip",
+  "download": "https://github.com/Lipton1010/foundry-mcp/releases/download/v0.7.1/module.zip",
   "readme": "https://github.com/Lipton1010/foundry-mcp/blob/main/README.md",
   "bugs": "https://github.com/Lipton1010/foundry-mcp/issues"
 }

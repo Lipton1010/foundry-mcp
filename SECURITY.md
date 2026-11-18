@@ -59,6 +59,10 @@ data. What this does not change:
   `key`), and URLs that carry their secret in themselves (webhooks, passwords in addresses, tokens in queries) have
   that part withheld. Email addresses are withheld too, in settings and in the change feed. A secret in any other form is returned. Stored settings are not readable through the document tools, which would
   sidestep this. The module's pairing token itself is withheld by this rule.
+- **Undo records are kept in the GM's browser.** So that an edit whose reply was lost can still be undone, the GM
+  tab keeps the undo records of its ten newest `foundry_update` edits in `localStorage`, with the document values they
+  put back. They hold real values (they are not redacted, or undo could not restore them), stay in that browser
+  profile until newer edits replace them, and are readable by anything running in a Foundry page there.
 - **A screenshot shows what the GM sees**, including hidden tokens and GM-only drawings, and it goes to the AI
   provider like any other reply.
 - **Text the agent reads can still steer it**, and with other tools available to the same agent that matters even
