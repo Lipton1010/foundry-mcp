@@ -37,4 +37,11 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" module.zip foundry-mcp/module.json --title "$GITHUB_REF_NAME" --generate-notes
+        # Only the tag that was tested: it must still exist and still point at this commit.
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+          if [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "Tag $GITHUB_REF_NAME now points at $tagged, not the tested commit $GITHUB_SHA" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" module.zip foundry-mcp/module.json --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

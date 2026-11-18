@@ -195,14 +195,17 @@ Listed when `allowEval` is on.
 
 - Without `apply`, it previews: the change (`set`, dot path to value, and `remove`, a list of dot paths) is
   validated on a copy of the document and nothing is saved. An invalid change comes back as `valid: false` with
-  Foundry's validation message. Paths that overlap (`flags.a` and `flags.a.b`), a path both set and removed, and a
-  change too large to keep a record of for undo are refused.
+  Foundry's validation message. Paths that overlap (`flags.a` and `flags.a.b`), a path both set and removed, a
+  write inside a value that is not an object, and a change larger than about 60,000 characters (use `foundry_eval`
+  for those) are refused.
 - To apply, call again with the same `set` and `remove`, `apply: true`, and the preview's `expected`. That records
   the exact change previewed and every affected path's value and whether it exists (an absent path is not the same
   as one holding `null`). If any of them has changed since the preview, nothing is saved and `conflicts` lists them.
   An `expected` from a preview of a different change, including the same paths with other values, is refused. An applied change returns `editId`; if a module hook refuses the update, the reply
   says so and nothing is recorded.
 - Setting an object merges it into the object there, as Foundry's own updates do.
+- An apply or undo keeps going if the client goes away, so a change that is saved is still recorded (see
+  `list: true`). One the hub gives up on after two minutes is cancelled if it has not started saving.
 - Applying and undoing through this hub happen one at a time per document, so two clients cannot both pass the same
   check. A change made in another tab, by another user or through `foundry_eval` at the same moment is not part of
   that queue; the check just before saving still catches one that has already landed.
@@ -510,7 +513,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 75 checks)
+### Tested in simulation only (`npm test`, 76 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -541,7 +544,7 @@ applying at once, an edit too large to undo, a token from another scene, and pag
 without skipping rows. After the second review: a reply the module did not sign refused, unproven connections
 refused before the upgrade, a fingerprint for a removal not accepted for a literal value, an overlap hidden by a
 sibling key, a write inside a value that is not an object refused, an undo a hook changed kept as not undone, and
-a dice wrapper put on top without calling another module's function.
+a dice wrapper put on top without calling another module's function. After the third review: an unsigned welcome refused, an undo refused once the object holding a removed key was replaced by a value, an apply given up on before saving changing nothing, keys added in any order undone cleanly, and credentials inside JSON stored as text withheld.
 
 ### Not tested
 

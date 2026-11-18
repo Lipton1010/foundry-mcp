@@ -124,6 +124,12 @@ function connect() {
     }
     if (msg.welcome && socket !== ws) {
       if (token && !sessionKey) return refuse('whatever answered at the hub address did not ask for the token');
+      // The welcome is signed too, so nothing in between can announce one: start-up logs are only sent after it.
+      if (sessionKey) {
+        const welcomeOk = msg.mac === toHex(await hmac(sessionKey, 'welcome'));
+        if (refused) return;
+        if (!welcomeOk) return refuse('the welcome did not come from the hub');
+      }
       console.log(`${MODULE_ID} | connected to MCP hub`);
       socket = ws;
       // Entries captured during start-up were redacted before the token setting could be read; scrub them again.

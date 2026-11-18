@@ -583,6 +583,8 @@ try {
     Hooks.fire('updateActiveEffect', effect, { system: { changes: [{ key: 'system.attributes.ac.bonus', value: '2' }] } }, {}, 'gm1');
     Hooks.fire('updateActor', vault, { flags: { integration: { token: 'zzSecret01234567', key: 'zz-plain-key-zz' }, mod: { speaker: { token: 'KxeEuSgHRRZueFXj' }, changes: [{ key: 'system.attributes.ac.bonus' }] } } }, {}, 'gm1');
     Hooks.fire('updateChatMessage', message, { speaker: { token: 'zz-not-an-id-zz' } }, {}, 'gm1');
+    // A module that keeps a profile as text holding JSON.
+    Hooks.fire('updateActor', vault, { flags: { mod: { profile: '{"url":"https://w.example","password":"zz-json-zz"}' } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
     assert.ok(!/zz-|zzSecret/.test(JSON.stringify(nested)), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
@@ -599,6 +601,7 @@ try {
       { path: 'flags.mod.changes', value: [{ key: '[withheld]' }] },
     ]);
     assert.deepEqual(nested.entries[5].changes, [{ path: 'speaker.token', value: '[withheld]' }]);
+    assert.deepEqual(nested.entries[6].changes, [{ path: 'flags.mod.profile', value: '{"url":"https://w.example","password":"[withheld]"}' }]);
 
     // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
     const shape = { documentName: 'Actor', uuid: 'Actor.s1', name: 'Shape', parent: null, _source: { flags: { mod: { x: 1, y: 2 } } } };
@@ -1001,6 +1004,28 @@ try {
     assert.deepEqual([tampered.undone, tampered.notRestored], [false, ['config.bright']]);
     assert.equal(JSON.parse((await callTool('foundry_undo', { list: true })).content[0].text).edits.find((edit) => edit.id === tamperEdit.editId).undone, false);
     torch._source.config.bright = 10;
+
+    // Two new keys given in reverse order: undo still removes the object the edit made for them.
+    const pairPreview = payload(await update({ set: { 'flags.pair.b': 1, 'flags.pair.a': 2 } })).result;
+    const pairEdit = payload(await update({ set: { 'flags.pair.b': 1, 'flags.pair.a': 2 }, apply: true, expected: pairPreview.expected })).result;
+    assert.equal(payload(await callTool('foundry_undo', { editId: pairEdit.editId })).result.undone, true);
+    assert.deepEqual(torch._source.flags, {});
+
+    // After an edit removed a key from an object, someone replaced the object with a value: undo refuses.
+    torch._source.flags.kit = { lamp: 'oil', spare: 1 };
+    const trimPreview = payload(await update({ remove: ['flags.kit.spare'] })).result;
+    const trimEdit = payload(await update({ remove: ['flags.kit.spare'], apply: true, expected: trimPreview.expected })).result;
+    torch._source.flags.kit = 'sold';
+    const blockedTrim = payload(await callTool('foundry_undo', { editId: trimEdit.editId })).result;
+    assert.equal(blockedTrim.undone, false);
+    assert.deepEqual(blockedTrim.conflicts, [{ path: 'flags.kit', expected: '(object)', now: '(value)' }]);
+    assert.equal(torch._source.flags.kit, 'sold');
+    delete torch._source.flags.kit;
+
+    // A call given up on before the save changes nothing, whether waiting for the document or for the lock.
+    const lateArgs = { uuid: torch.uuid, set: { 'config.dim': 3 }, apply: true, expected: payload(await update({ set: { 'config.dim': 3 } })).result.expected };
+    assert.match((await page.updateDocument(lateArgs, AbortSignal.abort())).note, /given up on/);
+    assert.equal(torch._source.config.dim, 20);
 
     // A hook that refuses the update: nothing is recorded as applied, and nothing can be undone.
     torch.veto = true;
@@ -1615,7 +1640,7 @@ try {
   // A stand-in hub, for behaviour the real hub never shows. `wrongProof` answers the challenge
   // without knowing the token; otherwise it completes the handshake honestly and then sends an
   // unsigned command, as something sitting between the module and the real hub would.
-  const fakeHub = async ({ wrongProof, replay, badId }) => {
+  const fakeHub = async ({ wrongProof, replay, badId, unsignedWelcome }) => {
     const fake = new WebSocketServer({ port: 0, host: '127.0.0.1' });
     await new Promise((resolve) => fake.on('listening', resolve));
     const closed = new Promise((resolve) => {
@@ -1629,8 +1654,8 @@ try {
             const proof = wrongProof ? '00'.repeat(32) : sign(MODULE_TOKEN, `hub\n${bindingOf(msg.hello, 'hubnonce')}`).toString('hex');
             ws.send(JSON.stringify({ challenge: { nonce: 'hubnonce', proof } }));
           } else if (msg.proof) {
-            ws.send(JSON.stringify({ welcome: true }));
             const key = sign(MODULE_TOKEN, `session\n${bindingOf(hello, 'hubnonce')}`);
+            ws.send(JSON.stringify({ welcome: true, ...(unsignedWelcome ? {} : { mac: sign(key, 'welcome').toString('hex') }) }));
             const signed = (id, code) => JSON.stringify({ id, method: 'eval', params: { code, source: 'eval' }, seq: 1, mac: sign(key, JSON.stringify([1, 'eval', id, code, 'eval'])).toString('hex') });
             if (replay) {
               // One genuinely signed command, sent twice.
@@ -1660,6 +1685,12 @@ try {
     assert.equal(await fakeHub({ wrongProof: false }), 4003);
     assert.equal(globalThis.injected, undefined);
   });
+  await check('a module refuses a welcome the hub did not sign, before sending it anything', async () => {
+    globalThis.injected = undefined;
+    assert.equal(await fakeHub({ unsignedWelcome: true }), 4003);
+    assert.equal(globalThis.injected, undefined);
+  });
+
   await check('a module refuses a command whose id is not a plain UUID, signed or not', async () => {
     assert.equal(await fakeHub({ badId: true }), 4003);
     assert.equal(globalThis.injected, undefined);

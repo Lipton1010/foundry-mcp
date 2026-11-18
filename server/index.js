@@ -502,7 +502,7 @@ function register(ws) {
     foundry.hello,
     samePage ? 'Foundry reconnected (same page as before; nothing was reloaded)' : 'Foundry connected (new page session; earlier entries are from before the reload)'
   );
-  ws.send(JSON.stringify({ welcome: true }));
+  ws.send(JSON.stringify({ welcome: true, ...(ws.sessionKey ? { mac: hmac(ws.sessionKey, 'welcome').toString('hex') } : {}) }));
 }
 
 // -------------------------------------------------------------------- MCP side
@@ -594,13 +594,15 @@ const requestScope = new AsyncLocalStorage(); // the AbortSignal of the HTTP req
 const textReply = (text, isError = false) => ({ content: [{ type: 'text', text }], ...(isError ? { isError } : {}) });
 
 // One of the fixed functions in page.js, with the caller's arguments as JSON data, never as code.
-const pageCall = (fn, args = {}) => `return (${fn.toString()})(${JSON.stringify(args)});`;
+// `signal` is the abort signal the bridge gives every call; page functions that write check it before saving.
+const pageCall = (fn, args = {}) => `return (${fn.toString()})(${JSON.stringify(args)}, signal);`;
 
 // Runs fixed page code and replies with its result (passed through `decorate`, if given).
-async function runPage(fn, args = {}, { expect, decorate, connection, timeoutMs } = {}) {
+// `detach`: keep waiting for the answer even if the client goes away, so a change that was saved is still recorded.
+async function runPage(fn, args = {}, { expect, decorate, connection, timeoutMs, detach } = {}) {
   const logSeq = lastSeq;
   try {
-    const reply = await callFoundry(pageCall(fn, args), { signal: requestScope.getStore(), expect, connection, timeoutMs });
+    const reply = await callFoundry(pageCall(fn, args), { signal: detach ? undefined : requestScope.getStore(), expect, connection, timeoutMs });
     const body = reply.ok ? { result: decorate ? decorate(reply.result) : reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
     return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped }, { logSeq }) }], isError: !reply.ok };
@@ -681,8 +683,9 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
     const startTime = Date.now() - CLOCK_SLACK_MS;
     const tracked = connection && connection.seenSeq !== undefined && !connection.untracked;
     const seqAtStart = connection?.seenSeq ?? 0;
-    if (left() <= 0) throw new Error('The time limit was used up while change tracking was being set up, so the code was not started. Nothing was run.');
-    const reply = await callFoundry(code, { timeoutMs: left(), signal: requestScope.getStore(), source: 'eval', expect });
+    const remaining = left(); // read once, so the check and the timeout agree
+    if (remaining <= 0) throw new Error('The time limit was used up while change tracking was being set up, so the code was not started. Nothing was run.');
+    const reply = await callFoundry(code, { timeoutMs: remaining, signal: requestScope.getStore(), source: 'eval', expect });
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
     let changed = {};
@@ -943,6 +946,7 @@ function buildMcpServer() {
             connection,
             // An apply is not given up on early: the edit lock in the page is held until Foundry has saved.
             timeoutMs: args.apply ? 120_000 : 30_000,
+            detach: Boolean(args.apply),
             decorate: (result) => {
               const { record, ...shown } = result ?? {};
               if (shown.valid && typeof shown.expected === 'string') {
@@ -968,7 +972,7 @@ function buildMcpServer() {
               if (!saved || !fields.every((field) => saved[field] && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(requested))) {
                 return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
               }
-              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, undone: false };
+              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, undone: false };
               edits.push(edit);
               if (edits.length > MAX_EDITS) edits.shift();
               return { ...shown, before: saved.before, after: saved.after, world, session, editId: edit.id };
@@ -997,7 +1001,7 @@ function buildMcpServer() {
         const connection = foundry;
         const world = connection?.hello.world;
         if (args.list) {
-          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
+          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
         }
         const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && !entry.undone);
         if (!edit) return textReply(args.editId !== undefined ? `No edit ${args.editId} is remembered.` : 'There is no edit to undo in this world.', true);
@@ -1005,11 +1009,12 @@ function buildMcpServer() {
         return oneAtATime(edit.uuid, () => {
           // Checked inside the queue: another undo of the same edit may have just finished.
           if (edit.undone) return textReply(`Edit ${edit.id} has already been undone.`, true);
-          const { before, existed, after, exists, roots, uuid } = edit;
-          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots }, {
+          const { before, existed, after, exists, roots, shape, uuid } = edit;
+          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots, shape }, {
             expect: expectOf(args),
             connection,
             timeoutMs: 120_000,
+            detach: true,
             decorate: (result) => {
               if (result?.undone === true) edit.undone = true;
               return { editId: edit.id, ...result };
