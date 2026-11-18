@@ -606,7 +606,12 @@ async function runPage(fn, args = {}, { expect, decorate, connection, timeoutMs,
     const reply = await callFoundry(pageCall(fn, args), { signal: detach ? undefined : requestScope.getStore(), expect, connection, timeoutMs });
     const body = reply.ok ? { result: decorate ? decorate(reply.result) : reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
-    return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped }, { logSeq }) }], isError: !reply.ok };
+    // Console output is the first thing left out of a reply that would be too long, before any of the result.
+    let logs = { logs: reply.logs };
+    if (JSON.stringify({ ...body, logs: reply.logs }, null, 1).length > MAX_RESULT_CHARS - 1000) {
+      logs = { logs: [], logsOmitted: `${reply.logs?.length ?? 0} lines of console output were left out to fit the result; read warnings and errors with foundry_logs from logSeq.` };
+    }
+    return { content: [{ type: 'text', text: asText({ ...body, ...logs, ...dropped }, { logSeq }) }], isError: !reply.ok };
   } catch (error) {
     return textReply(error.message, true);
   }
@@ -975,7 +980,10 @@ function buildMcpServer() {
                 saved = null;
               }
               const fields = ['before', 'existed', 'after', 'exists'];
-              if (!saved || !fields.every((field) => saved[field] && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(requested))) {
+              // Besides the paths asked for, the record holds any the system or a module changed as part of the save.
+              const extra = Array.isArray(saved?.extra) && saved.extra.every((path) => typeof path === 'string' && !requested.includes(path)) ? saved.extra : null;
+              const recorded = extra ? [...requested, ...extra].sort() : null;
+              if (!saved || !recorded || !fields.every((field) => saved[field] && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
                 return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
               }
               const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, undone: false };

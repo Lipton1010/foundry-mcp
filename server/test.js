@@ -587,6 +587,8 @@ try {
     Hooks.fire('updateActor', vault, { flags: { mod: { profile: '{"url":"https://w.example","password":"zz-json-zz"}' } } }, {}, 'gm1');
     // Malformed JSON (a trailing comma) and a repeated key cannot carry a credential through either.
     Hooks.fire('updateActor', vault, { flags: { mod: { broken: '{"password":"zz-bad-json-zz",}', twice: '{"password":"zz-first-zz","password":null}', label: '[Homebrew] Sword' } } }, {}, 'gm1');
+    // JSON encoded as a string twice over.
+    Hooks.fire('updateActor', vault, { flags: { mod: { wrapped: JSON.stringify(JSON.stringify({ password: 'zz-wrapped-zz', user: 'gm' })) } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
     assert.ok(!/zz-|zzSecret/.test(JSON.stringify(nested)), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
@@ -609,6 +611,7 @@ try {
       { path: 'flags.mod.twice', value: '{"password":null}' },
       { path: 'flags.mod.label', value: '[Homebrew] Sword' },
     ]);
+    assert.deepEqual(nested.entries[8].changes, [{ path: 'flags.mod.wrapped', value: JSON.stringify(JSON.stringify({ password: '[withheld]', user: 'gm' })) }]);
 
     // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
     const shape = { documentName: 'Actor', uuid: 'Actor.s1', name: 'Shape', parent: null, _source: { flags: { mod: { x: 1, y: 2 } } } };
@@ -680,7 +683,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 3);
+    assert.equal(globalThis[KEY].version, 4);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -1051,6 +1054,26 @@ try {
     const lateArgs = { uuid: torch.uuid, set: { 'config.dim': 3 }, apply: true, expected: payload(await update({ set: { 'config.dim': 3 } })).result.expected };
     assert.match((await page.updateDocument(lateArgs, AbortSignal.abort())).note, /given up on/);
     assert.equal(torch._source.config.dim, 20);
+
+    // The system changes more than was asked as part of the save (as dnd5e resets death saves when hit points rise
+    // from 0): those changes are recorded and listed, and undo puts them back too.
+    torch._source.flags.saves = { success: 2, failure: 1 };
+    const healPreview = payload(await update({ set: { 'config.dim': 9 } })).result;
+    torch.tamper = (source) => (source.flags.saves = { success: 0, failure: 0 });
+    const heal = payload(await update({ set: { 'config.dim': 9 }, apply: true, expected: healPreview.expected })).result;
+    torch.tamper = null;
+    assert.deepEqual(heal.alsoChanged, ['flags.saves.failure', 'flags.saves.success']);
+    assert.equal(payload(await callTool('foundry_undo', { editId: heal.editId })).result.undone, true);
+    assert.deepEqual([torch._source.config.dim, torch._source.flags.saves], [20, { success: 2, failure: 1 }]);
+    delete torch._source.flags.saves;
+
+    // An edit made flags.review.nested.leaf; someone added flags.review.keep since. Undo keeps that and leaves no empty object.
+    const nestPreview = payload(await update({ set: { 'flags.review.nested.leaf': 1 } })).result;
+    const nestEdit = payload(await update({ set: { 'flags.review.nested.leaf': 1 }, apply: true, expected: nestPreview.expected })).result;
+    torch._source.flags.review.keep = 1;
+    assert.equal(payload(await callTool('foundry_undo', { editId: nestEdit.editId })).result.undone, true);
+    assert.deepEqual(torch._source.flags, { review: { keep: 1 } });
+    delete torch._source.flags.review;
 
     // A hook that refuses the update: nothing is recorded as applied, and nothing can be undone.
     torch.veto = true;

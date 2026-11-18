@@ -120,7 +120,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 3; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
+  const VERSION = 4; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -157,10 +157,24 @@ export function installChanges() {
   };
   // Withholds credential-like text anywhere inside a plain JSON value; `segments` is the full path it is stored at
   // in a document of type `documentName` (null for data that is not a document's own, such as a setting's value).
-  const scrub = (value, segments, documentName = null) => {
-    if (Array.isArray(value)) return value.map((item, index) => scrub(item, [...segments, String(index)], documentName));
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, scrub(item, [...segments, key], documentName)]));
+  const scrub = (value, segments, documentName = null, depth = 0) => {
+    if (Array.isArray(value)) return value.map((item, index) => scrub(item, [...segments, String(index)], documentName, depth));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, scrub(item, [...segments, key], documentName, depth)]));
     if (secret(documentName, segments, value)) return '[withheld]';
+    // JSON encoded as a string more than once (text that is itself a quoted string) is unwrapped, a few levels deep.
+    if (typeof value === 'string' && /^\s*"/.test(value) && value.length <= 100_000) {
+      let inner;
+      try {
+        inner = JSON.parse(value);
+      } catch {
+        inner = undefined;
+      }
+      if (typeof inner === 'string') {
+        if (depth >= 3) return /[[{]/.test(inner) && /\\?"\s*:/.test(inner) ? '[withheld: nested too deeply to check]' : value;
+        const cleaned = scrub(inner, segments, null, depth + 1);
+        return cleaned === inner ? value : JSON.stringify(cleaned);
+      }
+    }
     // Text that holds JSON (a module storing a profile as a string) is read and scrubbed like any object, and given back
     // re-written from what was read (so a repeated key cannot carry an earlier value through). Text that looks like
     // JSON (it opens with a bracket and has a quoted key) but is too long to read safely, or does not parse, is withheld.
@@ -356,7 +370,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 3) return { installed: false }; // the same number as VERSION in installChanges
+  if (t?.version !== 4) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 
@@ -472,7 +486,24 @@ export async function updateDocument(args, signal) {
     const value = getProperty(doc._source, path);
     return value !== null && typeof value === 'object' && !Array.isArray(value) ? 'object' : 'value';
   };
-  const shape = () => Object.fromEntries([...new Set(paths.flatMap(ancestors))].map((ancestor) => [ancestor, kind(ancestor)]));
+  const shapeOf = (list) => Object.fromEntries([...new Set(list.flatMap(ancestors))].map((ancestor) => [ancestor, kind(ancestor)]));
+  // Leaf paths that differ between two versions of the source, outside the covered paths and _stats. When one such path
+  // holds another (a value that became an object), only the outer one is kept, so each is restored whole.
+  const sideEffects = (was, is, covered) => {
+    const flat = (value, prefix, out) => {
+      if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length) for (const [key, item] of Object.entries(value)) flat(item, prefix ? prefix + '.' + key : key, out);
+      else if (prefix) out[prefix] = value;
+      return out;
+    };
+    const a = flat(was, '', {});
+    const b = flat(is, '', {});
+    const near = (p, q) => p === q || p.startsWith(q + '.') || q.startsWith(p + '.');
+    const differing = [...new Set([...Object.keys(a), ...Object.keys(b)])]
+      .filter((p) => p !== '_stats' && !p.startsWith('_stats.') && !covered.some((q) => near(p, q)))
+      .filter((p) => Object.hasOwn(a, p) !== Object.hasOwn(b, p) || canon(a[p]) !== canon(b[p]))
+      .sort();
+    return differing.filter((p) => !differing.some((q) => q !== p && p.startsWith(q + '.')));
+  };
   // Writing inside a value that is not an object would replace it, and undo could not tell what it was.
   const checkShape = () => {
     for (const path of paths) for (const ancestor of ancestors(path)) if (kind(ancestor) === 'value') throw new Error('"' + ancestor + '" holds a value, not an object, so "' + path + '" cannot be written inside it. Set "' + ancestor + '" itself.');
@@ -546,15 +577,29 @@ export async function updateDocument(args, signal) {
       for (let i = 1; i <= keys.length; i++) if (!hasProperty(doc._source, keys.slice(0, i).join('.'))) return [path, keys.slice(0, i).join('.')];
       return [path, path];
     }));
+    const snapshot = deepClone(doc._source);
     const updated = await doc.update(change());
     // Foundry resolves to nothing when a hook or the server refused the update.
     if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
-    const after = Object.fromEntries(paths.map((path) => [path, read(doc._source, path)]));
-    const exists = Object.fromEntries(paths.map((path) => [path, hasProperty(doc._source, path)]));
+    // The game system or a module may have changed more of the document as part of this update (dnd5e resets death
+    // saves when hit points rise from 0). Those changes are found by comparing the whole document, recorded too, so
+    // undo puts them back as well, and listed in the reply.
+    const extra = sideEffects(snapshot, doc._source, paths);
+    for (const path of extra) {
+      before[path] = read(snapshot, path);
+      existed[path] = hasProperty(snapshot, path);
+      if (!existed[path]) {
+        const keys = path.split('.');
+        for (let i = 1; i <= keys.length; i++) if (!hasProperty(snapshot, keys.slice(0, i).join('.'))) { roots[path] = keys.slice(0, i).join('.'); break; }
+      }
+    }
+    const recorded = [...paths, ...extra];
+    const after = Object.fromEntries(recorded.map((path) => [path, read(doc._source, path)]));
+    const exists = Object.fromEntries(recorded.map((path) => [path, hasProperty(doc._source, path)]));
     // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
-    const record = JSON.stringify({ before, existed, after, exists, roots, shape: shape() });
+    const record = JSON.stringify({ before, existed, after, exists, roots, shape: shapeOf(recorded), extra });
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
-    return { ...about, applied: true, record };
+    return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), record };
   } finally {
     release();
     if (locks.get(doc.uuid) === chain) locks.delete(doc.uuid);
@@ -622,13 +667,51 @@ export async function undoUpdate(args, signal) {
         else setProperty(made, path.slice(root.length + 1), args.after[path]);
       }
       const whole = canon(read(root)) === canon(made);
-      for (const path of whole ? [root] : inside) {
+      const removing = whole ? [root] : [...inside];
+      if (!whole) {
+        // Something else has been added inside the new part since: keep it, but also remove the objects the edit made
+        // that the removals leave empty, so no empty object is left behind.
+        const tree = read(root);
+        for (const path of inside) {
+          const keys = path === root ? [] : path.slice(root.length + 1).split('.');
+          const holder = keys.slice(0, -1).reduce((node, key) => (node && typeof node === 'object' ? node[key] : undefined), tree);
+          if (holder && typeof holder === 'object' && keys.length) delete holder[keys.at(-1)];
+        }
+        const empties = (node, prefix) => {
+          for (const [key, child] of Object.entries(node ?? {})) {
+            if (!child || typeof child !== 'object' || Array.isArray(child)) continue;
+            empties(child, prefix + '.' + key);
+            if (!Object.keys(child).length) {
+              removing.push(prefix + '.' + key);
+              delete node[key]; // so the object holding it can be found empty in turn
+            }
+          }
+        };
+        if (tree && typeof tree === 'object' && !Array.isArray(tree)) {
+          empties(tree, root);
+          if (!Object.keys(tree).length) removing.push(root);
+        }
+      }
+      for (const path of removing) {
         setProperty(data, path, new ForcedDeletion());
         goes.push(path);
       }
     }
+    const snapshot = deepClone(doc._source);
     const updated = await doc.update(data);
     if (!updated) return { undone: false, note: 'Foundry did not save the undo: a module hook or the server refused it. Nothing was changed.' };
+    // Anything else the system or a module changed as part of this undo is reported; it is not undone in turn.
+    const flat = (value, prefix, out) => {
+      if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length) for (const [key, item] of Object.entries(value)) flat(item, prefix ? prefix + '.' + key : key, out);
+      else if (prefix) out[prefix] = value;
+      return out;
+    };
+    const was = flat(snapshot, '', {});
+    const is = flat(doc._source, '', {});
+    const mine = Object.keys(args.before);
+    const alsoChanged = [...new Set([...Object.keys(was), ...Object.keys(is)])]
+      .filter((p) => !p.startsWith('_stats') && !mine.some((q) => p === q || p.startsWith(q + '.') || q.startsWith(p + '.')))
+      .filter((p) => Object.hasOwn(was, p) !== Object.hasOwn(is, p) || canon(was[p]) !== canon(is[p]));
     // Checked, not assumed: a hook may have changed what was saved.
     const differs = [
       ...Object.keys(args.before).filter((path) => args.existed[path] && (!hasProperty(doc._source, path) || canon(read(path)) !== canon(args.before[path]))),
@@ -637,6 +720,7 @@ export async function undoUpdate(args, signal) {
     return {
       undone: differs.length === 0, uuid: doc.uuid, restored: Object.fromEntries(Object.keys(args.before).map((path) => [path, read(path)])),
       ...(differs.length ? { notRestored: differs, note: 'Foundry saved something other than the earlier state for these paths, so the edit is kept as not undone.' } : {}),
+      ...(alsoChanged.length ? { alsoChanged } : {}),
     };
   } finally {
     release();

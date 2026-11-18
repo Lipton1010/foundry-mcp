@@ -204,6 +204,9 @@ Listed when `allowEval` is on.
   An `expected` from a preview of a different change, including the same paths with other values, is refused. An applied change returns `editId`; if a module hook refuses the update, the reply
   says so and nothing is recorded.
 - Setting an object merges it into the object there, as Foundry's own updates do.
+- The game system or a module may change more of the document as part of the save (dnd5e resets death saves when
+  a character's hit points rise from 0). The whole document is compared before and after, those paths are listed
+  in `alsoChanged`, and undo puts them back too. Anything an undo changes in turn is listed in its own `alsoChanged`.
 - An apply or undo keeps going if the client goes away, so a change that is saved is still recorded (see
   `list: true`). One the hub gives up on after two minutes is cancelled if it has not started saving.
 - Applying and undoing through this hub happen one at a time per document, so two clients cannot both pass the same
@@ -505,7 +508,8 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   pairing token** setting after a real reload; a fingerprint for one value refused for another; overlapping paths
   refused; an edit to a light's range, animation object and a new flag, then undo restoring all three exactly; a
   module hook vetoing an update reported as not applied, with nothing to undo; a token from another scene refused;
-  all 49 scenes paged five at a time, each once; and a queued 20 then seed 42 matching Foundry's own
+  all 49 scenes paged five at a time, each once; a dnd5e character raised from 0 to 5 hit points, its reset death
+  saves listed in `alsoChanged` and restored by undo (1 success, 2 failures); and a queued 20 then seed 42 matching Foundry's own
   `MersenneTwister`, with none of the three wrappers left in place afterwards.
 - The code of the three read-only tools, on 15 November 2026, sent through `foundry_eval` rather than by calling
   the tools: the collection and compendium overview (14 collections, 85 packs), a name search, a compendium
@@ -544,7 +548,7 @@ applying at once, an edit too large to undo, a token from another scene, and pag
 without skipping rows. After the second review: a reply the module did not sign refused, unproven connections
 refused before the upgrade, a fingerprint for a removal not accepted for a literal value, an overlap hidden by a
 sibling key, a write inside a value that is not an object refused, an undo a hook changed kept as not undone, and
-a dice wrapper put on top without calling another module's function. After the third review: an unsigned welcome refused, an undo refused once the object holding a removed key was replaced by a value, an apply given up on before saving changing nothing, keys added in any order undone cleanly, and credentials inside JSON stored as text withheld. After the fourth review: malformed JSON text and repeated keys withheld, while ordinary text in brackets is kept; Foundry's older `==` replacement keys refused; undo never writing through a value a module put in place; and a removed absent sibling not leaving an empty object behind.
+a dice wrapper put on top without calling another module's function. After the third review: an unsigned welcome refused, an undo refused once the object holding a removed key was replaced by a value, an apply given up on before saving changing nothing, keys added in any order undone cleanly, and credentials inside JSON stored as text withheld. After the fourth review: malformed JSON text and repeated keys withheld, while ordinary text in brackets is kept; Foundry's older `==` replacement keys refused; undo never writing through a value a module put in place; and a removed absent sibling not leaving an empty object behind. After the fifth review: changes a save hook makes elsewhere in the document recorded and undone with the edit, JSON encoded as a string twice scrubbed, and no empty object left inside a new part that someone added to since.
 
 ### Not tested
 
