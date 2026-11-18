@@ -92,7 +92,7 @@ const ALL_TOOLS = [
 // --- Stub the slice of Foundry and the browser the module touches.
 const hooks = {};
 const settings = {
-  'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '', 'foundry-mcp.allowNoToken': true,
+  'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '', 'foundry-mcp.pairingToken': '', 'foundry-mcp.allowNoToken': true,
   'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': 'metric',
 };
 // What the read-only tools look at. A Foundry Collection is a Map that iterates its values.
@@ -167,7 +167,7 @@ globalThis.WebSocket = class extends NodeWebSocket {
 let copies = 0;
 async function startModule(url, token, beforeReady, { allowNoToken = true } = {}) {
   settings['foundry-mcp.url'] = url;
-  settings['foundry-mcp.token'] = token;
+  settings['foundry-mcp.pairingToken'] = token;
   settings['foundry-mcp.allowNoToken'] = allowNoToken;
   // A real second instance needs a second file: Node reuses the module for a URL that differs only by query.
   const copy = join(tmp, `bridge-${++copies}.mjs`);
@@ -185,7 +185,7 @@ async function startModule(url, token, beforeReady, { allowNoToken = true } = {}
 // `reported` overrides what the module says about itself (and proves); `relayed` what reaches the hub instead.
 const sign = (key, text) => createHmac('sha256', key).update(text).digest();
 const bindingOf = (hello, hubNonce) => [hello.nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
-function rawSocket(port, origin, token, { firstMessage, claimedWorld, reported = {}, relayed = {} } = {}) {
+function rawSocket(port, origin, token, { firstMessage, claimedWorld, reported = {}, relayed = {}, hubToken = MODULE_TOKEN } = {}) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
   const hello = { protocol: 6, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc', ...reported };
   const sent = { ...hello, world: claimedWorld ?? hello.world, ...relayed };
@@ -194,7 +194,7 @@ function rawSocket(port, origin, token, { firstMessage, claimedWorld, reported =
     ws.addEventListener('message', (event) => {
       const msg = JSON.parse(event.data);
       if (msg.challenge) {
-        const expected = sign(MODULE_TOKEN, `hub\n${bindingOf(sent, msg.challenge.nonce)}`).toString('hex');
+        const expected = sign(hubToken, `hub\n${bindingOf(sent, msg.challenge.nonce)}`).toString('hex');
         assert.equal(msg.challenge.proof, expected, 'the hub proves it knows the pairing token');
         ws.send(JSON.stringify({ proof: sign(token ?? '', `module\n${bindingOf(hello, msg.challenge.nonce)}`).toString('hex') }));
       } else resolve({ ws, outcome: msg.welcome ? 'welcomed' : 'other' });
@@ -233,6 +233,14 @@ const foundryUtils = {
 class ForcedDeletion {
   toJSON() {
     return { __$OPERATOR$__: 'ForcedDeletion' };
+  }
+}
+class ForcedReplacement {
+  constructor(value) {
+    this.value = value;
+  }
+  toJSON() {
+    return { __$OPERATOR$__: 'ForcedReplacement', value: this.value };
   }
 }
 const fixture = await import('./test-fixtures/modules/fake-automation/scripts/workflow.js');
@@ -497,8 +505,8 @@ try {
     Hooks.off = (name, id) => (handlers[name] = (handlers[name] ?? []).filter((entry) => entry.id !== id));
     Hooks.fire = (name, ...args) => (handlers[name] ?? []).forEach((entry) => entry.fn(...args));
     globalThis.handlers = handlers;
-    globalThis.CONST = { ALL_DOCUMENT_TYPES: ['Actor', 'Item', 'User', 'Setting'] };
-    globalThis.foundry = { utils: foundryUtils, data: { operators: { ForcedDeletion } } };
+    globalThis.CONST = { ALL_DOCUMENT_TYPES: ['Actor', 'Item', 'User', 'Setting', 'ChatMessage', 'ActiveEffect'] };
+    globalThis.foundry = { utils: foundryUtils, data: { operators: { ForcedDeletion, ForcedReplacement } } };
     game.user.id = 'gm1';
     game.users = new Collection([['gm1', { name: 'Gamemaster', isGM: true }], ['p1', { name: 'Player', isGM: false }]]);
     globalThis.testHero = { documentName: 'Actor', uuid: 'Actor.h1', name: 'Hero', parent: null, type: 'character', _source: { system: { hp: 10 } } };
@@ -566,25 +574,41 @@ try {
     Hooks.fire('preUpdateActor', vault, { flags: { mod: { '-=creds': null } } }, own, 'gm1');
     Hooks.fire('updateActor', vault, { flags: { mod: { '-=creds': null } } }, own, 'gm1');
     Hooks.fire('updateActor', vault, { flags: { mod: { list: [{ password: 'zz-in-array-zz' }], apiKeys: ['zz-key-list-zz'] } } }, {}, 'gm1');
-    // Foundry's own "token" and "key" fields (a chat speaker's token id, an Active Effect change's attribute path) are kept;
-    // the same names anywhere else, or holding something else, are withheld.
-    Hooks.fire('updateActor', vault, { flags: { mod: { speaker: { token: 'KxeEuSgHRRZueFXj', accessToken: 'zz-access-zz' }, changes: [{ key: 'system.attributes.ac.bonus', value: '2' }] } } }, {}, 'gm1');
-    Hooks.fire('updateActor', vault, { flags: { integration: { token: 'zzSecret01234567', key: 'zz-plain-key-zz' }, mod: { speaker: { token: 'zz-not-an-id-zz' }, changes: [{ key: 'zz-no-path-zz' }] } } }, {}, 'gm1');
+    // Foundry's own "token" and "key" fields are kept only in the document type and at the path where Foundry puts
+    // them (a chat message's speaker token id, an Active Effect change's attribute path), holding what Foundry puts
+    // there. The same names in a module's flags, or holding something else, are withheld.
+    const message = { documentName: 'ChatMessage', uuid: 'ChatMessage.m1', name: null, parent: null };
+    const effect = { documentName: 'ActiveEffect', uuid: 'Actor.v1.ActiveEffect.e1', name: 'Shield', parent: vault };
+    Hooks.fire('updateChatMessage', message, { speaker: { token: 'KxeEuSgHRRZueFXj', accessToken: 'zz-access-zz' } }, {}, 'gm1');
+    Hooks.fire('updateActiveEffect', effect, { system: { changes: [{ key: 'system.attributes.ac.bonus', value: '2' }] } }, {}, 'gm1');
+    Hooks.fire('updateActor', vault, { flags: { integration: { token: 'zzSecret01234567', key: 'zz-plain-key-zz' }, mod: { speaker: { token: 'KxeEuSgHRRZueFXj' }, changes: [{ key: 'system.attributes.ac.bonus' }] } } }, {}, 'gm1');
+    Hooks.fire('updateChatMessage', message, { speaker: { token: 'zz-not-an-id-zz' } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
     assert.ok(!/zz-|zzSecret/.test(JSON.stringify(nested)), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
     assert.deepEqual(nested.entries[1].changes, [{ path: 'flags.mod.list', value: [{ password: '[withheld]' }] }, { path: 'flags.mod.apiKeys', value: ['[withheld]'] }]);
     assert.deepEqual(nested.entries[2].changes, [
-      { path: 'flags.mod.speaker.token', value: 'KxeEuSgHRRZueFXj' },
-      { path: 'flags.mod.speaker.accessToken', value: '[withheld]' },
-      { path: 'flags.mod.changes', value: [{ key: 'system.attributes.ac.bonus', value: '2' }] },
+      { path: 'speaker.token', value: 'KxeEuSgHRRZueFXj' },
+      { path: 'speaker.accessToken', value: '[withheld]' },
     ]);
-    assert.deepEqual(nested.entries[3].changes, [
+    assert.deepEqual(nested.entries[3].changes, [{ path: 'system.changes', value: [{ key: 'system.attributes.ac.bonus', value: '2' }] }]);
+    assert.deepEqual(nested.entries[4].changes, [
       { path: 'flags.integration.token', value: '[withheld]' },
       { path: 'flags.integration.key', value: '[withheld]' },
       { path: 'flags.mod.speaker.token', value: '[withheld]' },
       { path: 'flags.mod.changes', value: [{ key: '[withheld]' }] },
     ]);
+    assert.deepEqual(nested.entries[5].changes, [{ path: 'speaker.token', value: '[withheld]' }]);
+
+    // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
+    const shape = { documentName: 'Actor', uuid: 'Actor.s1', name: 'Shape', parent: null, _source: { flags: { mod: { x: 1, y: 2 } } } };
+    const replace = {};
+    const sinceShape = payload(await callTool('foundry_changes')).lastSeq;
+    Hooks.fire('preUpdateActor', shape, { flags: { mod: new ForcedReplacement({ x: 9 }) } }, replace, 'gm1');
+    shape._source.flags.mod.x = 9; // in place, as Foundry does
+    delete shape._source.flags.mod.y;
+    Hooks.fire('updateActor', shape, { flags: { mod: new ForcedReplacement({ x: 9 }) } }, replace, 'gm1');
+    assert.deepEqual(payload(await callTool('foundry_changes', { since: sinceShape })).entries[0].changes, [{ path: 'flags.mod', value: { x: 9 }, before: { x: 1, y: 2 } }]);
 
     // Each update made from this tab is matched to its own earlier values, however updates to one document overlap;
     // one made elsewhere (another user, or the same account in another tab) gets none rather than someone else's.
@@ -640,16 +664,21 @@ try {
   await check('a tracker left by an older hub is replaced without a reload', async () => {
     const KEY = Symbol.for('foundry-mcp.changes');
     const current = globalThis[KEY];
-    const oldHook = Hooks.on('updateActor', () => {});
-    globalThis[KEY] = { seq: current.seq, entries: [], hookIds: [['updateActor', oldHook]] }; // no version: 0.6
+    // A 0.6 tracker: no version, no hook ids, and a hook that keeps pushing into its own buffer.
+    const old = { seq: current.seq, entries: [], before: new WeakMap() };
+    const oldHook = Hooks.on('updateActor', () => old.entries.push({ seq: ++old.seq }));
+    globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
     assert.equal(globalThis[KEY].version, 2);
-    assert.ok(!handlers.updateActor.some((hook) => hook.id === oldHook), 'its hooks are removed');
-    // The replaced tracker's own hooks were removed too, so each change is recorded once.
+    // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
-    assert.equal(page.queryChanges({ since: installed.seq }).matched, 1);
+    assert.equal(page.queryChanges({ since: installed.seq }).matched, 1, 'each change is recorded once');
+    assert.equal(old.entries.length, 0, 'the 0.6 hook, which cannot be removed, keeps nothing');
+    Hooks.off('updateActor', oldHook);
+    // A current tracker is left as it is.
+    assert.equal(page.installChanges().seq, globalThis[KEY].seq);
   });
 
   await check('evaluations that overlap never list the same change twice', async () => {
@@ -819,6 +848,22 @@ try {
     await dice({ seed: null });
     assert.equal(CONFIG.Dice.randomUniform, ownRandom);
 
+    // A module that hands ours only some dice looks, to the probe, as if it had replaced ours. A fresh wrapper goes on
+    // top, and once control is off nothing ends up calling itself.
+    await dice({ seed: 6 });
+    const ourHandler = mersenne.handler;
+    const picky = function (term, ...rest) {
+      return term.faces > 2 ? ourHandler.call(this, term, ...rest) : ownHandler.call(this, term, ...rest);
+    };
+    mersenne.handler = picky;
+    await dice({ seed: 6 });
+    assert.equal(mersenne.handler(new DiceTerm(20)), new DiceTerm(20).mapRandomFace(seeded(6)[0]));
+    await dice({ seed: null });
+    assert.equal(mersenne.handler, picky);
+    const free = mersenne.handler(new DiceTerm(20));
+    assert.ok(free >= 1 && free <= 20, 'rolls normally, without calling itself');
+    mersenne.handler = ownHandler;
+
     // At most 200 results wait in the queue; a request that would go over changes nothing.
     assert.equal((await dice({ next: Array.from({ length: 200 }, () => ({ result: 1 })) })).queued.length, 200);
     const over = await callTool('foundry_dice', { next: [{ result: 1 }] });
@@ -835,6 +880,7 @@ try {
   const merge = (target, change) => {
     for (const [key, value] of Object.entries(change)) {
       if (value instanceof ForcedDeletion) delete target[key];
+      else if (value instanceof ForcedReplacement) target[key] = structuredClone(value.value);
       else if (value && typeof value === 'object' && !Array.isArray(value)) merge((target[key] = own(target, key) && typeof target[key] === 'object' ? target[key] : {}), value);
       else target[key] = value;
     }
@@ -849,9 +895,13 @@ try {
       const copy = { _source: structuredClone(this._source), updateSource: (change) => (validate(change), merge(copy._source, change)) };
       return copy;
     },
+    // Like Foundry: resolves to the document, or to nothing when a hook refused the update.
     async update(change) {
       validate(change);
+      if (this.slow) await sleep(this.slow);
+      if (this.veto) return undefined;
       merge(this._source, change);
+      return this;
     },
   };
   const upper = { documentName: 'AmbientLight', uuid: 'Scene.s1.AmbientLight.l2', name: 'Lantern', _source: { x: 900, y: 900, elevation: 12, levels: [], hidden: false, config: { dim: 15, bright: 5, darkness: { min: 0, max: 0.5 } } } };
@@ -867,30 +917,49 @@ try {
     levels: [{ id: 'L0', name: 'Ground', _source: { elevation: { bottom: 0, top: 10 } } }, { id: 'L1', name: 'Upper', _source: { elevation: { bottom: 10, top: 20 } } }],
     lights: listOf(torch, upper), tokens: listOf(rogue), walls: listOf({}, {}, {}), regions: listOf(), tiles: listOf(),
   };
+  rogue.parent = crypt;
+  const stranger = { ...rogue, uuid: 'Scene.s2.Token.t9', name: 'Stranger', parent: { documentName: 'Scene', uuid: 'Scene.s2' } };
   const lookUp = globalThis.fromUuid;
-  globalThis.fromUuid = async (uuid) => ({ 'Scene.s1': crypt, 'Scene.s1.AmbientLight.l1': torch, 'Scene.s1.Token.t1': rogue })[uuid] ?? lookUp(uuid);
+  globalThis.fromUuid = async (uuid) => ({ 'Scene.s1': crypt, 'Scene.s1.AmbientLight.l1': torch, 'Scene.s1.Token.t1': rogue, 'Scene.s2.Token.t9': stranger })[uuid] ?? lookUp(uuid);
 
   await check('foundry_update previews a change, applies it only over the values it was shown, and foundry_undo reverses it', async () => {
     const update = async (args) => callTool('foundry_update', { uuid: torch.uuid, ...args });
-    const preview = payload(await update({ set: { 'config.dim': 30, 'flags.mod.note': 'lit' } })).result;
-    assert.deepEqual([preview.valid, preview.current, preview.proposed], [true, { 'config.dim': 20, 'flags.mod.note': null }, { 'config.dim': 30, 'flags.mod.note': 'lit' }]);
+    const change = { set: { 'config.dim': 30, 'flags.mod.note': 'lit' } };
+    const preview = payload(await update(change)).result;
+    assert.deepEqual([preview.valid, preview.current, preview.exists, preview.proposed], [true, { 'config.dim': 20, 'flags.mod.note': null }, { 'config.dim': true, 'flags.mod.note': false }, { 'config.dim': 30, 'flags.mod.note': 'lit' }]);
+    assert.equal(typeof preview.expected, 'string');
     assert.equal(torch._source.config.dim, 20, 'a preview changes nothing');
     const invalid = payload(await update({ set: { 'config.dim': 'bright' } })).result;
     assert.equal(invalid.valid, false);
     assert.match(invalid.error, /must be a number/);
-    assert.match((await update({ set: { 'config.dim': 30 }, apply: true })).content[0].text, /needs `expected`/);
+    assert.match((await update({ ...change, apply: true })).content[0].text, /needs `expected`/);
     assert.match((await update({ set: { _id: 'x' } })).content[0].text, /cannot be changed/);
-    assert.match((await update({ set: { 'config.dim': 30 }, apply: true, expected: {}, expectedWorld: 'elsewhere' })).content[0].text, /expected world "elsewhere"/);
+    assert.match((await update({ set: { 'config.dim': 1, config: {} } })).content[0].text, /config.{1,3} and .{1,3}config.dim.{1,3} overlap/);
+    assert.match((await update({ set: { 'config.dim': 1 }, remove: ['config.dim'] })).content[0].text, /both set and removed/);
+    // A fingerprint from a preview of another change, or one made up, is refused: every affected path must be covered.
+    assert.match((await update({ set: { 'config.dim': 30, hidden: true }, apply: true, expected: preview.expected })).content[0].text, /different change/);
+    assert.match((await update({ set: { 'config.dim': 5, 'flags.mod.note': 'lit' }, apply: true, expected: preview.expected })).content[0].text, /different change/, 'the same paths with another value');
+    assert.match((await update({ ...change, apply: true, expected: '[]' })).content[0].text, /different change/);
+    assert.match((await update({ ...change, apply: true, expected: preview.expected, expectedWorld: 'elsewhere' })).content[0].text, /expected world "elsewhere"/);
     assert.equal(torch._source.config.dim, 20);
 
-    const applied = payload(await update({ set: { 'config.dim': 30, 'flags.mod.note': 'lit' }, apply: true, expected: preview.current })).result;
+    const applied = payload(await update({ ...change, apply: true, expected: preview.expected })).result;
     assert.equal(applied.applied, true);
     assert.equal(typeof applied.editId, 'number');
+    assert.equal(applied.record, undefined, 'the undo record stays in the hub');
     assert.deepEqual(applied.after, { 'config.dim': 30, 'flags.mod.note': 'lit' });
     assert.equal(torch._source.flags.mod.note, 'lit');
-    // Applying again over the values from before the first apply: someone else's view of the document is out of date.
-    const stale = payload(await update({ set: { 'config.dim': 40 }, apply: true, expected: { 'config.dim': 20 } })).result;
-    assert.deepEqual([stale.applied, stale.conflicts], [false, [{ path: 'config.dim', expected: 20, now: 30 }]]);
+    // Applying again with the first preview's fingerprint: the document has changed since.
+    const stale = payload(await update({ ...change, apply: true, expected: preview.expected })).result;
+    assert.equal(stale.applied, false);
+    assert.deepEqual(stale.conflicts, [{ path: 'config.dim', expected: 20, now: 30 }, { path: 'flags.mod.note', expected: '(absent)', now: 'lit' }]);
+    // A path that holds null is not the same as one that is absent.
+    torch._source.flags.mod.empty = null;
+    const absent = payload(await update({ set: { 'flags.mod.extra': 1 } })).result;
+    torch._source.flags.mod.extra = null;
+    assert.equal(payload(await update({ set: { 'flags.mod.extra': 1 }, apply: true, expected: absent.expected })).result.applied, false);
+    delete torch._source.flags.mod.extra;
+    delete torch._source.flags.mod.empty;
 
     // Someone changes the light after the edit: undo refuses rather than overwrite them.
     torch._source.config.dim = 45;
@@ -906,6 +975,38 @@ try {
     assert.match((await callTool('foundry_undo', { editId: applied.editId })).content[0].text, /already been undone/);
     const { edits } = JSON.parse((await callTool('foundry_undo', { list: true })).content[0].text);
     assert.deepEqual(edits.map((edit) => [edit.id, edit.uuid, edit.undone, edit.paths]), [[applied.editId, torch.uuid, true, ['config.dim', 'flags.mod.note']]]);
+
+    // Setting an object merges it in; undoing puts the earlier object back whole, without the keys the edit added.
+    const merged = payload(await update({ set: { 'config.animation': { speed: 5 } } })).result;
+    const objectEdit = payload(await update({ set: { 'config.animation': { speed: 5 } }, apply: true, expected: merged.expected })).result;
+    assert.deepEqual(torch._source.config.animation, { type: 'torch', speed: 5 });
+    assert.equal(payload(await callTool('foundry_undo', { editId: objectEdit.editId })).result.undone, true);
+    assert.deepEqual(torch._source.config.animation, { type: 'torch' });
+
+    // A hook that refuses the update: nothing is recorded as applied, and nothing can be undone.
+    torch.veto = true;
+    const refusedPreview = payload(await update({ set: { 'config.dim': 5 } })).result;
+    const refused = payload(await update({ set: { 'config.dim': 5 }, apply: true, expected: refusedPreview.expected })).result;
+    torch.veto = false;
+    assert.deepEqual([refused.applied, refused.editId], [false, undefined]);
+    assert.match(refused.note, /refused/);
+
+    // Two clients apply over the same preview at once: the second waits for the first, then finds it out of date.
+    torch.slow = 300;
+    const racePreview = payload(await update({ set: { 'config.dim': 7 } })).result;
+    const [first, second] = await Promise.all([
+      update({ set: { 'config.dim': 7 }, apply: true, expected: racePreview.expected }),
+      update({ set: { 'config.dim': 7 }, apply: true, expected: racePreview.expected }),
+    ]);
+    torch.slow = 0;
+    assert.deepEqual([payload(first).result.applied, payload(second).result.applied], [true, false]);
+    assert.equal(payload(await callTool('foundry_undo', { editId: payload(first).result.editId })).result.undone, true);
+    assert.equal(torch._source.config.dim, 20);
+
+    // An edit too large to keep a record of for undo is refused up front.
+    const huge = payload(await update({ set: { 'flags.mod.blob': 'x'.repeat(310_000) } })).result;
+    assert.equal(huge.valid, false);
+    assert.match(huge.error, /too large/);
   });
 
   await check('foundry_scene explains a scene, a token\'s vision and the lights on a level in one call each', async () => {
@@ -923,6 +1024,8 @@ try {
     assert.deepEqual(lights.lights.map((light) => [light.name, light.litNow]), [['Lantern', false]], 'darker than its range: not lit now');
     const missing = await callTool('foundry_scene', { scene: 'Scene.s1', check: 'vision', token: 'Nobody' });
     assert.match(payload(missing).error.message, /No token "Nobody"/);
+    const elsewhere = await callTool('foundry_scene', { scene: 'Scene.s1', check: 'vision', token: 'Scene.s2.Token.t9' });
+    assert.match(payload(elsewhere).error.message, /on this scene/, 'a token from another scene is not mixed with this scene\'s lighting');
   });
 
   await check('foundry_screenshot returns the canvas as an image with what it shows', async () => {
@@ -1064,11 +1167,13 @@ try {
     const before = (await getLogs()).lastSeq;
     // The closing quote of the password lies beyond what a log entry keeps.
     console.error(`${'x'.repeat(1900)} {"password":"${'S'.repeat(3000)}"}`);
-    console.warn('settings', { endpoint: 'https://w.example', apiKey: 'K'.repeat(30_000), nested: { password: 'P'.repeat(40) } });
-    const entries = await until(async () => { const logs = await getLogs({ since: before }); return logs.entries.length === 2 && logs.entries; }, 'both entries');
+    console.warn('settings', { endpoint: 'https://w.example', apiKey: 'K'.repeat(30_000), nested: { password: 'P'.repeat(40) }, apiKeys: ['A1'.repeat(10)] });
+    console.warn('multi password="first line\nsecond SECRETLINE" end');
+    const entries = await until(async () => { const logs = await getLogs({ since: before }); return logs.entries.length === 3 && logs.entries; }, 'all three entries');
     assert.match(entries[0].text, /"password":"\[redacted\]$/);
     assert.ok(!/SSSS/.test(entries[0].text));
-    assert.equal(entries[1].text, 'settings {"endpoint":"https://w.example","apiKey":"[redacted]","nested":{"password":"[redacted]"}}');
+    assert.equal(entries[1].text, 'settings {"endpoint":"https://w.example","apiKey":"[redacted]","nested":{"password":"[redacted]"},"apiKeys":"[redacted]"}');
+    assert.equal(entries[2].text, 'multi password="[redacted]" end', 'a quoted value runs across a line break');
     const reply = await evalCode(`console.log(${JSON.stringify(`${'y'.repeat(7900)} password="${'Q'.repeat(3000)}"`)}); return 1;`);
     assert.match(reply.logs[0].text, /password="\[redacted\]$/);
   });
@@ -1165,6 +1270,40 @@ try {
     assert.match(logs.entries.at(-1).text, /^entry 49 /, 'the newest entries are the ones kept');
   });
 
+  await check('a page too long for one reply is shortened by whole rows, and its cursor skips nothing', async () => {
+    // 300 documents with long names: far more than fit in one reply.
+    const many = new Collection(Array.from({ length: 300 }, (_, i) => [`j${i}`, { id: `j${i}`, uuid: `JournalEntry.j${i}`, name: `entry ${String(i).padStart(3, '0')} ${'lorem '.repeat(80)}`, type: null, folder: null }]));
+    game.collections.set('JournalEntry', many);
+    try {
+      const seen = [];
+      let offset = 0;
+      for (let pages = 0; offset !== undefined && pages < 20; pages++) {
+        const reply = await callTool('foundry_documents', { type: 'JournalEntry', limit: 500, offset });
+        assert.ok(reply.content[0].text.length <= 80_000);
+        const result = payload(reply).result;
+        assert.equal(JSON.stringify(result).includes('[Truncated'), false, 'whole rows, not cut ones');
+        seen.push(...result.documents.map((doc) => doc.id));
+        offset = result.nextOffset;
+      }
+      assert.deepEqual(seen, [...many.keys()], 'every document once, in order');
+    } finally {
+      game.collections.delete('JournalEntry');
+    }
+    // Logs: the oldest are left out, and olderBefore leads back to them.
+    const before = (await getLogs()).lastSeq;
+    for (let i = 0; i < 40; i++) console.warn(`page ${String(i).padStart(2, '0')} ${'dolor '.repeat(500)}`);
+    await until(async () => (await getLogs({ since: before, limit: 1 })).matched === 40, 'forty entries');
+    const texts = [];
+    let cursor;
+    for (let pages = 0; pages < 10; pages++) {
+      const logs = await getLogs({ since: before, limit: 200, ...(cursor ? { before: cursor } : {}) });
+      texts.unshift(...logs.entries.map((entry) => entry.text.slice(0, 7)));
+      cursor = logs.olderBefore;
+      if (!cursor) break;
+    }
+    assert.deepEqual(texts, Array.from({ length: 40 }, (_, i) => `page ${String(i).padStart(2, '0')}`));
+  });
+
   await check('a flood is rate-limited in the browser and the buffer stays bounded', async () => {
     await sleep(1100); // start a fresh one-second window
     for (let i = 0; i < 300; i++) console.error(`flood ${i}`);
@@ -1207,6 +1346,8 @@ try {
   });
 
   await check('a module of another protocol version is turned away at once and does not hold the GM slot', async () => {
+    // Also on a hub with a pairing token, where it is turned away once it has proved itself.
+    assert.deepEqual(await rawSocket(TOKEN_PORT, ORIGIN, MODULE_TOKEN, { reported: { protocol: 5 } }), { outcome: 'closed', code: 4006 });
     const old = await rawSocket(BARE_PORT, ORIGIN, undefined, { reported: { protocol: 5 } });
     assert.equal(old.code, 4006);
     assert.equal(payload(await callTool('foundry_logs', { limit: 1 }, { port: BARE_PORT })).connected, false);
@@ -1220,7 +1361,7 @@ try {
     // A first message far larger than any hello ends the connection before it is parsed.
     const big = await rawSocket(BARE_PORT, ORIGIN, undefined, { firstMessage: JSON.stringify({ hello: { world: 'x'.repeat(10_000) } }) });
     assert.equal(big.outcome, 'closed');
-    assert.equal(big.code, 1006);
+    assert.ok([1006, 1009].includes(big.code), 'closed before it was read: ' + big.code);
     // Four sockets that say nothing fill the handshake slots; a fifth is refused until one goes.
     const idle = await Promise.all(Array.from({ length: 4 }, () => new Promise((resolve) => {
       const ws = new NodeWebSocket(`ws://127.0.0.1:${BARE_PORT}/foundry`, { headers: { origin: ORIGIN } });
@@ -1395,9 +1536,15 @@ try {
     assert.equal(moduleSockets.length, before + 1);
     assert.equal(moduleSockets.at(-1).closeCode, 4003, 'the module itself gave up, with the token-trouble code');
     assert.match((await callTool('foundry_status', {}, bearer(TOKEN))).content[0].text, /not connected/);
-    // Without a pairing token, and without being told that is intended, the module does not connect at all.
+    // Without a pairing token, and without being told that is intended, the module does not connect at all. A token
+    // left in the 0.6 "Hub token" setting (the client token, then) is not used for pairing.
     const sockets = moduleSockets.length;
-    await startModule(`ws://127.0.0.1:${PORT}/foundry`, '', undefined, { allowNoToken: false });
+    settings['foundry-mcp.token'] = TOKEN;
+    try {
+      await startModule(`ws://127.0.0.1:${TOKEN_PORT}/foundry`, '', undefined, { allowNoToken: false });
+    } finally {
+      settings['foundry-mcp.token'] = '';
+    }
     assert.equal(moduleSockets.length, sockets);
   });
 
@@ -1556,7 +1703,7 @@ try {
       const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
       const run = spawnSync(process.execPath, ['index.js'], {
         cwd: import.meta.dirname,
-        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: '30193', ...env },
+        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: '0', ...env },
         encoding: 'utf8',
         timeout: 5000,
       });
@@ -1597,12 +1744,12 @@ try {
   await check('a config file that cannot be saved or made private stops the hub', async () => {
     // What happens when the file or its folder belongs to another account, simulated by a preload.
     const base = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('FOUNDRY_MCP_')));
-    const start = (name, content, fault, port = '30193') => {
+    const start = (name, content, fault, port = '0', extra = {}) => {
       const file = join(tmp, name);
       writeFileSync(file, content);
       return spawnSync(process.execPath, ['--import', new URL('./test-fixtures/fault-fs.mjs', import.meta.url).href, 'index.js'], {
         cwd: import.meta.dirname,
-        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: port, FAULT_FS: fault },
+        env: { ...base, FOUNDRY_MCP_CONFIG: file, FOUNDRY_MCP_PORT: port, FAULT_FS: fault, ...extra },
         encoding: 'utf8',
         timeout: 5000,
       });
@@ -1614,6 +1761,10 @@ try {
     assert.deepEqual(readdirSync(tmp).filter((name) => name.endsWith('.tmp') || name.endsWith('.lock')), []);
     // Windows has no file modes, so the hub does not try to change them there.
     if (process.platform !== 'win32') {
+      // A pairing token in the file needs protecting even when the client token comes from the environment.
+      const mixed = start('mixed.json', '{ "moduleToken": "abcdefgh12345678ijkl" }', 'chmod', '0', { FOUNDRY_MCP_TOKEN: 'zyxwvuts98765432abcd' });
+      assert.equal(mixed.status, 1);
+      assert.match(mixed.stderr, /could not be made private/);
       const exposed = start('exposed.json', '{ "token": "abcdefgh12345678ijkl" }', 'chmod');
       assert.equal(exposed.status, 1);
       assert.match(exposed.stderr, /holds the hub token but could not be made private/);
@@ -1640,6 +1791,7 @@ try {
     const ports = await Promise.all([startHub({ FOUNDRY_MCP_CONFIG: shared }), startHub({ FOUNDRY_MCP_CONFIG: shared })]);
     const saved = JSON.parse(readFileSync(shared, 'utf8'));
     for (const port of ports) {
+      assert.equal((await rawSocket(port, ORIGIN, saved.moduleToken, { hubToken: saved.moduleToken })).outcome, 'welcomed', `hub on ${port} uses the saved pairing token`);
       assert.equal((await mcp('tools/list', {}, { port, headers: { authorization: `Bearer ${saved.token}` } })).result.tools.length, ALL_TOOLS.length, `hub on ${port} uses the saved token`);
     }
   });

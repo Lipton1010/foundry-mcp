@@ -109,7 +109,9 @@ for (const key of ['token', 'moduleToken']) {
 if (config.token && config.token === config.moduleToken) {
   fail('"moduleToken" must differ from "token": they guard different things. Set "moduleToken" to null to have one generated.');
 }
-if ((config.token || config.moduleToken) && env('TOKEN') === undefined && env('MODULE_TOKEN') === undefined && existsSync(configFile) && process.platform !== 'win32') {
+// Checked against what the file itself holds: a secret in the file needs protecting even when the other comes from the environment.
+const fileHoldsSecret = ['token', 'moduleToken'].some((key) => typeof fileConfig[key] === 'string' && fileConfig[key].trim() !== '');
+if (fileHoldsSecret && existsSync(configFile) && process.platform !== 'win32') {
   // A token typed into an existing file may be sitting in one that other accounts can read.
   // (Windows has no file modes; the file inherits its folder's permissions there.)
   try {
@@ -133,11 +135,16 @@ function ensureSecrets() {
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') fail(`Cannot save new secrets to ${configFile}: ${error.message}`);
-      let stale = tries >= 100;
+      let age = 0;
       try {
-        stale ||= Date.now() - statSync(lock).mtimeMs > 10_000; // left behind by a hub that crashed
-      } catch {}
-      if (stale) rmSync(lock, { force: true });
+        age = Date.now() - statSync(lock).mtimeMs;
+      } catch {
+        continue; // removed in the meantime: try again
+      }
+      // A lock this old was left by a hub that crashed while saving. A younger one belongs to a hub still at work,
+      // and is never taken from it: after waiting, this hub stops instead.
+      if (age > 30_000) rmSync(lock, { force: true });
+      else if (tries >= 200) fail(`Another hub is saving new secrets to ${configFile}. Start this one again in a moment, or delete ${lock} if no other hub is starting.`);
       else pause(50);
     }
   }
@@ -180,6 +187,7 @@ const MAX_PENDING = 16; // evaluations in flight at once, across all clients
 const HANDSHAKE_MS = 10_000;
 const MAX_HANDSHAKES = 4; // connections still proving themselves
 const MAX_HANDSHAKE_BYTES = 4096; // a hello or a proof is far smaller
+const MAX_SOCKET_BYTES = 16 * 1024 * 1024; // one message from a connected tab
 
 const worldAllowed = (world) => config.worlds.includes('*') || config.worlds.includes(world);
 const digest = (text) => createHash('sha256').update(String(text ?? '')).digest();
@@ -373,11 +381,22 @@ function callFoundry(code, { timeoutMs = 30_000, signal, source = 'tool', expect
   });
 }
 
+// ws accepts frames up to maxPayload on every socket. Until a socket has proved itself it may only send small
+// messages, so its limit is lowered while it does. (The receiver's limit is internal to ws; if a later version
+// moves it, the check on each message below still applies, after ws has received the message.)
+const setReceiveLimit = (ws, bytes) => {
+  if (typeof ws._receiver?._maxPayload === 'number') ws._receiver._maxPayload = bytes;
+};
+
 function onFoundryConnection(ws) {
+  // Without a listener, a malformed or oversized frame would take the whole hub down; this comes before anything
+  // that can close the socket, since ws can still report an error while it closes.
+  ws.on('error', () => ws.terminate());
   // Connections that have not proved themselves are few and small, so a noisy local program
   // cannot tie up the hub's memory while the GM is using it.
   if (handshaking >= MAX_HANDSHAKES) return ws.close(4005, 'Too many connections are starting at once');
   handshaking += 1;
+  setReceiveLimit(ws, MAX_HANDSHAKE_BYTES);
   let counted = true;
   const settled = () => {
     if (counted) handshaking -= 1;
@@ -387,8 +406,6 @@ function onFoundryConnection(ws) {
   ws.isAlive = true;
   ws.sent = 0;
   ws.on('pong', () => (ws.isAlive = true));
-  // Without a listener, a malformed or oversized frame would take the whole hub down.
-  ws.on('error', () => ws.terminate());
   const handshake = setTimeout(() => foundry?.ws !== ws && ws.close(4000, 'Handshake not completed in time'), HANDSHAKE_MS);
   ws.on('message', (data) => {
     // Anything from the socket is untrusted until proven otherwise, and even
@@ -472,6 +489,7 @@ function register(ws) {
   if (foundry) return ws.close(4001, 'Another GM tab is already connected');
   foundry = { ws, hello: ws.hello };
   ws.settled();
+  setReceiveLimit(ws, MAX_SOCKET_BYTES); // results can be large
   refusedWorldAt = 0;
   const pageId = `${ws.hello.world}\n${ws.hello.session}`;
   const samePage = lastPage === pageId;
@@ -542,13 +560,32 @@ const asText = (value, keep = {}) => {
 };
 
 // Log replies lose their oldest entries instead: the newest are the ones a caller is after.
-const logsText = (result) => {
-  for (let entries = result.entries; ; entries = entries.slice(Math.ceil(entries.length / 4))) {
-    const omitted = result.entries.length - entries.length;
-    const text = JSON.stringify({ ...result, entries, ...(omitted ? { entriesOmitted: omitted } : {}) }, null, 1);
-    if (text.length <= MAX_RESULT_CHARS || entries.length <= 1) return text;
-  }
-};
+// A page of rows that does not fit in one reply is shortened by whole rows, and its cursor is set from the rows
+// that were kept, so following it skips nothing. Pages that go forward (documents, settings) lose rows from their
+// end; pages of the newest entries (logs, changes) lose their oldest, and `olderBefore` leads back to them.
+const ROOM = MAX_RESULT_CHARS - 4000; // left for the fields around the result
+const shorter = (rows, end) => (rows.length <= 1 ? rows : end ? rows.slice(0, Math.floor(rows.length * 3 / 4) || 1) : rows.slice(Math.ceil(rows.length / 4)));
+function fitForward(result, field, offset = 0) {
+  if (!Array.isArray(result?.[field])) return result;
+  const size = (rows) => JSON.stringify({ ...result, [field]: rows }, null, 1).length;
+  let rows = result[field];
+  while (rows.length > 1 && size(rows) > ROOM) rows = shorter(rows, true);
+  if (rows.length === result[field].length) return result;
+  const { nextOffset, ...rest } = result;
+  const next = offset + rows.length;
+  return { ...rest, [field]: rows, ...(next < result.total ? { nextOffset: next } : {}), shortened: `Only ${rows.length} rows fit in one reply; pass nextOffset as offset for the rest.` };
+}
+function fitBackward(result, field) {
+  if (!Array.isArray(result?.[field])) return result;
+  const size = (rows) => JSON.stringify({ ...result, [field]: rows }, null, 1).length;
+  let rows = result[field];
+  while (rows.length > 1 && size(rows) > ROOM) rows = shorter(rows, false);
+  if (rows.length === result[field].length) return result;
+  return { ...result, [field]: rows, olderBefore: rows[0].seq, entriesOmitted: result[field].length - rows.length };
+}
+
+// Log replies lose their oldest entries: the newest are the ones a caller is after.
+const logsText = (result) => asText(fitBackward(result, 'entries'));
 
 const requestScope = new AsyncLocalStorage(); // the AbortSignal of the HTTP request being served
 const textReply = (text, isError = false) => ({ content: [{ type: 'text', text }], ...(isError ? { isError } : {}) });
@@ -589,12 +626,26 @@ function tracking(connection) {
   return connection.tracking;
 }
 
-// Queries the tracker; installs it first if this page does not have it yet. Returns { found } or { error }.
-async function queryChanges(connection, args, timeoutMs = 10_000) {
+// Waits for a promise, but not past the deadline. Resolves to undefined when time runs out.
+async function until(promise, deadline) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((resolve) => (timer = setTimeout(resolve, Math.max(0, deadline - Date.now()))))]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Queries the tracker; installs it first if this page does not have it yet. Every step stops at the deadline.
+// Returns { found } or { error }.
+async function queryChanges(connection, args, deadline) {
+  const tooLate = { error: 'The time limit was used up before the changes could be read.' };
   for (let attempt = 0; attempt < 2; attempt++) {
-    await tracking(connection);
+    await until(tracking(connection), deadline);
     if (connection.untracked) return { error: connection.untracked };
-    if (connection.seenSeq === undefined) return { error: 'Change tracking could not be set up in time.' };
+    if (connection.seenSeq === undefined) return { error: 'Change tracking was still being set up.' };
+    const timeoutMs = Math.min(10_000, deadline - Date.now());
+    if (timeoutMs < 250) return tooLate;
     let reply;
     try {
       reply = await callFoundry(pageCall(page.queryChanges, args), { timeoutMs, signal: requestScope.getStore() });
@@ -622,9 +673,7 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
     checkExpected(expect);
     if (connection) {
       // Waiting for the installation counts against this call's time; if it is slow, the code runs anyway.
-      let timer;
-      await Promise.race([tracking(connection), new Promise((resolve) => (timer = setTimeout(resolve, Math.max(0, Math.min(10_000, left() - 1000)))))]);
-      clearTimeout(timer);
+      await until(tracking(connection), Math.min(Date.now() + 10_000, deadline - 1000));
     }
     const startTime = Date.now() - CLOCK_SLACK_MS;
     const tracked = connection && connection.seenSeq !== undefined && !connection.untracked;
@@ -636,7 +685,7 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
     const keep = { logSeq, session: connection?.hello.session };
     if (tracked) {
       keep.changesSeq = seqAtStart;
-      const { found, error } = left() >= 250 ? await queryChanges(connection, { since: seqAtStart, sinceTime: startTime, limit: 100 }, Math.min(10_000, left())) : { error: 'The time limit was used up before the changes could be read.' };
+      const { found, error } = await queryChanges(connection, { since: seqAtStart, sinceTime: startTime, limit: 100 }, deadline);
       if (found) {
         connection.seenSeq = Math.max(connection.seenSeq ?? 0, found.lastSeq);
         keep.changesSeq = found.cursor;
@@ -654,11 +703,24 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
       }
     } else if (connection?.untracked) {
       changed = { changesUnavailable: connection.untracked };
+    } else if (connection) {
+      changed = { changesUnavailable: 'Change tracking was still being set up when the code ran, so its changes could not be listed. foundry_changes lists every change seen since tracking started.' };
     }
     return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };
   } catch (error) {
     return textReply(error.message, true);
   }
+}
+
+// Applying and undoing are queued per document, so two clients of this hub cannot both pass the same check
+// before either has written. (A change made in another tab or by another user is not part of this queue.)
+const queues = new Map();
+function oneAtATime(uuid, task) {
+  const run = (queues.get(uuid) ?? Promise.resolve()).then(task, task);
+  const tail = run.catch(() => {});
+  queues.set(uuid, tail);
+  tail.then(() => queues.get(uuid) === tail && queues.delete(uuid));
+  return run;
 }
 
 // Edits made with foundry_update, so they can be undone. Held by the hub, not the page: a reload does not lose them.
@@ -725,7 +787,7 @@ function buildMcpServer() {
           offset: z.number().int().min(0).optional().describe('Skip this many matches first, for paging. Default 0.'),
         }),
       },
-      (args) => runPage(page.listDocuments, args)
+      (args) => runPage(page.listDocuments, args, { decorate: (result) => fitForward(result, 'documents', args.offset) })
     );
 
     server.registerTool(
@@ -764,7 +826,7 @@ function buildMcpServer() {
           offset: z.number().int().min(0).optional().describe('Skip this many matches first, for paging. Default 0.'),
         }),
       },
-      (args) => runPage(page.readSettings, args)
+      (args) => runPage(page.readSettings, args, { decorate: (result) => fitForward(result, 'settings', args.offset) })
     );
 
     server.registerTool(
@@ -846,15 +908,18 @@ function buildMcpServer() {
       {
         description:
           'Change one document safely, by dot paths. Without `apply` it is a preview: the change is validated on a copy and the ' +
-          'reply has each path\'s `current` and `proposed` value, or `valid: false` and the error. With `apply: true` it is made; ' +
-          'pass the preview\'s `current` values as `expected`, and if the document has changed since, nothing is applied and the ' +
-          'conflicts are listed. An applied change returns `editId` for foundry_undo. Settings are changed with foundry_eval.',
+          'reply has each path\'s `current` value, whether it `exists`, its `proposed` value, and `expected`; or `valid: false` ' +
+          'and the error. To make the change, call again with the same `set` and `remove`, `apply: true`, and the preview\'s ' +
+          '`expected`: if any of those paths has changed since the preview, nothing is applied and the conflicts are listed. ' +
+          'Setting an object merges it into the one there. An applied change returns `editId` for foundry_undo. Changes made ' +
+          'through this hub to one document are applied one at a time; a change made elsewhere at the same moment is not ' +
+          'locked out. Settings are changed with foundry_eval.',
         inputSchema: z.object({
           uuid: z.string().min(1).max(500).describe('The document UUID, for example "Scene.abc.AmbientLight.def" or "Actor.abc".'),
           set: z.record(z.string().min(1).max(300), jsonValue).optional().describe('Dot path to new value, for example { "config.dim": 30, "hidden": false }.'),
           remove: z.array(z.string().min(1).max(300)).max(100).optional().describe('Dot paths to delete, for example ["flags.my-module.note"].'),
           apply: z.boolean().optional().describe('Make the change. Default false: only preview it.'),
-          expected: z.record(z.string().min(1).max(300), jsonValue).optional().describe('Values the document must still have for the change to be applied (null for absent).'),
+          expected: z.string().max(400_000).optional().describe('With apply: the `expected` text a preview of this same change returned.'),
           ...expectFields,
         }),
       },
@@ -862,22 +927,25 @@ function buildMcpServer() {
         const paths = Object.keys(args.set ?? {}).length + (args.remove?.length ?? 0);
         if (paths > 100) return textReply('At most 100 paths can be changed in one call.', true);
         if (args.apply && args.expected === undefined) {
-          return textReply('Applying needs `expected`: preview first and pass its `current` values, so a change made in between is not overwritten.', true);
+          return textReply('Applying needs `expected`: preview the change first and pass the `expected` it returns, so a change made in between is not overwritten.', true);
         }
         const world = foundry?.hello.world;
         const session = foundry?.hello.session;
         const { expectedWorld, expectedSession, ...rest } = args;
-        return runPage(page.updateDocument, rest, {
-          expect: expectOf(args),
-          decorate: (result) => {
-            if (!result?.applied) return { ...result, world, session };
-            const { before, existed, after, exists, roots } = result;
-            const edit = { id: ++editSeq, world, uuid: result.uuid, name: result.name, time: new Date().toISOString(), before, existed, after, exists, roots, undone: false };
-            edits.push(edit);
-            if (edits.length > MAX_EDITS) edits.shift();
-            return { ...result, world, session, editId: edit.id };
-          },
-        });
+        const run = () =>
+          runPage(page.updateDocument, rest, {
+            expect: expectOf(args),
+            decorate: (result) => {
+              const { record, ...shown } = result ?? {};
+              if (!shown.applied) return { ...shown, world, session };
+              if (!record) return { ...shown, world, session };
+              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), ...JSON.parse(record), undone: false };
+              edits.push(edit);
+              if (edits.length > MAX_EDITS) edits.shift();
+              return { ...shown, world, session, editId: edit.id };
+            },
+          });
+        return args.apply ? oneAtATime(args.uuid, run) : run();
       }
     );
 
@@ -885,10 +953,11 @@ function buildMcpServer() {
       'foundry_undo',
       {
         description:
-          'Undo a change made with foundry_update: put back each path\'s earlier value (or remove a path that did not exist). ' +
-          'Only if those paths still hold what the update left there; if anyone has changed them since, nothing is undone and the ' +
-          'conflicts are listed, so a later change is never overwritten. Without `editId`, undoes the most recent edit in the ' +
-          'connected world that is not undone yet. `list: true` lists the edits this hub remembers (the last 100, until it restarts).',
+          'Undo a change made with foundry_update: put back each path\'s earlier value (an object whole), or remove a path, and ' +
+          'any object holding it, that the update created. Only if those paths still hold what the update left there; if anyone ' +
+          'has changed them since, nothing is undone and the conflicts are listed, so a later change is never overwritten. ' +
+          'Without `editId`, undoes the most recent edit in the connected world that is not undone yet. `list: true` lists the ' +
+          'edits this hub remembers (the last 100, until it restarts).',
         inputSchema: z.object({
           editId: z.number().int().min(1).optional().describe('The editId foundry_update returned. Default: the most recent.'),
           list: z.boolean().optional().describe('List the remembered edits instead of undoing one.'),
@@ -902,15 +971,18 @@ function buildMcpServer() {
         }
         const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && !entry.undone);
         if (!edit) return textReply(args.editId !== undefined ? `No edit ${args.editId} is remembered.` : 'There is no edit to undo in this world.', true);
-        if (edit.undone) return textReply(`Edit ${edit.id} has already been undone.`, true);
         if (edit.world !== world) return textReply(`Edit ${edit.id} was made in world "${edit.world}", but "${world ?? 'nothing'}" is connected now.`, true);
-        const { before, existed, after, exists, roots, uuid } = edit;
-        return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots }, {
-          expect: expectOf(args),
-          decorate: (result) => {
-            if (result?.undone) edit.undone = true;
-            return { editId: edit.id, ...result };
-          },
+        return oneAtATime(edit.uuid, () => {
+          // Checked inside the queue: another undo of the same edit may have just finished.
+          if (edit.undone) return textReply(`Edit ${edit.id} has already been undone.`, true);
+          const { before, existed, after, exists, roots, uuid } = edit;
+          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots }, {
+            expect: expectOf(args),
+            decorate: (result) => {
+              if (result?.undone) edit.undone = true;
+              return { editId: edit.id, ...result };
+            },
+          });
         });
       }
     );
@@ -974,10 +1046,10 @@ function buildMcpServer() {
           delete query.since;
           delete query.before;
         }
-        const { found, error } = await queryChanges(connection, query);
+        const { found, error } = await queryChanges(connection, query, Date.now() + 20_000);
         if (!found) return textReply(error, true);
         const note = reloaded ? { pageReloaded: 'The page has reloaded since that cursor, so `since` was ignored: these are the changes seen since the new page loaded.' } : {};
-        return textReply(asText({ ...note, session: connection.hello.session, ...found }));
+        return textReply(asText({ ...note, session: connection.hello.session, ...fitBackward(found, 'entries') }));
       }
     );
   }
@@ -1061,7 +1133,7 @@ http.on('error', startupFailed);
 const sockets = new WebSocketServer({
   server: http,
   path: '/foundry',
-  maxPayload: 16 * 1024 * 1024,
+  maxPayload: MAX_SOCKET_BYTES,
   // Origin is the control here. Host is not checked as it is for /mcp: a page that reached this
   // port by DNS rebinding still sends its own origin, which is not on the list.
   verifyClient: ({ origin }) => config.origins.includes(origin),

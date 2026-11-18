@@ -87,7 +87,9 @@ Three read-only tools for plain lookups. They run no code from the client, so th
 - `foundry_documents` lists. With no arguments it returns the world's collections with their sizes and its
   compendium packs. With `type` (`"Actor"`, `"JournalEntry"`, ...) it lists that collection, and with `pack` the
   entries of that compendium. Optional `name` (text the name must contain), `limit` (default 50, at most 500) and
-  `offset`. When more match than fit, the reply has `nextOffset`; pass it as `offset` for the next page.
+  `offset`. When more match than fit, the reply has `nextOffset`; pass it as `offset` for the next page. A page too
+  long for one reply is shortened by whole rows (`shortened` says so), and `nextOffset` continues after the last one
+  sent.
   ```json
   // arguments: { "type": "Actor", "name": "tyrant" }
   { "result": { "type": "Actor", "total": 1, "documents": [
@@ -118,7 +120,7 @@ by `scene` (a UUID). Listed when `allowRead` is on.
 - `check: "overview"` (the default): grid, token vision, fog, lighting (darkness, global light and whether it is lit
   at the current darkness), the scene's levels with how many tokens and lights each has, and counts of walls,
   regions and tiles.
-- `check: "vision"` with `token` (a UUID, or a token's name on the scene): the token's sight and detection modes,
+- `check: "vision"` with `token` (a UUID or a name, of a token on that scene): the token's sight and detection modes,
   the actor's senses, its level, which players own it, the lights that reach it and whether they are lit, and
   plain-language `notes` such as "Sight range is 0 and global light is not lit" or "The actor has darkvision (60)
   but the token's vision mode is basic".
@@ -185,19 +187,30 @@ Listed when `allowEval` is on.
 ```json
 // arguments: { "uuid": "Scene.dWgZ...AmbientLight.QHmp...", "set": { "config.dim": 30, "flags.my-module.note": "lit" } }
 { "result": { "valid": true, "current": { "config.dim": 46.46, "flags.my-module.note": null },
-  "proposed": { "config.dim": 30, "flags.my-module.note": "lit" }, "world": "my-test-world", "session": "g8qm10yg" } }
+  "exists": { "config.dim": true, "flags.my-module.note": false },
+  "proposed": { "config.dim": 30, "flags.my-module.note": "lit" },
+  "expected": "{\"change\":[[\"config.dim\",30],...],\"state\":[[\"config.dim\",true,46.46],...]}",
+  "world": "my-test-world", "session": "g8qm10yg" } }
 ```
 
 - Without `apply`, it previews: the change (`set`, dot path to value, and `remove`, a list of dot paths) is
   validated on a copy of the document and nothing is saved. An invalid change comes back as `valid: false` with
-  Foundry's validation message.
-- With `apply: true` it saves the change, but only if the document still holds `expected`, which is normally the
-  preview's `current`. If anyone has changed one of those paths since, nothing is saved and `conflicts` lists them.
-  An applied change returns `editId`.
-- `foundry_undo` puts back each path's earlier value, and removes paths, and the objects holding them, that the edit
-  created. It does so only if the document still holds what the edit left there; otherwise it changes nothing and
-  lists the conflicts, so a later change by anyone is never overwritten. Without `editId` it undoes the most recent
-  edit in the connected world; `list: true` lists the edits the hub remembers (the last 100, until it restarts).
+  Foundry's validation message. Paths that overlap (`flags.a` and `flags.a.b`), a path both set and removed, and a
+  change too large to keep a record of for undo are refused.
+- To apply, call again with the same `set` and `remove`, `apply: true`, and the preview's `expected`. That records
+  the exact change previewed and every affected path's value and whether it exists (an absent path is not the same
+  as one holding `null`). If any of them has changed since the preview, nothing is saved and `conflicts` lists them.
+  An `expected` from a preview of a different change, including the same paths with other values, is refused. An applied change returns `editId`; if a module hook refuses the update, the reply
+  says so and nothing is recorded.
+- Setting an object merges it into the object there, as Foundry's own updates do.
+- Applying and undoing through this hub happen one at a time per document, so two clients cannot both pass the same
+  check. A change made in another tab, by another user or through `foundry_eval` at the same moment is not part of
+  that queue; the check just before saving still catches one that has already landed.
+- `foundry_undo` puts back each path's earlier value (an object whole, without keys the edit added), and removes
+  paths, and the objects holding them, that the edit created. It does so only if the document still holds what the
+  edit left there; otherwise it changes nothing and lists the conflicts, so a later change by anyone is never
+  overwritten. Without `editId` it undoes the most recent edit in the connected world; `list: true` lists the edits
+  the hub remembers (the last 100, until it restarts).
 - Settings are changed with `foundry_eval` (`game.settings.set`).
 
 ### `foundry_changes`
@@ -208,15 +221,18 @@ Lists document changes the GM's tab has seen, from any user or module, newest la
 `allowRead` is on.
 
 - An update lists each changed path with its new value (the first 100 paths; `morePaths` says when there were more).
-  `before` is there for updates made from the GM's tab: each is matched to its own earlier values by an option that
-  travels with the update, so updates to one document that overlap each get the right ones. Foundry tells other
+  `before` is there for updates made from the GM's tab: each is matched to its own earlier values, copied when the
+  update was sent, by an option that travels with the update, so updates to one document that overlap each get their
+  own. (Two updates sent before either lands both report the value from before both.) Foundry tells other
   clients, and other tabs, only the result, so their updates have no `before`. A field removed with Foundry's
   deletion operator reads `"deleted": true`.
 - A deletion carries the deleted document's data, if it is under 20,000 characters, so it can be created again.
 - Tracking starts with the first call to `foundry_eval` or `foundry_changes` and lasts until the page reloads. A
-  tracker left in the page by an older hub is replaced. The newest 500 changes are kept, fewer when they are large
-  (about 2 MB in all), in the browser's memory only; `evicted` counts the rest, and `evictedSince` those newer than
-  `since`. Long text values are cut.
+  tracker left in the page by an older hub is replaced; the 0.6 tracker's hooks cannot be removed until the page
+  reloads, but from then on they keep nothing. The newest 500 changes are kept, fewer when they are large (about
+  2 MB in all), in the browser's memory only; `evicted` counts the rest, and `evictedSince` those newer than `since`.
+  Long text values are cut. A reply too long to send whole leaves out the oldest entries, and `olderBefore` leads
+  back to them.
 - A cursor is only meaningful on the page it came from. If you pass `session` and the page has reloaded since,
   `since` is ignored, every change on the new page is listed, and `pageReloaded` says so.
 - A text value under a credential-like name (password, secret, api key, a name ending in `token` or `key`, and so
@@ -328,7 +344,7 @@ example.
 | `origins` | `FOUNDRY_MCP_ORIGINS` | `http://localhost:30000`, `http://127.0.0.1:30000` | Page origins allowed to connect as Foundry: an `http` or `https` scheme, host and port only, matching the address in the GM's browser. Capital letters and a trailing `/` are tidied up; a path, `*`, `null` or any other scheme stops the hub with a message. |
 | `token` | `FOUNDRY_MCP_TOKEN` (hub only; do not reuse this name for clients) | generated on first start | Client secret. MCP clients send it as `Authorization: Bearer <token>`. Set it to `""` to let any program on this computer call the hub (not recommended). A blank value, or one containing a line break, stops the hub with a message. |
 | `moduleToken` | `FOUNDRY_MCP_MODULE_TOKEN` | generated on first start | Pairing secret, pasted into the module. The hub and the module each prove they know it, and the hub signs every command with a key derived from it. It must differ from `token`, so a client token that reaches the wrong program cannot be used to pose as the hub to your GM tab. `""` turns pairing off; the module then connects only if its **Connect without a pairing token** setting is on. |
-| `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes the tools that change the world (`foundry_eval`, `foundry_update`, `foundry_undo`, `foundry_dice`): clients can still read status, logs, documents, settings, scenes and changes. |
+| `allowEval` | `FOUNDRY_MCP_ALLOW_EVAL` | `true` | `false` removes the tools that change the world (`foundry_eval`, `foundry_update`, `foundry_undo`, `foundry_dice`): clients can still read status, logs, documents, settings, scenes, screenshots and changes. |
 | `allowRead` | `FOUNDRY_MCP_ALLOW_READ` | `true` | `false` removes `foundry_documents`, `foundry_document`, `foundry_settings`, `foundry_scene`, `foundry_screenshot` and `foundry_changes`. With `allowEval` also `false`, clients can read status and logs only. |
 | `logLimit` | `FOUNDRY_MCP_LOG_LIMIT` | `1000` | Log entries kept in memory, from 1 to 10000. |
 
@@ -337,7 +353,8 @@ addresses are accepted), **Hub pairing token**, and **Connect without a pairing 
 `moduleToken` is `""`).
 
 **Upgrading from 0.6.** The module used to share the client `token`. Start the 0.7 hub once: it adds `moduleToken`
-to `config.json`. Paste that into **Hub pairing token** and reload the world. Clients keep using `token`. If you ran
+to `config.json`. Paste that into **Hub pairing token** (a new setting; the old **Hub token** value is not used) and
+reload the world. Until then the module does not connect. Clients keep using `token`. If you ran
 without a token, the hub still generates `moduleToken`; to run without pairing as well, set `"moduleToken": ""` and
 turn on **Connect without a pairing token**.
 
@@ -429,7 +446,7 @@ Behaviour worth knowing:
 | "Port 30123 is already in use" | Another hub is running. Stop it, or change `port`. |
 | A result contains `[Truncated ...]` and a `truncated` field | Return fewer fields; replies are capped at 80,000 characters. A cut reply is still valid JSON. |
 | `foundry_logs` returns `entriesOmitted` | The matches did not fit in one reply, so the oldest were left out. Lower `limit` or raise `since`. |
-| `foundry_update` returns `conflicts` | The document changed after the preview. Preview again and apply with the new `current`. |
+| `foundry_update` returns `conflicts` | The document changed after the preview. Preview again and apply with the new `expected`. |
 | `foundry_undo` returns `conflicts` | Someone changed those paths after the edit, so undoing would overwrite them. Decide by hand, or set them back and undo. |
 
 ## Tested versions
@@ -480,14 +497,19 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   `ForcedDeletion` reported as deleted; a seed cleared while a result was queued and set again seeding Foundry's
   rolls again, and turning control off restoring all three of Foundry's functions; a `foundry_changes` cursor from
   an earlier page reported as such; document paging; and redaction of a password whose closing quote was cut off
-  and of an API key inside a logged object.
+  and of an API key inside a logged object. After the review fixes, the same day: pairing through the new **Hub
+  pairing token** setting after a real reload; a fingerprint for one value refused for another; overlapping paths
+  refused; an edit to a light's range, animation object and a new flag, then undo restoring all three exactly; a
+  module hook vetoing an update reported as not applied, with nothing to undo; a token from another scene refused;
+  all 49 scenes paged five at a time, each once; and a queued 20 then seed 42 matching Foundry's own
+  `MersenneTwister`, with none of the three wrappers left in place afterwards.
 - The code of the three read-only tools, on 15 November 2026, sent through `foundry_eval` rather than by calling
   the tools: the collection and compendium overview (14 collections, 85 packs), a name search, a compendium
   listing, an actor read whole and by field, an embedded item, a compendium document, both error messages, and
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 73 checks)
+### Tested in simulation only (`npm test`, 74 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -508,7 +530,14 @@ three overlapping updates and for updates from another tab, a 400-field update a
 `changesEvicted` alongside `changesOmitted`, an older tracker replaced in place, dice wrappers added before, after
 and instead of ours and the 200-result queue cap, `foundry_update` and `foundry_undo` with their conflicts,
 `foundry_scene`'s three checks, `foundry_screenshot`, warnings from the hub's own tools not marked `fromEval`, and
-redaction of cut-off quoted values and of logged objects.
+redaction of cut-off quoted values and of logged objects. After the 0.7 review: a 0.6 pairing value left in the
+old setting not used, the protocol check on a hub with a pairing token, the size limit on unproven connections
+applied while a message arrives, earlier values copied before Foundry changes them in place, `token` and `key`
+kept only on chat messages and Active Effects, the 0.6 tracker's hooks keeping nothing, a module hook that hands
+ours only some dice (no wrapper calls itself), `foundry_update`'s fingerprint (every path, absent versus null, a
+fingerprint from another change), overlapping paths, a refused update, an object put back whole, two clients
+applying at once, an edit too large to undo, a token from another scene, and pages shortened to fit a reply
+without skipping rows.
 
 ### Not tested
 

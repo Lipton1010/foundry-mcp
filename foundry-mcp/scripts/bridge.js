@@ -25,7 +25,8 @@ Hooks.once('init', () => {
     type: String,
     default: 'ws://127.0.0.1:30123/foundry',
   });
-  game.settings.register(MODULE_ID, 'token', {
+  // A new setting, not the 0.6 "token" one: that held the client token, which must not be used for pairing.
+  game.settings.register(MODULE_ID, 'pairingToken', {
     name: 'Hub pairing token',
     hint: 'The "moduleToken" value from the hub\'s config.json. It lets this tab and the hub prove themselves to each other. Stored in this browser. Reload after changing.',
     scope: 'client',
@@ -64,7 +65,7 @@ function connect() {
     console.log(`${MODULE_ID} | not connecting: the hub address must be a ws:// address on 127.0.0.1 or localhost`);
     return;
   }
-  const token = game.settings.get(MODULE_ID, 'token').trim();
+  const token = game.settings.get(MODULE_ID, 'pairingToken').trim();
   hubToken = token;
   if (!token && !game.settings.get(MODULE_ID, 'allowNoToken')) {
     console.log(`${MODULE_ID} | not connecting: paste the hub's "moduleToken" into the "Hub pairing token" setting, then reload`);
@@ -348,8 +349,9 @@ function redact(text, opaque = true) {
     // key=value, key: value and "key":"value". The key is one bounded word ending in a credential-like
     // word and is judged by name afterwards; a quoted value is taken up to its own closing quote,
     // escapes included.
-    // A quoted value whose closing quote was cut off with the end of a long line runs to the end of the text.
-    .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\\n]|\\.)*(?:"|\\?$)|'(?:[^'\\\n]|\\.)*(?:'|\\?$)|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
+    // A quoted value runs to its closing quote, across line breaks; one whose closing quote was cut off with the end
+    // of a long line runs to the end of the text.
+    .replace(/([\w-]{0,74}(?:password|passwd|key|token|secret|authorization|cookie))(\s*(["'])?\s*[:=]\s*)("(?:[^"\\]|\\[\s\S])*(?:"|\\?$)|'(?:[^'\\]|\\[\s\S])*(?:'|\\?$)|[^\s"',;&}]+)/gi, (match, key, separator, keyQuote, value) => {
       const quote = value[0] === '"' || value[0] === "'" ? value[0] : '';
       const closed = quote !== '' && value.length > 1 && value.endsWith(quote) && !value.endsWith(`\\${quote}`);
       if (!isCredentialKey(key, Boolean(keyQuote) || separator.includes('='), quote ? value.slice(1, closed ? -1 : undefined) : value)) return match;
@@ -375,7 +377,7 @@ function redact(text, opaque = true) {
 // Written as plain `token: value`, the value decides: one that looks machine-made (six or more
 // characters with a digit, or twelve or more of anything) is taken for a credential, a short word is not.
 function isCredentialKey(key, assignment, value) {
-  const name = key.toLowerCase();
+  const name = key.toLowerCase().replace(/(key|token|secret|password)s$/, '$1'); // a list of them: apiKeys, tokens
   if (/(?:password|passwd|api[-_]?key|secret[-_]?key|private[-_]?key|authorization|cookie)$/.test(name)) return true;
   if (/(?:token|secret)$/.test(name)) return assignment || name.length > 6 || value.length >= 12 || (value.length >= 6 && /\d/.test(value));
   return false;
@@ -405,7 +407,8 @@ function formatLogArg(arg) {
 // cuts replies far below the default anyway).
 function serialize(value, { budget = 50_000, chars = 400_000, redactKeys = false } = {}) {
   const ancestors = new WeakSet();
-  const hidden = (key, item) => redactKeys && typeof item === 'string' && isCredentialKey(String(key), true, item);
+  // Text, or a list, under a credential-like key ("apiKeys": [...] too) is withheld whole.
+  const hidden = (key, item) => redactKeys && (typeof item === 'string' || Array.isArray(item)) && isCredentialKey(String(key), true, typeof item === 'string' ? item : 'a list of values');
   const text = (v) => {
     const kept = v.length > chars ? `${v.slice(0, chars)}[Truncated ${v.length - chars} chars]` : v;
     chars = Math.max(0, chars - v.length);

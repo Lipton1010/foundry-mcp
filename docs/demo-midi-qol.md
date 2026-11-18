@@ -17,18 +17,21 @@ const macro = await Macro.create({
   command: "const bonus = 2;\nconst total = actor.system.attributes.prof + bonuss;\nui.notifications.info(`Total ${total}`);",
 });
 const actor = await Actor.create({ name: tag, type: 'npc', system: { attributes: { hp: { value: 10, max: 10 } } } });
-await actor.createEmbeddedDocuments('Item', [{
+const [item] = await actor.createEmbeddedDocuments('Item', [{
   name: tag, type: 'feat',
   system: { activities: { mcpdemo000000001: { _id: 'mcpdemo000000001', type: 'utility', name: 'Demo', activation: { type: 'action' } } } },
   flags: { 'midi-qol': { onUseMacroName: `[postActiveEffects]Macro.${macro.uuid}` } },
 }]);
 // Everything is found again by the UUIDs saved here, never by name: an earlier run may have left documents with
 // the same name, and cleaning up by name would delete those instead.
-globalThis.mcpDemo = { actorUuid: actor.uuid, macroUuid: macro.uuid, itemUuid: actor.items.contents[0].uuid, messageIds: [] };
-// Record the chat messages this demo's workflows create, so exactly those are deleted at the end.
-mcpDemo.hook = Hooks.on('createChatMessage', (message) => {
-  if (message.speaker?.actor === actor.id) mcpDemo.messageIds.push(message.id);
+const run = { actorUuid: actor.uuid, macroUuid: macro.uuid, itemUuid: item.uuid, messageIds: [] };
+// Record the chat messages this run's workflows create, so exactly those are deleted at the end. The hook keeps
+// its own run, so a hook left by an earlier, unfinished run cannot add to this one.
+run.hook = Hooks.on('createChatMessage', (message) => {
+  if (message.speaker?.actor === actor.id) run.messageIds.push(message.id);
 });
+if (globalThis.mcpDemo?.hook) Hooks.off('createChatMessage', globalThis.mcpDemo.hook);
+globalThis.mcpDemo = run;
 return 'created';
 ```
 
