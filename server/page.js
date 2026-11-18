@@ -94,7 +94,19 @@ export function readSettings(args) {
     .replace(/(:\/\/[^/@\s:"']*:)[^\s/?#"']+@/g, '$1[withheld]@')
     .replace(/([?&](?:token|access_token|api[-_]?key|key|sig|signature|secret|password|auth|code)=)[^&\s"'#]+/gi, '$1[withheld]');
   const clean = (value, depth, key = '') => {
-    if (typeof value === 'string') return key && credential.test(key) && value ? '[withheld]' : /:\/\//.test(value) ? url(value) : value;
+    if (typeof value === 'string') {
+      if (key && credential.test(key) && value) return '[withheld]';
+      // Text holding JSON (a profile stored as a string) is read and cleaned the same way; unreadable such text is withheld.
+      if (/^\s*[[{]/.test(value) && /"\s*:/.test(value)) {
+        if (value.length > 100_000 || depth > 20) return '[withheld: too long to check for credentials]';
+        try {
+          return JSON.stringify(clean(JSON.parse(value), depth + 1));
+        } catch {
+          return '[withheld: not readable as JSON]';
+        }
+      }
+      return /:\/\//.test(value) ? url(value) : value;
+    }
     if (!value || typeof value !== 'object' || depth > 20) return value;
     if (typeof value.toObject === 'function') {
       try {
@@ -631,6 +643,10 @@ export async function updateDocument(args, signal) {
     });
     if (conflicts.length) return { ...about, applied: false, conflicts, note: 'The document has changed since the preview. Preview again.' };
     const snapshot = deepClone(doc._source);
+    // The documents embedded in this one before the save (effects, items...), so undo can say which are gone since:
+    // a system can remove one as a result of the edit after the save has returned (dnd5e's downed effect, on healing).
+    const embeddedIds = () => Object.fromEntries(Object.entries(doc.collections ?? {}).map(([name, collection]) => [name, [...(collection?.keys?.() ?? [])]]));
+    const embedded = embeddedIds();
     const { updated, changed, linked } = await saveAndCapture(change());
     // Foundry resolves to nothing when a hook or the server refused the update.
     if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
@@ -668,9 +684,10 @@ export async function updateDocument(args, signal) {
     if (replaced.length) return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), undoable: 'As this was saved, something replaced ' + replaced.join(', ') + ' with a value, so this edit cannot be undone with foundry_undo.' };
     // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
     const elsewhere = linked.length ? { linkedChanged: linked, linkedNote: 'Foundry also changed these linked documents as this was saved (a system can, as dnd5e removes a downed effect on healing). foundry_undo restores this document only, not them.' } : {};
-    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded), linked });
+    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded), linked, embedded });
+    const scope = Object.keys(embedded).length ? { undoScope: 'foundry_undo restores the data of this document itself. Documents embedded in it (effects, items) that the system adds or removes because of this edit, now or a moment later, are reported by foundry_undo, not restored.' } : {};
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
-    return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...elsewhere, record };
+    return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...elsewhere, ...scope, record };
   } finally {
     release();
     if (locks.get(doc.uuid) === chain) locks.delete(doc.uuid);
@@ -835,6 +852,11 @@ export async function undoUpdate(args, signal) {
       ...(alsoChanged.length ? { alsoChanged } : {}),
       // What the edit changed in linked documents is not put back; say so every time, not only when the edit was made.
       ...(args.linked?.length ? { notRestoredElsewhere: args.linked, linkedNote: 'The edit also changed these linked documents, which undo does not restore.' } : {}),
+      // Embedded documents that were there before the edit and are gone now, however late they went: not restored.
+      ...(() => {
+        const missing = Object.entries(args.embedded ?? {}).flatMap(([name, ids]) => ids.filter((id) => !doc.collections?.[name]?.has?.(id)).map((id) => doc.uuid + '.' + (doc.collections?.[name]?.documentClass?.documentName ?? name) + '.' + id));
+        return missing.length ? { missingSinceEdit: missing, missingNote: 'These embedded documents existed before the edit and are gone now (the system may have removed them because of it). Undo does not recreate them; foundry_changes has their data if they were deleted while it was tracking.' } : {};
+      })(),
       ...(linked.length ? { linkedChanged: linked } : {}),
     };
   } finally {

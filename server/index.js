@@ -721,8 +721,16 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
     }
     // Console output is left out before any of the result or the change list, when they would not all fit.
     let logs = { logs: reply.logs };
-    if (JSON.stringify({ ...body, logs: reply.logs, ...changed, ...keep }, null, 1).length > MAX_RESULT_CHARS - 1000) {
+    const fits = (extra) => JSON.stringify({ ...body, ...extra, ...keep }, null, 1).length <= MAX_RESULT_CHARS - 1000;
+    if (!fits({ logs: reply.logs, ...changed })) {
       logs = { logs: [], logsOmitted: `${reply.logs?.length ?? 0} lines of console output were left out to fit the result; read warnings and errors with foundry_logs from logSeq.` };
+    }
+    // Then whole change entries, newest first, rather than any of the result; changesSeq reads them all.
+    if (Array.isArray(changed.changes) && !fits({ ...logs, ...changed })) {
+      let rows = changed.changes;
+      while (rows.length && !fits({ ...logs, ...changed, changes: rows })) rows = rows.slice(0, Math.floor(rows.length * 3 / 4));
+      const cut = changed.changes.length - rows.length;
+      changed = { ...changed, changes: rows, changesOmitted: (changed.changesOmitted ?? 0) + cut };
     }
     return { content: [{ type: 'text', text: asText({ ...body, ...logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };
   } catch (error) {
@@ -990,7 +998,7 @@ function buildMcpServer() {
               if (!saved || !recorded || !fields.every((field) => saved[field] && typeof saved[field] === 'object' && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
                 return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
               }
-              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], undone: false };
+              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, linked: Array.isArray(saved.linked) ? saved.linked : [], embedded: saved.embedded && typeof saved.embedded === 'object' ? saved.embedded : {}, undone: false };
               edits.push(edit);
               if (edits.length > MAX_EDITS) edits.shift();
               // editId first; the values are left out when they would not fit beside it.
@@ -1021,7 +1029,7 @@ function buildMcpServer() {
         const connection = foundry;
         const world = connection?.hello.world;
         if (args.list) {
-          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, linked, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
+          return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, shape, linked, embedded, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
         }
         const edit = args.editId !== undefined ? edits.find((entry) => entry.id === args.editId) : edits.findLast((entry) => entry.world === world && !entry.undone);
         if (!edit) return textReply(args.editId !== undefined ? `No edit ${args.editId} is remembered.` : 'There is no edit to undo in this world.', true);
@@ -1029,8 +1037,8 @@ function buildMcpServer() {
         return oneAtATime(edit.uuid, () => {
           // Checked inside the queue: another undo of the same edit may have just finished.
           if (edit.undone) return textReply(`Edit ${edit.id} has already been undone.`, true);
-          const { before, existed, after, exists, roots, shape, linked, uuid } = edit;
-          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots, shape, linked }, {
+          const { before, existed, after, exists, roots, shape, linked, embedded, uuid } = edit;
+          return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots, shape, linked, embedded }, {
             expect: expectOf(args),
             connection,
             timeoutMs: 120_000,

@@ -93,7 +93,7 @@ const ALL_TOOLS = [
 const hooks = {};
 const settings = {
   'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '', 'foundry-mcp.pairingToken': '', 'foundry-mcp.allowNoToken': true,
-  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/zz-settings-hook-zz', auth: { password: 'zz-settings-pw-zz' } },
+  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/zz-settings-hook-zz', auth: { password: 'zz-settings-pw-zz' }, profile: '{"user":"gm","password":"zz-settings-json-zz"}' },
 };
 // What the read-only tools look at. A Foundry Collection is a Map that iterates its values.
 class Collection extends Map {
@@ -388,7 +388,7 @@ try {
       assert.ok(!JSON.stringify(all).includes('the-hub-token-itself') && !JSON.stringify(all).includes('sk-weather-123'));
       // "Token" is an everyday word in Foundry: a setting that is not text is shown.
       assert.deepEqual(byKey['core.defaultToken'], { namespace: 'core', key: 'defaultToken', scope: 'world', name: 'Default Token', value: { displayName: 20 } });
-      assert.deepEqual(byKey['weather.units'].value, { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/[withheld]', auth: { password: '[withheld]' } }, 'webhook URLs and nested credentials in a value are withheld');
+      assert.deepEqual(byKey['weather.units'].value, { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/[withheld]', auth: { password: '[withheld]' }, profile: '{"user":"gm","password":"[withheld]"}' }, 'webhook URLs and nested credentials in a value are withheld');
       assert.match(byKey['weather.broken'].unreadable, /not a registered setting/);
       assert.equal(byKey['weather.broken'].name, null);
       assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
@@ -1133,6 +1133,19 @@ try {
     assert.match(healUndo.linkedNote, /does not restore/);
     assert.equal(healUndo.notRestoredElsewhere[0].uuid, effect.uuid);
 
+    // The system removes an embedded effect a moment after the save has returned: the apply says undo covers this
+    // document only, and the undo names the effect that is gone.
+    torch.collections = { effects: new Map([['down', { name: 'Unconscious' }]]) };
+    const latePreview = payload(await update({ set: { 'config.dim': 6 } })).result;
+    const lateHeal = payload(await update({ set: { 'config.dim': 6 }, apply: true, expected: latePreview.expected })).result;
+    assert.match(lateHeal.undoScope, /reported by foundry_undo, not restored/);
+    torch.collections.effects.delete('down'); // later, outside the save
+    const lateUndo = payload(await callTool('foundry_undo', { editId: lateHeal.editId })).result;
+    assert.equal(lateUndo.undone, true);
+    assert.deepEqual(lateUndo.missingSinceEdit, [torch.uuid + '.effects.down']);
+    assert.match(lateUndo.missingNote, /does not recreate/);
+    delete torch.collections;
+
     // A module replaced the object holding the path with a value as the edit was saved: it is reported as not undoable.
     torch._source.flags.kit = { lamp: 'oil' };
     const swapPreview = payload(await update({ set: { 'flags.kit.lamp': 'gas' } })).result;
@@ -1608,6 +1621,8 @@ try {
   });
 
   await check('a reply the module did not sign is never believed', async () => {
+    // The previous check's tab must be gone first, or this one is turned away as a second tab.
+    await until(async () => !payload(await callTool('foundry_logs', { limit: 1 }, { port: FAULT_PORT })).connected, 'the previous tab to disconnect');
     const tab = await rawSocket(FAULT_PORT, ORIGIN, MODULE_TOKEN);
     assert.equal(tab.outcome, 'welcomed');
     tab.ws.on('message', (data) => {
