@@ -589,6 +589,8 @@ try {
     Hooks.fire('updateActor', vault, { flags: { mod: { broken: '{"password":"zz-bad-json-zz",}', twice: '{"password":"zz-first-zz","password":null}', label: '[Homebrew] Sword' } } }, {}, 'gm1');
     // JSON encoded as a string twice over.
     Hooks.fire('updateActor', vault, { flags: { mod: { wrapped: JSON.stringify(JSON.stringify({ password: 'zz-wrapped-zz', user: 'gm' })) } } }, {}, 'gm1');
+    // The same, but far too long to unwrap.
+    Hooks.fire('updateActor', vault, { flags: { mod: { bulky: JSON.stringify(JSON.stringify({ apiKey: 'zz-bulky-zz', template: 'x'.repeat(110_000) })) } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
     assert.ok(!/zz-|zzSecret/.test(JSON.stringify(nested)), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
@@ -612,6 +614,7 @@ try {
       { path: 'flags.mod.label', value: '[Homebrew] Sword' },
     ]);
     assert.deepEqual(nested.entries[8].changes, [{ path: 'flags.mod.wrapped', value: JSON.stringify(JSON.stringify({ password: '[withheld]', user: 'gm' })) }]);
+    assert.deepEqual(nested.entries[9].changes, [{ path: 'flags.mod.bulky', value: '[withheld: too long to check for credentials]' }]);
 
     // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
     const shape = { documentName: 'Actor', uuid: 'Actor.s1', name: 'Shape', parent: null, _source: { flags: { mod: { x: 1, y: 2 } } } };
@@ -683,7 +686,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 4);
+    assert.equal(globalThis[KEY].version, 5);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -910,12 +913,14 @@ try {
       return copy;
     },
     // Like Foundry: resolves to the document, or to nothing when a hook refused the update.
-    async update(change) {
+    async update(change, options = {}) {
       validate(change);
       if (this.slow) await sleep(this.slow);
       if (this.veto) return undefined;
+      this.prepare?.(change); // the system adding to the change while preparing it, as dnd5e does
       merge(this._source, change);
       this.tamper?.(this._source); // a module hook changing what is saved
+      Hooks.fire('updateAmbientLight', this, change, options, 'gm1');
       return this;
     },
   };
@@ -1059,20 +1064,37 @@ try {
     // from 0): those changes are recorded and listed, and undo puts them back too.
     torch._source.flags.saves = { success: 2, failure: 1 };
     const healPreview = payload(await update({ set: { 'config.dim': 9 } })).result;
-    torch.tamper = (source) => (source.flags.saves = { success: 0, failure: 0 });
+    torch.prepare = (change) => ((change.flags ??= {}).saves = { success: 0, failure: 0 });
+    // Meanwhile a separate save by someone else lands while this one is under way: it is not part of this edit.
+    torch.slow = 100;
+    setTimeout(() => (torch._source.flags.independent = true), 30);
     const heal = payload(await update({ set: { 'config.dim': 9 }, apply: true, expected: healPreview.expected })).result;
-    torch.tamper = null;
+    torch.prepare = null;
+    torch.slow = 0;
     assert.deepEqual(heal.alsoChanged, ['flags.saves.failure', 'flags.saves.success']);
     assert.equal(payload(await callTool('foundry_undo', { editId: heal.editId })).result.undone, true);
     assert.deepEqual([torch._source.config.dim, torch._source.flags.saves], [20, { success: 2, failure: 1 }]);
+    assert.equal(torch._source.flags.independent, true, 'the other save is left alone');
     delete torch._source.flags.saves;
+    delete torch._source.flags.independent;
+
+    // A module replaced the object holding the path with a value as the edit was saved: it is reported as not undoable.
+    torch._source.flags.kit = { lamp: 'oil' };
+    const swapPreview = payload(await update({ set: { 'flags.kit.lamp': 'gas' } })).result;
+    torch.tamper = (source) => (source.flags.kit = 'sold');
+    const swapped = payload(await update({ set: { 'flags.kit.lamp': 'gas' }, apply: true, expected: swapPreview.expected })).result;
+    torch.tamper = null;
+    assert.deepEqual([swapped.applied, swapped.editId], [true, undefined]);
+    assert.match(swapped.undoable, /replaced flags.kit with a value/);
+    delete torch._source.flags.kit;
 
     // An edit made flags.review.nested.leaf; someone added flags.review.keep since. Undo keeps that and leaves no empty object.
     const nestPreview = payload(await update({ set: { 'flags.review.nested.leaf': 1 } })).result;
     const nestEdit = payload(await update({ set: { 'flags.review.nested.leaf': 1 }, apply: true, expected: nestPreview.expected })).result;
     torch._source.flags.review.keep = 1;
+    torch._source.flags.review.overrides = {}; // someone's deliberately empty object: theirs, so it stays
     assert.equal(payload(await callTool('foundry_undo', { editId: nestEdit.editId })).result.undone, true);
-    assert.deepEqual(torch._source.flags, { review: { keep: 1 } });
+    assert.deepEqual(torch._source.flags, { review: { keep: 1, overrides: {} } });
     delete torch._source.flags.review;
 
     // A hook that refuses the update: nothing is recorded as applied, and nothing can be undone.

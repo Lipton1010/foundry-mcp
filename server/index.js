@@ -719,7 +719,12 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
     } else if (connection) {
       changed = { changesUnavailable: 'Change tracking was still being set up when the code ran, so its changes could not be listed. foundry_changes lists every change seen since tracking started.' };
     }
-    return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };
+    // Console output is left out before any of the result or the change list, when they would not all fit.
+    let logs = { logs: reply.logs };
+    if (JSON.stringify({ ...body, logs: reply.logs, ...changed, ...keep }, null, 1).length > MAX_RESULT_CHARS - 1000) {
+      logs = { logs: [], logsOmitted: `${reply.logs?.length ?? 0} lines of console output were left out to fit the result; read warnings and errors with foundry_logs from logSeq.` };
+    }
+    return { content: [{ type: 'text', text: asText({ ...body, ...logs, ...dropped, ...changed }, keep) }], isError: !reply.ok };
   } catch (error) {
     return textReply(error.message, true);
   }
