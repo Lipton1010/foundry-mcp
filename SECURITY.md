@@ -54,9 +54,10 @@ data. What this does not change:
 
 - **Reading is still disclosure.** Everything these tools return goes to the AI provider behind the client:
   journals, chat, GM notes, user names and settings.
-- **Withholding secrets in settings is best effort.** A text value is withheld only when its key is named like a
-  credential (password, secret, cookie, api key, or ending in `token` or `key`). A secret under any other name, or
-  inside an object, is returned. Stored settings are not readable through the document tools, which would
+- **Withholding secrets in settings is best effort.** A text value is withheld when its key, or the key it sits
+  under inside an object, is named like a credential (password, secret, cookie, api key, or ending in `token` or
+  `key`), and URLs that carry their secret in themselves (webhooks, passwords in addresses, tokens in queries) have
+  that part withheld. A secret in any other form is returned. Stored settings are not readable through the document tools, which would
   sidestep this. The module's pairing token itself is withheld by this rule.
 - **A screenshot shows what the GM sees**, including hidden tokens and GM-only drawings, and it goes to the AI
   provider like any other reply.

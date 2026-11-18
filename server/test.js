@@ -93,7 +93,7 @@ const ALL_TOOLS = [
 const hooks = {};
 const settings = {
   'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '', 'foundry-mcp.pairingToken': '', 'foundry-mcp.allowNoToken': true,
-  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': 'metric',
+  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/zz-settings-hook-zz', auth: { password: 'zz-settings-pw-zz' } },
 };
 // What the read-only tools look at. A Foundry Collection is a Map that iterates its values.
 class Collection extends Map {
@@ -388,7 +388,7 @@ try {
       assert.ok(!JSON.stringify(all).includes('the-hub-token-itself') && !JSON.stringify(all).includes('sk-weather-123'));
       // "Token" is an everyday word in Foundry: a setting that is not text is shown.
       assert.deepEqual(byKey['core.defaultToken'], { namespace: 'core', key: 'defaultToken', scope: 'world', name: 'Default Token', value: { displayName: 20 } });
-      assert.equal(byKey['weather.units'].value, 'metric');
+      assert.deepEqual(byKey['weather.units'].value, { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/[withheld]', auth: { password: '[withheld]' } }, 'webhook URLs and nested credentials in a value are withheld');
       assert.match(byKey['weather.broken'].unreadable, /not a registered setting/);
       assert.equal(byKey['weather.broken'].name, null);
       assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
@@ -590,7 +590,7 @@ try {
     // JSON encoded as a string twice over.
     Hooks.fire('updateActor', vault, { flags: { mod: { wrapped: JSON.stringify(JSON.stringify({ password: 'zz-wrapped-zz', user: 'gm' })) } } }, {}, 'gm1');
     // A webhook URL carries its secret in itself, whatever the field is called.
-    Hooks.fire('updateActor', vault, { flags: { mod: { history: [{ url: 'https://discord.com/api/webhooks/123456/zz-hook-secret-zz', note: 'kept' }] } } }, {}, 'gm1');
+    Hooks.fire('updateActor', vault, { flags: { mod: { history: [{ url: 'https://discord.com/api/webhooks/123456/zz-hook-secret-zz', note: 'kept' }, { url: 'https://discord.com/api/v10/webhooks/123456/zz-hook-v10-zz' }] } } }, {}, 'gm1');
     // The same, but far too long to unwrap.
     Hooks.fire('updateActor', vault, { flags: { mod: { bulky: JSON.stringify(JSON.stringify({ apiKey: 'zz-bulky-zz', template: 'x'.repeat(110_000) })) } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
@@ -616,7 +616,7 @@ try {
       { path: 'flags.mod.label', value: '[Homebrew] Sword' },
     ]);
     assert.deepEqual(nested.entries[8].changes, [{ path: 'flags.mod.wrapped', value: JSON.stringify(JSON.stringify({ password: '[withheld]', user: 'gm' })) }]);
-    assert.deepEqual(nested.entries[9].changes, [{ path: 'flags.mod.history', value: [{ url: 'https://discord.com/api/webhooks/123456/[withheld]', note: 'kept' }] }]);
+    assert.deepEqual(nested.entries[9].changes, [{ path: 'flags.mod.history', value: [{ url: 'https://discord.com/api/webhooks/123456/[withheld]', note: 'kept' }, { url: 'https://discord.com/api/v10/webhooks/123456/[withheld]' }] }]);
     assert.deepEqual(nested.entries[10].changes, [{ path: 'flags.mod.bulky', value: '[withheld: too long to check for credentials]' }]);
 
     // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
@@ -689,7 +689,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 6);
+    assert.equal(globalThis[KEY].version, 7);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -901,7 +901,7 @@ try {
     for (const [key, value] of Object.entries(change)) {
       if (value instanceof ForcedDeletion) delete target[key];
       else if (value instanceof ForcedReplacement) target[key] = structuredClone(value.value);
-      else if (value && typeof value === 'object' && !Array.isArray(value)) merge((target[key] = own(target, key) && typeof target[key] === 'object' ? target[key] : {}), value);
+      else if (value && typeof value === 'object' && !Array.isArray(value)) merge((target[key] = own(target, key) && target[key] !== null && typeof target[key] === 'object' ? target[key] : {}), value);
       else target[key] = value;
     }
   };
@@ -1111,6 +1111,27 @@ try {
     assert.deepEqual([torch._source.flags.config, torch._source.flags.profile.mode], [null, 'a']);
     delete torch._source.flags.config;
     delete torch._source.flags.profile;
+
+    // A nullable object being set up (as dnd5e's group restSettings can be): undo puts the null back, not an empty object.
+    torch._source.flags.rest = null;
+    const restPreview = payload(await update({ set: { 'flags.rest': { short: 1 } } })).result;
+    const rested = payload(await update({ set: { 'flags.rest': { short: 1 } }, apply: true, expected: restPreview.expected })).result;
+    assert.equal(payload(await callTool('foundry_undo', { editId: rested.editId })).result.undone, true);
+    assert.equal(torch._source.flags.rest, null);
+    delete torch._source.flags.rest;
+
+    // The system also changes a linked document as the edit is saved (dnd5e removes a downed effect on healing):
+    // undo cannot put that back, and both the apply and the undo say so.
+    const effect = { documentName: 'ActiveEffect', uuid: torch.uuid + '.ActiveEffect.down', name: 'Unconscious' };
+    torch.prepare = () => Hooks.fire('deleteActiveEffect', effect, {}, 'gm1');
+    const downPreview = payload(await update({ set: { 'config.dim': 8 } })).result;
+    const healed = payload(await update({ set: { 'config.dim': 8 }, apply: true, expected: downPreview.expected })).result;
+    torch.prepare = null;
+    assert.deepEqual(healed.linkedChanged, [{ action: 'delete', documentName: 'ActiveEffect', uuid: effect.uuid, name: 'Unconscious' }]);
+    const healUndo = payload(await callTool('foundry_undo', { editId: healed.editId })).result;
+    assert.equal(healUndo.undone, true);
+    assert.match(healUndo.linkedNote, /does not restore/);
+    assert.equal(healUndo.notRestoredElsewhere[0].uuid, effect.uuid);
 
     // A module replaced the object holding the path with a value as the edit was saved: it is reported as not undoable.
     torch._source.flags.kit = { lamp: 'oil' };
@@ -1437,7 +1458,9 @@ try {
     } finally {
       game.collections.delete('JournalEntry');
     }
-    // Logs: the oldest are left out, and olderBefore leads back to them.
+    // Logs: the oldest are left out, and olderBefore leads back to them. A fresh one-second window first, so the
+    // tab's rate limit (100 entries a second) cannot drop any of the forty.
+    await sleep(1100);
     const before = (await getLogs()).lastSeq;
     for (let i = 0; i < 40; i++) console.warn(`page ${String(i).padStart(2, '0')} ${'dolor '.repeat(500)}`);
     await until(async () => (await getLogs({ since: before, limit: 1 })).matched === 40, 'forty entries');

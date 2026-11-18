@@ -86,6 +86,26 @@ export function readSettings(args) {
   const needle = args.contains?.toLowerCase();
   const offset = args.offset ?? 0;
   const limit = args.limit ?? 100;
+  // Inside a value: text under a credential-like key is withheld at any depth, and a URL that carries its secret in
+  // itself (a webhook, a password in the address, a token in the query) has that part withheld.
+  const url = (text) => text
+    .replace(/(discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/)[\w-]+/gi, '$1[withheld]')
+    .replace(/(hooks\.slack\.com\/(?:services|workflows|triggers)\/)[^\s"'?#]+/gi, '$1[withheld]')
+    .replace(/(:\/\/[^/@\s:"']*:)[^\s/?#"']+@/g, '$1[withheld]@')
+    .replace(/([?&](?:token|access_token|api[-_]?key|key|sig|signature|secret|password|auth|code)=)[^&\s"'#]+/gi, '$1[withheld]');
+  const clean = (value, depth, key = '') => {
+    if (typeof value === 'string') return key && credential.test(key) && value ? '[withheld]' : /:\/\//.test(value) ? url(value) : value;
+    if (!value || typeof value !== 'object' || depth > 20) return value;
+    if (typeof value.toObject === 'function') {
+      try {
+        value = value.toObject(); // a data model: its stored data
+      } catch {
+        return value;
+      }
+    }
+    if (Array.isArray(value)) return value.map((item) => clean(item, depth + 1, key));
+    return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, clean(item, depth + 1, name)]));
+  };
   let total = 0;
   let room = 60_000; // rows stop when the page would be too long for one reply; a single huge value is cut inside it
   const settings = [];
@@ -103,7 +123,7 @@ export function readSettings(args) {
     try {
       const value = game.settings.get(setting.namespace, setting.key);
       if (typeof value === 'string' && value && credential.test(setting.key)) settings.push({ ...entry, withheld: 'The key is named like a credential, so its text value is not returned.' });
-      else settings.push({ ...entry, value });
+      else settings.push({ ...entry, value: clean(value, 0) });
     } catch (error) {
       settings.push({ ...entry, unreadable: String(error?.message ?? error) });
     }
@@ -120,7 +140,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 6; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
+  const VERSION = 7; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -165,7 +185,7 @@ export function installChanges() {
     // in the address, or a token in the query.
     if (typeof value === 'string' && /:\/\//.test(value)) {
       value = value
-        .replace(/(discord(?:app)?\.com\/api\/webhooks\/\d+\/)[\w-]+/gi, '$1[withheld]')
+        .replace(/(discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/)[\w-]+/gi, '$1[withheld]') // with or without an API version
         .replace(/(hooks\.slack\.com\/(?:services|workflows|triggers)\/)[^\s"'?#]+/gi, '$1[withheld]')
         .replace(/(:\/\/[^/@\s:"']*:)[^\s/?#"']+@/g, '$1[withheld]@')
         .replace(/([?&](?:token|access_token|api[-_]?key|key|sig|signature|secret|password|auth|code)=)[^&\s"'#]+/gi, '$1[withheld]');
@@ -381,7 +401,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 6) return { installed: false }; // the same number as VERSION in installChanges
+  if (t?.version !== 7) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 
@@ -509,11 +529,20 @@ export async function updateDocument(args, signal) {
     const hookId = Hooks.on(hook, (document, change, options) => {
       if (document === doc && options?.[MARK] === id) changed = change;
     });
+    // Documents linked to this one (embedded in it, or holding it) that change while it is saved: a system can do that
+    // as part of the update (dnd5e removes a character's downed effect when it is healed). Undo cannot put those back,
+    // so they are reported. A save someone else makes to them at the same moment is reported too, to be safe.
+    const linked = [];
+    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid.startsWith(doc.uuid + '.') || doc.uuid.startsWith(other.uuid + '.'));
+    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other) => {
+      if (related(other)) linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null });
+    })]));
     try {
       const updated = await doc.update(data, { [MARK]: id });
-      return { updated, changed };
+      return { updated, changed, linked };
     } finally {
       Hooks.off(hook, hookId);
+      for (const [name, watcher] of watchers) Hooks.off(name, watcher);
     }
   };
   // The dot paths an update's change touched, outermost first where one holds another; _id and _stats left out.
@@ -602,7 +631,7 @@ export async function updateDocument(args, signal) {
     });
     if (conflicts.length) return { ...about, applied: false, conflicts, note: 'The document has changed since the preview. Preview again.' };
     const snapshot = deepClone(doc._source);
-    const { updated, changed } = await saveAndCapture(change());
+    const { updated, changed, linked } = await saveAndCapture(change());
     // Foundry resolves to nothing when a hook or the server refused the update.
     if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
     // The undo record is made of exactly the paths Foundry reports this one update changed: the leaves an object
@@ -610,7 +639,16 @@ export async function updateDocument(args, signal) {
     // system or a module added while preparing it (dnd5e resets death saves when hit points rise from 0), and any
     // object a module replaced or created whole. If Foundry reported nothing, the requested paths are used.
     const near = (p, q) => p === q || p.startsWith(q + '.') || q.startsWith(p + '.');
-    const recorded = changed ? changedPaths(changed) : paths;
+    // A key written into what was null or another value (a nullable object being set up) is recorded at that value's
+    // path, whole, so undo can put the null back rather than leave an empty object.
+    const holderIn = (source, path) => ancestors(path).find((ancestor) => {
+      if (!hasProperty(source, ancestor)) return false;
+      const value = getProperty(source, ancestor);
+      return value === null || typeof value !== 'object' || Array.isArray(value);
+    });
+    const leaves = changed ? changedPaths(changed) : paths;
+    const lifted = [...new Set(leaves.map((path) => holderIn(snapshot, path) ?? path))].sort();
+    const recorded = lifted.filter((p) => !lifted.some((q) => q !== p && p.startsWith(q + '.')));
     if (!recorded.length) return { ...about, applied: true, note: 'Foundry saved no difference: the document already held these values. Nothing to undo.' };
     const extra = recorded.filter((p) => !paths.some((q) => near(p, q)));
     const before = Object.fromEntries(recorded.map((path) => [path, read(snapshot, path)]));
@@ -629,9 +667,10 @@ export async function updateDocument(args, signal) {
     const replaced = Object.entries(shapeOf(recorded)).filter(([, kind]) => kind === 'value').map(([path]) => path);
     if (replaced.length) return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), undoable: 'As this was saved, something replaced ' + replaced.join(', ') + ' with a value, so this edit cannot be undone with foundry_undo.' };
     // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
-    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded) });
+    const elsewhere = linked.length ? { linkedChanged: linked, linkedNote: 'Foundry also changed these linked documents as this was saved (a system can, as dnd5e removes a downed effect on healing). foundry_undo restores this document only, not them.' } : {};
+    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded), linked });
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
-    return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), record };
+    return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...elsewhere, record };
   } finally {
     release();
     if (locks.get(doc.uuid) === chain) locks.delete(doc.uuid);
@@ -665,11 +704,20 @@ export async function undoUpdate(args, signal) {
     const hookId = Hooks.on(hook, (document, change, options) => {
       if (document === doc && options?.[MARK] === id) changed = change;
     });
+    // Documents linked to this one (embedded in it, or holding it) that change while it is saved: a system can do that
+    // as part of the update (dnd5e removes a character's downed effect when it is healed). Undo cannot put those back,
+    // so they are reported. A save someone else makes to them at the same moment is reported too, to be safe.
+    const linked = [];
+    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid.startsWith(doc.uuid + '.') || doc.uuid.startsWith(other.uuid + '.'));
+    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other) => {
+      if (related(other)) linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null });
+    })]));
     try {
       const updated = await doc.update(data, { [MARK]: id });
-      return { updated, changed };
+      return { updated, changed, linked };
     } finally {
       Hooks.off(hook, hookId);
+      for (const [name, watcher] of watchers) Hooks.off(name, watcher);
     }
   };
   // The dot paths an update's change touched, outermost first where one holds another; _id and _stats left out.
@@ -771,7 +819,7 @@ export async function undoUpdate(args, signal) {
         goes.push(path);
       }
     }
-    const { updated, changed } = await saveAndCapture(data);
+    const { updated, changed, linked } = await saveAndCapture(data);
     if (!updated) return { undone: false, note: 'Foundry did not save the undo: a module hook or the server refused it. Nothing was changed.' };
     // Anything else the system or a module changed as part of this undo is reported; it is not undone in turn.
     const mine = Object.keys(args.before);
@@ -785,6 +833,9 @@ export async function undoUpdate(args, signal) {
       undone: differs.length === 0, uuid: doc.uuid, restored: Object.fromEntries(Object.keys(args.before).map((path) => [path, read(path)])),
       ...(differs.length ? { notRestored: differs, note: 'Foundry saved something other than the earlier state for these paths, so the edit is kept as not undone.' } : {}),
       ...(alsoChanged.length ? { alsoChanged } : {}),
+      // What the edit changed in linked documents is not put back; say so every time, not only when the edit was made.
+      ...(args.linked?.length ? { notRestoredElsewhere: args.linked, linkedNote: 'The edit also changed these linked documents, which undo does not restore.' } : {}),
+      ...(linked.length ? { linkedChanged: linked } : {}),
     };
   } finally {
     release();
