@@ -22,12 +22,18 @@ export function listDocuments(args) {
   const needle = args.name?.toLowerCase();
   const offset = args.offset ?? 0;
   const limit = args.limit ?? 50;
+  // Rows stop when the page would be too long for one reply, so nextOffset never skips a row that was not sent.
   const pick = (entries, describe) => {
     let total = 0;
+    let room = 60_000;
     const documents = [];
     for (const entry of entries) {
       if (needle !== undefined && !String(entry.name ?? '').toLowerCase().includes(needle)) continue;
-      if (total >= offset && documents.length < limit) documents.push(describe(entry));
+      if (total >= offset && documents.length < limit && room > 0) {
+        const row = describe(entry);
+        room -= JSON.stringify(row).length;
+        documents.push(row);
+      }
       total += 1;
     }
     const next = offset + documents.length;
@@ -80,12 +86,18 @@ export function readSettings(args) {
   const offset = args.offset ?? 0;
   const limit = args.limit ?? 100;
   let total = 0;
+  let room = 60_000; // rows stop when the page would be too long for one reply; a single huge value is cut inside it
   const settings = [];
   for (const setting of game.settings.settings.values()) {
     if (args.namespace !== undefined && setting.namespace !== args.namespace) continue;
     if (needle !== undefined && !(setting.key + ' ' + (label(setting) ?? '')).toLowerCase().includes(needle)) continue;
     total += 1;
-    if (total <= offset || settings.length >= limit) continue;
+    if (total <= offset || settings.length >= limit || room <= 0) continue;
+    try {
+      room -= JSON.stringify(game.settings.get(setting.namespace, setting.key) ?? null)?.length ?? 4;
+    } catch {
+      room -= 100;
+    }
     const entry = { namespace: setting.namespace, key: setting.key, scope: setting.scope, name: label(setting) };
     try {
       const value = game.settings.get(setting.namespace, setting.key);
@@ -193,13 +205,16 @@ export function installChanges() {
   };
   const settingKeySecret = (doc) => doc.documentName === 'Setting' && credential.test(String(doc.key ?? '').split('.').at(-1));
   // A setting stores its value as JSON text: credentials inside it are withheld like any others.
+  // Text that looks like JSON but does not parse is withheld rather than shown half-read.
   const settingValue = (text) => {
     if (typeof text !== 'string') return text;
     try {
       const parsed = JSON.parse(text);
       if (parsed && typeof parsed === 'object') return JSON.stringify(scrub(parsed, []));
-    } catch {}
-    return text;
+      return text;
+    } catch {
+      return /^\s*[[{]/.test(text) ? '[withheld: not readable as JSON]' : text;
+    }
   };
   // A value as reported: cut down, with credential-like text withheld at any depth.
   const clean = (doc, path, value) => {
@@ -236,8 +251,9 @@ export function installChanges() {
       if (!options || typeof options !== 'object') return;
       const mark = (options[MARK] ??= Math.random().toString(36).slice(2) + Date.now().toString(36));
       const before = {};
-      // Copied now (cap returns plain JSON): Foundry changes the source objects in place when the update lands.
-      for (const path of Object.keys(paths(change).rows)) before[path] = cap(foundry.utils.getProperty(doc._source ?? {}, path));
+      // Cleaned now, which also copies them: Foundry changes the source objects in place when the update lands, and a
+      // setting's value must be scrubbed before it is cut down.
+      for (const path of Object.keys(paths(change).rows)) before[path] = clean(doc, path, foundry.utils.getProperty(doc._source ?? {}, path));
       t.snapshots.set(mark + ' ' + doc.uuid, before);
       // An update another hook cancels never reaches its update hook; its snapshot is dropped eventually.
       for (const key of t.snapshots.keys()) if (t.snapshots.size > 200) t.snapshots.delete(key); else break;
@@ -254,7 +270,7 @@ export function installChanges() {
         const row = { path };
         if (deleted) row.deleted = true;
         else row.value = clean(doc, path, value);
-        if (own && Object.hasOwn(own, path)) row.before = clean(doc, path, own[path]);
+        if (own && Object.hasOwn(own, path)) row.before = own[path];
         return row;
       }), ...(more ? { morePaths: 'Only the first ' + MAX_PATHS + ' changed paths are listed; read the document for the rest.' } : {}) });
     });
@@ -286,7 +302,16 @@ export function installChanges() {
     const oldest = t.entries[0]?.seq ?? t.seq + 1;
     const upTo = Math.min(oldest - 1, args.before === undefined ? Infinity : args.before - 1);
     const evictedSince = Math.max(0, upTo - since);
-    const entries = matched.slice(-(args.limit ?? 50));
+    // Whole entries, newest first, up to what one reply can carry; olderBefore leads back to the rest.
+    let entries = matched.slice(-(args.limit ?? 50));
+    let room = 60_000;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      room -= entries[i].size;
+      if (room < 0 && i < entries.length - 1) {
+        entries = entries.slice(i + 1);
+        break;
+      }
+    }
     return {
       trackingSince: new Date(t.since).toISOString(), lastSeq: t.seq, evicted: t.evicted, ...(evictedSince ? { evictedSince } : {}),
       matched: matched.length,
@@ -340,27 +365,11 @@ export function dice(args) {
   };
   const slots = { random: [CONFIG.Dice, 'randomUniform'], handler: mersenne ? [mersenne, 'handler'] : null, mapRandomFace: [DiceTerm.prototype, 'mapRandomFace'] };
   const top = (name) => slots[name][0][slots[name][1]];
-  // Is our current wrapper reached from what is installed now? A wrapper another module put on top of it is; a
-  // function that replaced it outright is not. A wrapper that cannot be probed counts as reaching it.
-  const reaches = (name) => {
-    if (top(name) === s.current[name]) return true;
-    if (name === 'mapRandomFace') return false;
-    const saved = s.twister;
-    let hit = false;
-    s.twister = { random: () => ((hit = true), 0.5) };
-    try {
-      if (name === 'random') CONFIG.Dice.randomUniform();
-      else mersenne.handler(Object.assign(Object.create(DiceTerm.prototype), { faces: 2, minValue: 1, mapRandomFace: (value) => value }));
-    } catch {
-      hit = true;
-    } finally {
-      s.twister = saved;
-    }
-    return hit;
-  };
-  // Puts a fresh wrapper on top unless ours is still in the chain. Each wrapper keeps the function it replaced.
+  // Puts a fresh wrapper on top unless ours already is. Other modules' functions are never called to find out
+  // whether ours is somewhere below them: a wrapper they added stays in the chain under the new one, and passes
+  // rolls through to Foundry's own once control is off. Each wrapper keeps the function it replaced.
   const install = (name) => {
-    if (!slots[name] || (s.current[name] && reaches(name))) return;
+    if (!slots[name] || (s.current[name] && top(name) === s.current[name])) return;
     const previous = top(name);
     s.current[name] = make[name](previous);
     s.previous[name] = previous;
@@ -398,12 +407,13 @@ export function dice(args) {
 
 /**
  * foundry_update. Previews or applies a change to one document, given as dot paths. A preview validates the change
- * on a copy and returns each path's current and proposed value, and `expected`: a fingerprint of every affected
- * path's current value and whether it exists. Applying requires that fingerprint and checks it again just before
- * saving, so a change anyone made in between is never overwritten.
+ * on a copy and returns each path's current and proposed value, and `expected`: a fingerprint of the world, the
+ * document, the exact change, and every affected path's current value and whether it exists. Applying requires that
+ * fingerprint and checks it again, inside a per-document lock held until Foundry has saved, so a change anyone made
+ * in between is never overwritten by this tool.
  */
 export async function updateDocument(args) {
-  const MAX_RECORD = 300_000; // characters an undo record may take; larger edits are refused, not made unundoable
+  const MAX_RECORD = 300_000; // characters the undo record, or a preview's fingerprint, may take
   const doc = await fromUuid(args.uuid);
   if (!doc) throw new Error('Nothing found at "' + args.uuid + '".');
   if (doc.documentName === 'Setting') throw new Error('Settings are changed with game.settings.set through foundry_eval.');
@@ -418,16 +428,26 @@ export async function updateDocument(args) {
     }
   }
   if (Object.keys(set).some((path) => remove.includes(path))) throw new Error('A path cannot be both set and removed.');
-  // One path inside another ("flags.a" and "flags.a.b") would make the earlier values ambiguous.
-  for (let i = 1; i < paths.length; i++) if (paths[i].startsWith(paths[i - 1] + '.')) throw new Error('"' + paths[i - 1] + '" and "' + paths[i] + '" overlap. Change one or the other.');
+  const ancestors = (path) => {
+    const keys = path.split('.');
+    return keys.slice(0, -1).map((_, i) => keys.slice(0, i + 1).join('.'));
+  };
+  for (const path of paths) {
+    for (const ancestor of ancestors(path)) {
+      // One path inside another ("flags.a" and "flags.a.b") would make the earlier values ambiguous.
+      if (paths.includes(ancestor)) throw new Error('"' + ancestor + '" and "' + path + '" overlap. Change one or the other.');
+      // Writing inside a value that is not an object would replace it, and undo could not tell what it was.
+      if (hasProperty(doc._source, ancestor)) {
+        const value = getProperty(doc._source, ancestor);
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('"' + ancestor + '" holds a value, not an object, so "' + path + '" cannot be written inside it. Set "' + ancestor + '" itself.');
+      }
+    }
+  }
   const read = (source, path) => (hasProperty(source, path) ? deepClone(getProperty(source, path)) : null);
   const state = (source) => paths.map((path) => [path, hasProperty(source, path), read(source, path)]);
-  // The fingerprint binds the exact change previewed (each path and its new value, or its removal) to the state it was
-  // previewed against, so it cannot be used to apply a different value without a preview of that value.
-  const asked = paths.map((path) => [path, Object.hasOwn(set, path) ? set[path] : '(removed)']);
-  const fingerprint = () => JSON.stringify({ change: asked, state: state(doc._source) });
-  const current = Object.fromEntries(paths.map((path) => [path, read(doc._source, path)]));
-  const existed = Object.fromEntries(paths.map((path) => [path, hasProperty(doc._source, path)]));
+  // The exact change asked for: each path with its new value, or marked removed.
+  const asked = paths.map((path) => (Object.hasOwn(set, path) ? [path, 'set', set[path]] : [path, 'remove']));
+  const fingerprint = () => JSON.stringify({ world: game.world.id, uuid: doc.uuid, change: asked, state: state(doc._source) });
   const change = () => {
     const data = {};
     for (const [path, value] of Object.entries(set)) setProperty(data, path, deepClone(value));
@@ -435,20 +455,23 @@ export async function updateDocument(args) {
     return data;
   };
   const about = { uuid: doc.uuid, documentName: doc.documentName, name: doc.name ?? null };
-  let proposed;
-  try {
-    const copy = doc.clone({}, { keepId: true });
-    copy.updateSource(change());
-    proposed = Object.fromEntries(paths.map((path) => [path, read(copy._source, path)]));
-  } catch (error) {
-    return { ...about, valid: false, error: String(error?.message ?? error), current };
+  const current = Object.fromEntries(paths.map((path) => [path, read(doc._source, path)]));
+  if (!args.apply) {
+    let proposed;
+    try {
+      const copy = doc.clone({}, { keepId: true });
+      copy.updateSource(change());
+      proposed = Object.fromEntries(paths.map((path) => [path, read(copy._source, path)]));
+    } catch (error) {
+      return { ...about, valid: false, error: String(error?.message ?? error) };
+    }
+    const expected = fingerprint();
+    // Everything this reply carries must arrive whole, or the fingerprint could not be used to apply.
+    const size = expected.length + JSON.stringify(proposed).length;
+    if (size > MAX_RECORD) return { ...about, valid: false, error: 'This change is too large to preview and keep a record of for undo (' + size + ' characters). Make it with foundry_eval instead.' };
+    const unchanged = paths.filter((path) => JSON.stringify(current[path]) === JSON.stringify(proposed[path]) && !remove.includes(path));
+    return { ...about, valid: true, proposed, expected, ...(unchanged.length ? { unchanged } : {}) };
   }
-  const size = JSON.stringify([current, proposed]).length;
-  if (size > MAX_RECORD) {
-    return { ...about, valid: false, error: 'This change is too large to keep a record of for undo (' + size + ' characters). Make it with foundry_eval instead.', current: null };
-  }
-  const unchanged = paths.filter((path) => JSON.stringify(current[path]) === JSON.stringify(proposed[path]) && !remove.includes(path));
-  if (!args.apply) return { ...about, valid: true, current, exists: existed, proposed, expected: fingerprint(), ...(unchanged.length ? { unchanged } : {}) };
   if (typeof args.expected !== 'string') throw new Error('Applying needs `expected`, the fingerprint a preview of this same change returned.');
   let shown;
   try {
@@ -456,31 +479,46 @@ export async function updateDocument(args) {
   } catch {
     shown = null;
   }
-  if (!Array.isArray(shown?.state) || JSON.stringify(shown.change) !== JSON.stringify(asked) || shown.state.length !== paths.length) {
-    throw new Error('`expected` is from a preview of a different change. Preview this change and pass its `expected`.');
+  if (!Array.isArray(shown?.state) || shown.world !== game.world.id || shown.uuid !== doc.uuid || JSON.stringify(shown.change) !== JSON.stringify(asked) || shown.state.length !== paths.length) {
+    throw new Error('`expected` is from a preview of a different change, document or world. Preview this change and pass its `expected`.');
   }
-  const now = state(doc._source);
-  const conflicts = [];
-  now.forEach(([path, exists, value], i) => {
-    const [, wasThere, was] = shown.state[i];
-    if (exists !== wasThere || JSON.stringify(value) !== JSON.stringify(was)) conflicts.push({ path, expected: wasThere ? was : '(absent)', now: exists ? value : '(absent)' });
-  });
-  if (conflicts.length) return { ...about, applied: false, conflicts, note: 'The document has changed since the preview. Preview again.' };
-  // For a path that did not exist, the outermost part of it that did not exist either ("flags.mod" for a new
-  // "flags.mod.note"), so undoing can remove what the edit created rather than leave an empty object behind.
-  const roots = Object.fromEntries(paths.filter((path) => !existed[path]).map((path) => {
-    const keys = path.split('.');
-    for (let i = 1; i <= keys.length; i++) if (!hasProperty(doc._source, keys.slice(0, i).join('.'))) return [path, keys.slice(0, i).join('.')];
-    return [path, path];
-  }));
-  const updated = await doc.update(change());
-  // Foundry resolves to nothing when a hook or the server refused the update.
-  if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
-  const after = Object.fromEntries(paths.map((path) => [path, read(doc._source, path)]));
-  const exists = Object.fromEntries(paths.map((path) => [path, hasProperty(doc._source, path)]));
-  // The undo record travels as one text, so the reply's size limits cannot quietly cut it down.
-  const record = JSON.stringify({ before: current, existed, after, exists, roots });
-  return { ...about, applied: true, before: current, after, ...(record.length <= MAX_RECORD ? { record } : { undoable: 'The saved values are too large to keep for undo.' }) };
+  // One edit at a time per document in this tab, held until Foundry has answered, however long the caller waits.
+  const LOCKS = Symbol.for('foundry-mcp.edit-locks');
+  const locks = (globalThis[LOCKS] ??= new Map());
+  const waitFor = locks.get(doc.uuid) ?? Promise.resolve();
+  let release;
+  const mine = new Promise((resolve) => (release = resolve));
+  const chain = waitFor.then(() => mine);
+  locks.set(doc.uuid, chain);
+  await waitFor;
+  try {
+    const conflicts = [];
+    state(doc._source).forEach(([path, exists, value], i) => {
+      const [, wasThere, was] = shown.state[i];
+      if (exists !== wasThere || JSON.stringify(value) !== JSON.stringify(was)) conflicts.push({ path, expected: wasThere ? was : '(absent)', now: exists ? value : '(absent)' });
+    });
+    if (conflicts.length) return { ...about, applied: false, conflicts, note: 'The document has changed since the preview. Preview again.' };
+    const existed = Object.fromEntries(paths.map((path) => [path, hasProperty(doc._source, path)]));
+    // For a path that did not exist, the outermost part of it that did not exist either ("flags.mod" for a new
+    // "flags.mod.note"), so undoing can remove what the edit created rather than leave an empty object behind.
+    const roots = Object.fromEntries(paths.filter((path) => !existed[path]).map((path) => {
+      const keys = path.split('.');
+      for (let i = 1; i <= keys.length; i++) if (!hasProperty(doc._source, keys.slice(0, i).join('.'))) return [path, keys.slice(0, i).join('.')];
+      return [path, path];
+    }));
+    const updated = await doc.update(change());
+    // Foundry resolves to nothing when a hook or the server refused the update.
+    if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
+    const after = Object.fromEntries(paths.map((path) => [path, read(doc._source, path)]));
+    const exists = Object.fromEntries(paths.map((path) => [path, hasProperty(doc._source, path)]));
+    // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
+    const record = JSON.stringify({ before: current, existed, after, exists, roots });
+    if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'The values saved are too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
+    return { ...about, applied: true, record };
+  } finally {
+    release();
+    if (locks.get(doc.uuid) === chain) locks.delete(doc.uuid);
+  }
 }
 
 /** foundry_undo: puts back the values from before a foundry_update, if nobody has changed those paths since. */
@@ -490,34 +528,49 @@ export async function undoUpdate(args) {
   const { getProperty, hasProperty, deepClone, setProperty } = foundry.utils;
   const { ForcedDeletion, ForcedReplacement } = foundry.data.operators;
   const read = (path) => (hasProperty(doc._source, path) ? deepClone(getProperty(doc._source, path)) : null);
-  const same = (path) => hasProperty(doc._source, path) === args.exists[path] && JSON.stringify(read(path)) === JSON.stringify(args.after[path] ?? null);
-  const conflicts = Object.keys(args.after).filter((path) => !same(path)).map((path) => ({ path, expected: args.exists[path] ? args.after[path] : '(absent)', now: hasProperty(doc._source, path) ? read(path) : '(absent)' }));
-  if (conflicts.length) return { undone: false, conflicts, note: 'These paths changed after the update, so nothing was undone.' };
-  const data = {};
-  const created = {}; // outermost new part -> the new paths inside it
-  for (const path of Object.keys(args.before)) {
-    if (!args.existed[path]) {
-      (created[args.roots?.[path] ?? path] ??= []).push(path);
-      continue;
+  // The same per-document lock as foundry_update, held until Foundry has answered.
+  const LOCKS = Symbol.for('foundry-mcp.edit-locks');
+  const locks = (globalThis[LOCKS] ??= new Map());
+  const waitFor = locks.get(doc.uuid) ?? Promise.resolve();
+  let release;
+  const mine = new Promise((resolve) => (release = resolve));
+  const chain = waitFor.then(() => mine);
+  locks.set(doc.uuid, chain);
+  await waitFor;
+  try {
+    const same = (path) => hasProperty(doc._source, path) === args.exists[path] && JSON.stringify(read(path)) === JSON.stringify(args.after[path] ?? null);
+    const conflicts = Object.keys(args.after).filter((path) => !same(path)).map((path) => ({ path, expected: args.exists[path] ? args.after[path] : '(absent)', now: hasProperty(doc._source, path) ? read(path) : '(absent)' }));
+    if (conflicts.length) return { undone: false, conflicts, note: 'These paths changed after the update, so nothing was undone.' };
+    const data = {};
+    const created = {}; // outermost new part -> the new paths inside it
+    for (const path of Object.keys(args.before)) {
+      if (!args.existed[path]) {
+        (created[args.roots?.[path] ?? path] ??= []).push(path);
+        continue;
+      }
+      const value = args.before[path];
+      // An object is put back whole: an update would merge it with keys the edit added.
+      setProperty(data, path, value && typeof value === 'object' && !Array.isArray(value) ? new ForcedReplacement(value) : value);
     }
-    const value = args.before[path];
-    // An object is put back whole: an update would merge it with keys the edit added.
-    setProperty(data, path, value && typeof value === 'object' && !Array.isArray(value) ? new ForcedReplacement(value) : value);
-  }
-  for (const [root, inside] of Object.entries(created)) {
-    // The whole new part goes if it holds only what the edit put there; otherwise only the edit's own paths do.
-    let made = {};
-    for (const path of inside) {
-      if (path === root) made = args.after[path];
-      else setProperty(made, path.slice(root.length + 1), args.after[path]);
+    for (const [root, inside] of Object.entries(created)) {
+      // The whole new part goes if it holds only what the edit put there; otherwise only the edit's own paths do.
+      let made = {};
+      for (const path of inside) {
+        if (path === root) made = args.after[path];
+        else setProperty(made, path.slice(root.length + 1), args.after[path]);
+      }
+      const whole = JSON.stringify(read(root)) === JSON.stringify(made);
+      for (const path of whole ? [root] : inside) setProperty(data, path, new ForcedDeletion());
     }
-    const whole = JSON.stringify(read(root)) === JSON.stringify(made);
-    for (const path of whole ? [root] : inside) setProperty(data, path, new ForcedDeletion());
+    const updated = await doc.update(data);
+    if (!updated) return { undone: false, note: 'Foundry did not save the undo: a module hook or the server refused it. Nothing was changed.' };
+    // Checked, not assumed: a hook may have changed what was saved.
+    const differs = Object.keys(args.before).filter((path) => (args.existed[path] ? !hasProperty(doc._source, path) || JSON.stringify(read(path)) !== JSON.stringify(args.before[path]) : hasProperty(doc._source, path)));
+    return { undone: differs.length === 0, uuid: doc.uuid, restored: Object.fromEntries(Object.keys(args.before).map((path) => [path, read(path)])), ...(differs.length ? { notRestored: differs, note: 'Foundry saved something other than the earlier values for these paths, so the edit is kept as not undone.' } : {}) };
+  } finally {
+    release();
+    if (locks.get(doc.uuid) === chain) locks.delete(doc.uuid);
   }
-  const updated = await doc.update(data);
-  if (!updated) return { undone: false, note: 'Foundry did not save the undo: a module hook or the server refused it. Nothing was changed.' };
-  const differs = Object.keys(args.before).filter((path) => (args.existed[path] ? JSON.stringify(read(path)) !== JSON.stringify(args.before[path]) : hasProperty(doc._source, path)));
-  return { undone: true, uuid: doc.uuid, restored: Object.fromEntries(Object.keys(args.before).map((path) => [path, read(path)])), ...(differs.length ? { notRestored: differs } : {}) };
 }
 
 /**

@@ -260,8 +260,9 @@ listed when `allowEval` is on.
 - With no arguments it reports the state and changes nothing. Setting `seed` to `null` puts Foundry's random source
   back, and with an empty queue everything is back. Each of the three functions it replaces wraps whatever is in
   place at that moment, so another module's wrapper added earlier stays in the chain. If another module wraps
-  them afterwards, its wrapper stays, and rolls pass through it to Foundry's own. If something replaces them
-  outright, setting the seed again notices and takes over again.
+  them afterwards, its wrapper stays, and rolls pass through it to Foundry's own. Setting the seed or queueing a
+  result when ours is no longer on top puts a fresh wrapper on top, without calling other modules' functions to look;
+  while dice control is on, that wrapper answers before theirs.
 - `expectedWorld` and `expectedSession` work as for `foundry_eval`.
 - Only rolls evaluated in the GM's tab are affected. Players' own rolls, and code that calls `Math.random`
   itself, are not. A world reload undoes it.
@@ -434,7 +435,7 @@ Behaviour worth knowing:
 | `foundry-mcp | not connecting: paste the hub's "moduleToken"` | The module has no pairing token. Paste `moduleToken` from `server/config.json` into **Hub pairing token** and reload. |
 | `foundry-mcp | not connected: the hub requires a token` | As above; or the hub was given a `moduleToken` while the module was set to connect without one. The module retries every 30 s. |
 | `... does not know the token` / `... did not ask for the token` | Something other than your hub answered on the hub port, or the hub's `moduleToken` changed. Check that only your hub is listening on the port. |
-| `not connected: The module (protocol 5) and the hub (protocol 6) do not match` | Module and hub are from different releases. Update whichever is older and reload the world. |
+| `not connected: The module (protocol 6) and the hub (protocol 7) do not match` | Module and hub are from different releases. Update whichever is older and reload the world. |
 | "This call expected world ..." or "expected page session ..." | Another world connected, or the world reloaded, since the agent called `foundry_status`. Nothing ran. Call `foundry_status` again. |
 | `... token checks need a secure page` | Foundry is open at a plain `http://` address other than localhost. Open it at `http://localhost:<port>`, or serve it over https. |
 | HTTP 401 from `/mcp` | The client is not sending `Authorization: Bearer <token>`. See [docs/clients.md](docs/clients.md). |
@@ -509,7 +510,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 74 checks)
+### Tested in simulation only (`npm test`, 75 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
@@ -537,7 +538,10 @@ kept only on chat messages and Active Effects, the 0.6 tracker's hooks keeping n
 ours only some dice (no wrapper calls itself), `foundry_update`'s fingerprint (every path, absent versus null, a
 fingerprint from another change), overlapping paths, a refused update, an object put back whole, two clients
 applying at once, an edit too large to undo, a token from another scene, and pages shortened to fit a reply
-without skipping rows.
+without skipping rows. After the second review: a reply the module did not sign refused, unproven connections
+refused before the upgrade, a fingerprint for a removal not accepted for a literal value, an overlap hidden by a
+sibling key, a write inside a value that is not an object refused, an undo a hook changed kept as not undone, and
+a dice wrapper put on top without calling another module's function.
 
 ### Not tested
 

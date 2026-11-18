@@ -187,7 +187,7 @@ const sign = (key, text) => createHmac('sha256', key).update(text).digest();
 const bindingOf = (hello, hubNonce) => [hello.nonce, hubNonce, hello.protocol, hello.world, hello.core, hello.system, hello.session].join('\n');
 function rawSocket(port, origin, token, { firstMessage, claimedWorld, reported = {}, relayed = {}, hubToken = MODULE_TOKEN } = {}) {
   const ws = new NodeWebSocket(`ws://127.0.0.1:${port}/foundry`, { headers: { origin } });
-  const hello = { protocol: 6, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc', ...reported };
+  const hello = { protocol: 7, session: 's', world: 'test-world', core: '14', system: 'y', nonce: 'abc', ...reported };
   const sent = { ...hello, world: claimedWorld ?? hello.world, ...relayed };
   return new Promise((resolve) => {
     ws.addEventListener('open', () => ws.send(firstMessage ?? JSON.stringify({ hello: sent })));
@@ -774,9 +774,10 @@ try {
     CONFIG.Dice.randomUniform = wrapped;
     mersenne.handler = wrappedHandler;
     await dice({ seed: 8 });
-    assert.equal(CONFIG.Dice.randomUniform, wrapped, 'reseeding leaves the other module\'s wrapper in place');
-    assert.equal(mersenne.handler, wrappedHandler);
+    assert.notEqual(CONFIG.Dice.randomUniform, wrapped, 'reseeding puts a fresh wrapper on top, without calling theirs to look');
     assert.equal((await dice({ seed: null })).active, false);
+    assert.equal(CONFIG.Dice.randomUniform, wrapped, 'their wrapper is on top again, still in the chain');
+    assert.equal(mersenne.handler, wrappedHandler);
     let ownRolls = 0;
     const realRandom = Math.random;
     Math.random = () => (ownRolls++, 0.5);
@@ -901,6 +902,7 @@ try {
       if (this.slow) await sleep(this.slow);
       if (this.veto) return undefined;
       merge(this._source, change);
+      this.tamper?.(this._source); // a module hook changing what is saved
       return this;
     },
   };
@@ -939,6 +941,13 @@ try {
     // A fingerprint from a preview of another change, or one made up, is refused: every affected path must be covered.
     assert.match((await update({ set: { 'config.dim': 30, hidden: true }, apply: true, expected: preview.expected })).content[0].text, /different change/);
     assert.match((await update({ set: { 'config.dim': 5, 'flags.mod.note': 'lit' }, apply: true, expected: preview.expected })).content[0].text, /different change/, 'the same paths with another value');
+    // A removal is not the same change as setting the text that once stood for one.
+    const removal = payload(await update({ remove: ['flags.mod.note'] })).result;
+    assert.match((await update({ set: { 'flags.mod.note': '(removed)' }, apply: true, expected: removal.expected })).content[0].text, /different change/);
+    // A sibling that sorts between a parent and its child does not hide the overlap.
+    assert.match((await update({ set: { 'config.dim': 1, 'config-x': 1, config: {} } })).content[0].text, /overlap/);
+    // Writing inside a value that is not an object would replace it.
+    assert.match((await update({ set: { 'config.dim.inner': 1 } })).content[0].text, /holds a value, not an object/);
     assert.match((await update({ ...change, apply: true, expected: '[]' })).content[0].text, /different change/);
     assert.match((await update({ ...change, apply: true, expected: preview.expected, expectedWorld: 'elsewhere' })).content[0].text, /expected world "elsewhere"/);
     assert.equal(torch._source.config.dim, 20);
@@ -982,6 +991,16 @@ try {
     assert.deepEqual(torch._source.config.animation, { type: 'torch', speed: 5 });
     assert.equal(payload(await callTool('foundry_undo', { editId: objectEdit.editId })).result.undone, true);
     assert.deepEqual(torch._source.config.animation, { type: 'torch' });
+
+    // A hook that changes what an undo saves: the edit is kept as not undone.
+    const tamperPreview = payload(await update({ set: { 'config.bright': 11 } })).result;
+    const tamperEdit = payload(await update({ set: { 'config.bright': 11 }, apply: true, expected: tamperPreview.expected })).result;
+    torch.tamper = (source) => (source.config.bright = 99);
+    const tampered = payload(await callTool('foundry_undo', { editId: tamperEdit.editId })).result;
+    torch.tamper = null;
+    assert.deepEqual([tampered.undone, tampered.notRestored], [false, ['config.bright']]);
+    assert.equal(JSON.parse((await callTool('foundry_undo', { list: true })).content[0].text).edits.find((edit) => edit.id === tamperEdit.editId).undone, false);
+    torch._source.config.bright = 10;
 
     // A hook that refuses the update: nothing is recorded as applied, and nothing can be undone.
     torch.veto = true;
@@ -1367,7 +1386,7 @@ try {
       const ws = new NodeWebSocket(`ws://127.0.0.1:${BARE_PORT}/foundry`, { headers: { origin: ORIGIN } });
       ws.on('open', () => resolve(ws));
     })));
-    assert.deepEqual(await rawSocket(BARE_PORT, ORIGIN), { outcome: 'closed', code: 4005 });
+    assert.equal((await rawSocket(BARE_PORT, ORIGIN)).outcome, 'rejected', 'refused before the upgrade');
     idle.forEach((ws) => ws.close());
     await sleep(200);
     const tab = await rawSocket(BARE_PORT, ORIGIN);
@@ -1434,6 +1453,19 @@ try {
     assert.ok(seqs.length >= 17);
     assert.deepEqual(seqs, seqs.map((_, i) => i + 1));
     tab.ws.close();
+  });
+
+  await check('a reply the module did not sign is never believed', async () => {
+    const tab = await rawSocket(FAULT_PORT, ORIGIN, MODULE_TOKEN);
+    assert.equal(tab.outcome, 'welcomed');
+    tab.ws.on('message', (data) => {
+      const msg = JSON.parse(data);
+      if (msg.method === 'eval') tab.ws.send(JSON.stringify({ reply: JSON.stringify({ id: msg.id, ok: true, result: 'forged', logs: [] }), mac: '00'.repeat(32) }));
+    });
+    const call = await callTool('foundry_eval', { code: 'return 1', timeoutMs: 5000 }, { port: FAULT_PORT });
+    assert.equal(call.isError, true);
+    assert.doesNotMatch(call.content[0].text, /forged/);
+    assert.match(call.content[0].text, /disconnected|not connected/);
   });
 
   await check('clients that open with an MCP initialize handshake are served', async () => {

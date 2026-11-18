@@ -4,7 +4,7 @@
 // need to change.
 
 const MODULE_ID = 'foundry-mcp';
-const PROTOCOL = 6; // bump together with MODULE_PROTOCOL in server/index.js
+const PROTOCOL = 7; // bump together with MODULE_PROTOCOL in server/index.js
 const SESSION = Math.random().toString(36).slice(2, 10); // identifies this page load
 const EVAL_SOURCE = 'foundry-mcp-eval.js'; // name a caller's code gets in stack traces
 const TOOL_SOURCE = 'foundry-mcp-tool.js'; // and the hub's own fixed tools
@@ -149,19 +149,31 @@ function connect() {
     }
     if (msg.method === 'cancel') return running.get(msg.id)?.abort();
     if (running.size >= MAX_RUNNING) {
-      return send({ id: msg.id, ok: false, error: { message: `${MAX_RUNNING} evaluations are still running in Foundry; code that timed out keeps running. Reload the world to clear them.` }, logs: [] }, ws);
+      return reply({ id: msg.id, ok: false, error: { message: `${MAX_RUNNING} evaluations are still running in Foundry; code that timed out keeps running. Reload the world to clear them.` }, logs: [] });
     }
     const controller = new AbortController();
     running.set(msg.id, controller);
     // Not awaited: the queue moves on while this evaluation runs.
     evaluate(code, controller.signal, source)
       .catch(() => ({ ok: false, error: { message: 'The evaluation failed in a way that could not be reported.' }, logs: [] }))
-      .then((reply) => {
-        if (!send({ id: msg.id, ...reply }, ws)) {
-          send({ id: msg.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] }, ws);
-        }
-      })
+      .then((result) => reply({ id: msg.id, ...result }))
       .finally(() => running.delete(msg.id)); // whatever happened, the slot is free once the code has finished
+  }
+
+  // A reply travels as text with its own signature under the session key, so nothing between the tab and the hub can
+  // alter a result, or the undo record the hub keeps from one.
+  async function reply(body) {
+    let text;
+    try {
+      text = JSON.stringify(body);
+    } catch {
+      text = JSON.stringify({ id: body.id, ok: false, error: { message: 'The result could not be serialized.' }, logs: [] });
+    }
+    const sign = async (value) => (sessionKey ? { mac: toHex(await hmac(sessionKey, `reply\n${value}`)) } : {});
+    if (refused) return;
+    if (send({ reply: text, ...(await sign(text)) }, ws)) return;
+    const fallback = JSON.stringify({ id: body.id, ok: false, error: { message: 'The result could not be sent back (too large or not serializable).' }, logs: [] });
+    send({ reply: fallback, ...(await sign(fallback)) }, ws);
   }
 
   // The hub may not be running, or may restart: keep retrying quietly. Retry

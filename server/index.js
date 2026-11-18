@@ -9,7 +9,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer } from 'node:http';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
@@ -135,17 +135,10 @@ function ensureSecrets() {
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') fail(`Cannot save new secrets to ${configFile}: ${error.message}`);
-      let age = 0;
-      try {
-        age = Date.now() - statSync(lock).mtimeMs;
-      } catch {
-        continue; // removed in the meantime: try again
-      }
-      // A lock this old was left by a hub that crashed while saving. A younger one belongs to a hub still at work,
-      // and is never taken from it: after waiting, this hub stops instead.
-      if (age > 30_000) rmSync(lock, { force: true });
-      else if (tries >= 200) fail(`Another hub is saving new secrets to ${configFile}. Start this one again in a moment, or delete ${lock} if no other hub is starting.`);
-      else pause(50);
+      // A lock is never taken from another hub, however old: which hub owns it cannot be told safely. A stale one
+      // (left by a hub that crashed while saving) has to be deleted by hand, and the message says where it is.
+      if (tries >= 200) fail(`Another hub is saving new secrets to ${configFile}. Start this one again in a moment, or delete ${lock} if no other hub is starting.`);
+      pause(50);
     }
   }
   // process.exit skips `finally`, so the lock is removed before stopping too.
@@ -180,7 +173,7 @@ function ensureSecrets() {
   }
 }
 
-const MODULE_PROTOCOL = 6; // bump together with PROTOCOL in foundry-mcp/scripts/bridge.js
+const MODULE_PROTOCOL = 7; // bump together with PROTOCOL in foundry-mcp/scripts/bridge.js
 const MAX_RESULT_CHARS = 80_000;
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const MAX_PENDING = 16; // evaluations in flight at once, across all clients
@@ -323,7 +316,7 @@ function checkExpected(expect) {
   }
 }
 
-function callFoundry(code, { timeoutMs = 30_000, signal, source = 'tool', expect } = {}) {
+function callFoundry(code, { timeoutMs = 30_000, signal, source = 'tool', expect, connection } = {}) {
   if (!foundry && Date.now() - refusedWorldAt < 60_000) {
     throw new Error(
       "The world open in Foundry is not on this hub's allowlist, so the hub refused its connection and no code will be run in it. " +
@@ -344,6 +337,10 @@ function callFoundry(code, { timeoutMs = 30_000, signal, source = 'tool', expect
     );
   }
   checkExpected(expect);
+  // A call tied to the connection it started on runs nothing once another tab or world has taken its place.
+  if (connection && foundry !== connection) {
+    throw new Error('The Foundry connection changed (a reload, or another world) while this call waited. Nothing was run. Check foundry_status and try again.');
+  }
   if (pending.size >= MAX_PENDING) {
     throw new Error(`${MAX_PENDING} evaluations are already running in Foundry. Wait for some to finish or time out.`);
   }
@@ -394,9 +391,9 @@ function onFoundryConnection(ws) {
   ws.on('error', () => ws.terminate());
   // Connections that have not proved themselves are few and small, so a noisy local program
   // cannot tie up the hub's memory while the GM is using it.
+  setReceiveLimit(ws, MAX_HANDSHAKE_BYTES); // before anything, including a refusal: ws can still read while it closes
   if (handshaking >= MAX_HANDSHAKES) return ws.close(4005, 'Too many connections are starting at once');
   handshaking += 1;
-  setReceiveLimit(ws, MAX_HANDSHAKE_BYTES);
   let counted = true;
   const settled = () => {
     if (counted) handshaking -= 1;
@@ -423,11 +420,17 @@ function onFoundryConnection(ws) {
         if (worldAllowed(foundry.hello.world)) addFoundryLog(foundry.hello, msg.log);
         return;
       }
-      const request = pending.get(msg.id);
+      // A reply is text, signed under the session key when there is one: a reply that is not is never believed.
+      if (typeof msg.reply !== 'string') return;
+      if (ws.sessionKey && !secretEquals(msg.mac, hmac(ws.sessionKey, `reply\n${msg.reply}`).toString('hex'))) {
+        return ws.close(4003, 'A reply arrived that the module did not sign');
+      }
+      const body = JSON.parse(msg.reply);
+      const request = body && typeof body === 'object' ? pending.get(body.id) : undefined;
       if (!request) return;
-      pending.delete(msg.id);
+      pending.delete(body.id);
       clearTimeout(request.timer);
-      request.resolve(msg);
+      request.resolve(body);
     } catch {
       ws.close(4002, 'Malformed message');
     }
@@ -594,10 +597,10 @@ const textReply = (text, isError = false) => ({ content: [{ type: 'text', text }
 const pageCall = (fn, args = {}) => `return (${fn.toString()})(${JSON.stringify(args)});`;
 
 // Runs fixed page code and replies with its result (passed through `decorate`, if given).
-async function runPage(fn, args = {}, { expect, decorate } = {}) {
+async function runPage(fn, args = {}, { expect, decorate, connection, timeoutMs } = {}) {
   const logSeq = lastSeq;
   try {
-    const reply = await callFoundry(pageCall(fn, args), { signal: requestScope.getStore(), expect });
+    const reply = await callFoundry(pageCall(fn, args), { signal: requestScope.getStore(), expect, connection, timeoutMs });
     const body = reply.ok ? { result: decorate ? decorate(reply.result) : reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
     return { content: [{ type: 'text', text: asText({ ...body, logs: reply.logs, ...dropped }, { logSeq }) }], isError: !reply.ok };
@@ -678,7 +681,8 @@ async function evalTool(code, timeoutMs = 30_000, expect) {
     const startTime = Date.now() - CLOCK_SLACK_MS;
     const tracked = connection && connection.seenSeq !== undefined && !connection.untracked;
     const seqAtStart = connection?.seenSeq ?? 0;
-    const reply = await callFoundry(code, { timeoutMs: Math.max(1000, left()), signal: requestScope.getStore(), source: 'eval', expect });
+    if (left() <= 0) throw new Error('The time limit was used up while change tracking was being set up, so the code was not started. Nothing was run.');
+    const reply = await callFoundry(code, { timeoutMs: left(), signal: requestScope.getStore(), source: 'eval', expect });
     const body = reply.ok ? { result: reply.result } : { error: reply.error };
     const dropped = reply.logsDropped ? { logsDropped: reply.logsDropped } : {};
     let changed = {};
@@ -909,11 +913,11 @@ function buildMcpServer() {
         description:
           'Change one document safely, by dot paths. Without `apply` it is a preview: the change is validated on a copy and the ' +
           'reply has each path\'s `current` value, whether it `exists`, its `proposed` value, and `expected`; or `valid: false` ' +
-          'and the error. To make the change, call again with the same `set` and `remove`, `apply: true`, and the preview\'s ' +
-          '`expected`: if any of those paths has changed since the preview, nothing is applied and the conflicts are listed. ' +
-          'Setting an object merges it into the one there. An applied change returns `editId` for foundry_undo. Changes made ' +
-          'through this hub to one document are applied one at a time; a change made elsewhere at the same moment is not ' +
-          'locked out. Settings are changed with foundry_eval.',
+          'and the error. To make the change, call again with the same `uuid`, `set` and `remove`, `apply: true`, and the ' +
+          'preview\'s `expected`: if any of those paths has changed since the preview, nothing is applied and the conflicts are ' +
+          'listed. Setting an object merges it into the one there. An applied change returns `editId` for foundry_undo. Edits to ' +
+          'one document through this hub are made one at a time; a change made elsewhere at the same moment is not locked out. ' +
+          'Settings are changed with foundry_eval.',
         inputSchema: z.object({
           uuid: z.string().min(1).max(500).describe('The document UUID, for example "Scene.abc.AmbientLight.def" or "Actor.abc".'),
           set: z.record(z.string().min(1).max(300), jsonValue).optional().describe('Dot path to new value, for example { "config.dim": 30, "hidden": false }.'),
@@ -924,25 +928,50 @@ function buildMcpServer() {
         }),
       },
       async (args) => {
-        const paths = Object.keys(args.set ?? {}).length + (args.remove?.length ?? 0);
-        if (paths > 100) return textReply('At most 100 paths can be changed in one call.', true);
+        const requested = [...new Set([...Object.keys(args.set ?? {}), ...(args.remove ?? [])])].sort();
+        if (requested.length > 100) return textReply('At most 100 paths can be changed in one call.', true);
         if (args.apply && args.expected === undefined) {
           return textReply('Applying needs `expected`: preview the change first and pass the `expected` it returns, so a change made in between is not overwritten.', true);
         }
-        const world = foundry?.hello.world;
-        const session = foundry?.hello.session;
+        const connection = foundry;
+        const world = connection?.hello.world;
+        const session = connection?.hello.session;
         const { expectedWorld, expectedSession, ...rest } = args;
         const run = () =>
           runPage(page.updateDocument, rest, {
             expect: expectOf(args),
+            connection,
+            // An apply is not given up on early: the edit lock in the page is held until Foundry has saved.
+            timeoutMs: args.apply ? 120_000 : 30_000,
             decorate: (result) => {
               const { record, ...shown } = result ?? {};
-              if (!shown.applied) return { ...shown, world, session };
-              if (!record) return { ...shown, world, session };
-              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), ...JSON.parse(record), undone: false };
+              if (shown.valid && typeof shown.expected === 'string') {
+                // What the preview was made against, read from the fingerprint itself.
+                const { state } = JSON.parse(shown.expected);
+                const { proposed, expected, unchanged, ...head } = shown;
+                return {
+                  ...head,
+                  current: Object.fromEntries(state.map(([path, , value]) => [path, value])),
+                  exists: Object.fromEntries(state.map(([path, exists]) => [path, exists])),
+                  proposed, ...(unchanged ? { unchanged } : {}), expected, world, session,
+                };
+              }
+              if (!shown.applied || !record) return { ...shown, world, session };
+              // The record is kept by the hub for undo. Its paths must be exactly the ones asked for.
+              let saved;
+              try {
+                saved = JSON.parse(record);
+              } catch {
+                saved = null;
+              }
+              const fields = ['before', 'existed', 'after', 'exists'];
+              if (!saved || !fields.every((field) => saved[field] && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(requested))) {
+                return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
+              }
+              const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, undone: false };
               edits.push(edit);
               if (edits.length > MAX_EDITS) edits.shift();
-              return { ...shown, world, session, editId: edit.id };
+              return { ...shown, before: saved.before, after: saved.after, world, session, editId: edit.id };
             },
           });
         return args.apply ? oneAtATime(args.uuid, run) : run();
@@ -965,7 +994,8 @@ function buildMcpServer() {
         }),
       },
       async (args) => {
-        const world = foundry?.hello.world;
+        const connection = foundry;
+        const world = connection?.hello.world;
         if (args.list) {
           return textReply(asText({ edits: edits.map(({ before, existed, after, exists, roots, ...summary }) => ({ ...summary, paths: Object.keys(after) })) }));
         }
@@ -978,8 +1008,10 @@ function buildMcpServer() {
           const { before, existed, after, exists, roots, uuid } = edit;
           return runPage(page.undoUpdate, { uuid, before, existed, after, exists, roots }, {
             expect: expectOf(args),
+            connection,
+            timeoutMs: 120_000,
             decorate: (result) => {
-              if (result?.undone) edit.undone = true;
+              if (result?.undone === true) edit.undone = true;
               return { editId: edit.id, ...result };
             },
           });
@@ -1136,7 +1168,8 @@ const sockets = new WebSocketServer({
   maxPayload: MAX_SOCKET_BYTES,
   // Origin is the control here. Host is not checked as it is for /mcp: a page that reached this
   // port by DNS rebinding still sends its own origin, which is not on the list.
-  verifyClient: ({ origin }) => config.origins.includes(origin),
+  // Too many connections still proving themselves are refused before the upgrade, so they never get a socket.
+  verifyClient: ({ origin }) => config.origins.includes(origin) && handshaking < MAX_HANDSHAKES,
 });
 sockets.on('connection', onFoundryConnection);
 sockets.on('error', startupFailed); // the socket server re-emits the HTTP server's errors
