@@ -539,12 +539,12 @@ export async function updateDocument(args, signal) {
   };
   for (const path of paths) for (const ancestor of ancestors(path)) if (paths.includes(ancestor)) throw new Error('"' + ancestor + '" and "' + path + '" overlap. Change one or the other.');
   // What holds each path: for every ancestor, whether it is absent, an object, or another value.
-  const kind = (path) => {
-    if (!hasProperty(doc._source, path)) return 'absent';
-    const value = getProperty(doc._source, path);
+  const kind = (path, source = doc._source) => {
+    if (!hasProperty(source, path)) return 'absent';
+    const value = getProperty(source, path);
     return value !== null && typeof value === 'object' && !Array.isArray(value) ? 'object' : 'value';
   };
-  const shapeOf = (list) => Object.fromEntries([...new Set(list.flatMap(ancestors))].map((ancestor) => [ancestor, kind(ancestor)]));
+  const shapeOf = (list, source = doc._source) => Object.fromEntries([...new Set(list.flatMap(ancestors))].map((ancestor) => [ancestor, kind(ancestor, source)]));
   // Saves `data` and returns what Foundry reports this one update changed: the change its update hook receives for
   // this operation, which includes what the game system or a module added while preparing it (dnd5e resets death
   // saves when hit points rise from 0). Saves made by anyone else in the meantime are separate operations, not part of it.
@@ -573,8 +573,10 @@ export async function updateDocument(args, signal) {
     const SETTLE_MS = globalThis.foundryMcpSettleMs ?? 1000; // how long after the save to keep watching
     try {
       const updated = await doc.update(data, { [MARK]: id });
+      // What this save left, read at once: anything saved during the watch below is someone else's, never this edit's.
+      const saved = updated ? deepClone(doc._source) : null;
       if (updated) await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
-      return { updated, changed, linked };
+      return { updated, changed, linked, saved };
     } finally {
       Hooks.off(hook, hookId);
       for (const [name, watcher] of watchers) Hooks.off(name, watcher);
@@ -670,7 +672,7 @@ export async function updateDocument(args, signal) {
     // a system can remove one as a result of the edit after the save has returned (dnd5e's downed effect, on healing).
     const embeddedIds = () => Object.fromEntries(Object.entries(doc.collections ?? {}).map(([name, collection]) => [name, [...(collection?.keys?.() ?? [])]]));
     const embedded = embeddedIds();
-    const { updated, changed, linked } = await saveAndCapture(change());
+    const { updated, changed, linked, saved } = await saveAndCapture(change());
     // Foundry resolves to nothing when a hook or the server refused the update.
     if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
     // The undo record is made of exactly the paths Foundry reports this one update changed: the leaves an object
@@ -699,15 +701,15 @@ export async function updateDocument(args, signal) {
       const keys = path.split('.');
       for (let i = 1; i <= keys.length; i++) if (!hasProperty(snapshot, keys.slice(0, i).join('.'))) { roots[path] = keys.slice(0, i).join('.'); break; }
     }
-    const after = Object.fromEntries(recorded.map((path) => [path, read(doc._source, path)]));
-    const exists = Object.fromEntries(recorded.map((path) => [path, hasProperty(doc._source, path)]));
+    const after = Object.fromEntries(recorded.map((path) => [path, read(saved, path)]));
+    const exists = Object.fromEntries(recorded.map((path) => [path, hasProperty(saved, path)]));
     // A module replaced an object holding one of the paths with a value as this was saved: undo could not write
     // through it, so say so now rather than offer an undo that will refuse.
-    const replaced = Object.entries(shapeOf(recorded)).filter(([, kind]) => kind === 'value').map(([path]) => path);
+    const replaced = Object.entries(shapeOf(recorded, saved)).filter(([, kind]) => kind === 'value').map(([path]) => path);
     if (replaced.length) return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), undoable: 'As this was saved, something replaced ' + replaced.join(', ') + ' with a value, so this edit cannot be undone with foundry_undo.' };
     // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
     const elsewhere = linked.length ? { linkedChanged: linked, linkedNote: 'Foundry also changed these linked documents as this was saved (a system can, as dnd5e removes a downed effect on healing). foundry_undo restores this document only, not them.' } : {};
-    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded), linked, embedded });
+    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded, saved), linked, embedded });
     const scope = Object.keys(embedded).length ? { undoScope: 'foundry_undo restores the data of this document itself. Documents embedded in it (effects, items) that the system adds or removes because of this edit, now or a moment later, are reported by foundry_undo, not restored.' } : {};
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
     return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), ...elsewhere, ...scope, record };
@@ -728,9 +730,9 @@ export async function undoUpdate(args, signal) {
   const { ForcedDeletion, ForcedReplacement } = foundry.data.operators;
   const canon = (value) => JSON.stringify(value ?? null, (key, item) => (item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map((k) => [k, item[k]])) : item));
   const read = (path) => (hasProperty(doc._source, path) ? deepClone(getProperty(doc._source, path)) : null);
-  const kind = (path) => {
-    if (!hasProperty(doc._source, path)) return 'absent';
-    const value = getProperty(doc._source, path);
+  const kind = (path, source = doc._source) => {
+    if (!hasProperty(source, path)) return 'absent';
+    const value = getProperty(source, path);
     return value !== null && typeof value === 'object' && !Array.isArray(value) ? 'object' : 'value';
   };
   // Saves `data` and returns what Foundry reports this one update changed: the change its update hook receives for
@@ -761,8 +763,10 @@ export async function undoUpdate(args, signal) {
     const SETTLE_MS = globalThis.foundryMcpSettleMs ?? 1000; // how long after the save to keep watching
     try {
       const updated = await doc.update(data, { [MARK]: id });
+      // What this save left, read at once: anything saved during the watch below is someone else's, never this edit's.
+      const saved = updated ? deepClone(doc._source) : null;
       if (updated) await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
-      return { updated, changed, linked };
+      return { updated, changed, linked, saved };
     } finally {
       Hooks.off(hook, hookId);
       for (const [name, watcher] of watchers) Hooks.off(name, watcher);
@@ -867,18 +871,19 @@ export async function undoUpdate(args, signal) {
         goes.push(path);
       }
     }
-    const { updated, changed, linked } = await saveAndCapture(data);
+    const { updated, changed, linked, saved } = await saveAndCapture(data);
     if (!updated) return { undone: false, note: 'Foundry did not save the undo: a module hook or the server refused it. Nothing was changed.' };
     // Anything else the system or a module changed as part of this undo is reported; it is not undone in turn.
     const mine = Object.keys(args.before);
     const alsoChanged = changedPaths(changed).filter((p) => !mine.some((q) => p === q || p.startsWith(q + '.') || q.startsWith(p + '.')));
     // Checked, not assumed: a hook may have changed what was saved.
     const differs = [
-      ...Object.keys(args.before).filter((path) => args.existed[path] && (!hasProperty(doc._source, path) || canon(read(path)) !== canon(args.before[path]))),
-      ...goes.filter((path) => hasProperty(doc._source, path)),
+      // Read from what this save left, not from later saves made during the watch.
+      ...Object.keys(args.before).filter((path) => args.existed[path] && (!hasProperty(saved, path) || canon(getProperty(saved, path)) !== canon(args.before[path]))),
+      ...goes.filter((path) => hasProperty(saved, path)),
     ];
     return {
-      undone: differs.length === 0, uuid: doc.uuid, restored: Object.fromEntries(Object.keys(args.before).map((path) => [path, read(path)])),
+      undone: differs.length === 0, uuid: doc.uuid, restored: Object.fromEntries(Object.keys(args.before).map((path) => [path, hasProperty(saved, path) ? deepClone(getProperty(saved, path)) : null])),
       ...(differs.length ? { notRestored: differs, note: 'Foundry saved something other than the earlier state for these paths, so the edit is kept as not undone.' } : {}),
       ...(alsoChanged.length ? { alsoChanged } : {}),
       // What the edit changed in linked documents is not put back; say so every time, not only when the edit was made.

@@ -1156,6 +1156,17 @@ try {
     assert.deepEqual(fav.linkedChanged, [{ action: 'update', documentName: 'Item', uuid: sibling.uuid, name: 'Pack', paths: ['system.favorite'] }]);
     assert.equal(payload(await callTool('foundry_undo', { editId: fav.editId })).result.notRestoredElsewhere[0].uuid, sibling.uuid);
 
+    // Someone else saves the same field during the watch after the save: the edit records its own value, so undo sees
+    // the later change and refuses rather than overwrite it.
+    torch.prepare = () => setTimeout(() => (torch._source.config.dim = 99), 20);
+    const racePreview2 = payload(await update({ set: { 'config.dim': 12 } })).result;
+    const raced = payload(await update({ set: { 'config.dim': 12 }, apply: true, expected: racePreview2.expected })).result;
+    torch.prepare = null;
+    assert.deepEqual(raced.after, { 'config.dim': 12 }, 'the value this edit saved, not the later one');
+    const racedUndo = payload(await callTool('foundry_undo', { editId: raced.editId })).result;
+    assert.deepEqual([racedUndo.undone, torch._source.config.dim], [false, 99]);
+    torch._source.config.dim = 20;
+
     // The system removes an embedded effect a moment after the save has returned: the apply says undo covers this
     // document only, and the undo names the effect that is gone.
     torch.collections = { effects: new Map([['down', { name: 'Unconscious' }]]) };
