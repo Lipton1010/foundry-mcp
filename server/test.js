@@ -126,7 +126,7 @@ globalThis.game = {
   version: '14.370',
   actors: Object.assign(new Map([['a1', actor]]), { getName: () => actor }),
   items: new Map(), scenes: Object.assign(new Map(), { active: null }), macros: new Map(), journal: new Map(),
-  modules: [{ id: 'foundry-mcp', version: '0.5.0', active: true }],
+  modules: [{ id: 'foundry-mcp', version: '0.6.0', active: true }],
 };
 globalThis.fromUuid = async (uuid) => ({ 'Actor.g1': goblin, 'Setting.s1': storedSetting })[uuid] ?? null;
 globalThis.canvas = { scene: null };
@@ -478,10 +478,17 @@ try {
     Hooks.fire('preUpdateActor', vault, { flags: { mod: { '-=creds': null } } });
     Hooks.fire('updateActor', vault, { flags: { mod: { '-=creds': null } } }, {}, 'gm1');
     Hooks.fire('updateActor', vault, { flags: { mod: { list: [{ password: 'zz-in-array-zz' }], apiKeys: ['zz-key-list-zz'] } } }, {}, 'gm1');
+    // Foundry's own "token" and "key" fields: a chat speaker's token id and an Active Effect change's attribute path.
+    Hooks.fire('updateActor', vault, { flags: { mod: { speaker: { token: 'KxeEuSgHRRZueFXj', accessToken: 'zz-access-zz' }, changes: [{ key: 'system.attributes.ac.bonus', value: '2' }] } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
     assert.ok(!JSON.stringify(nested).includes('zz-'), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
     assert.deepEqual(nested.entries[1].changes, [{ path: 'flags.mod.list', value: [{ password: '[withheld]' }] }, { path: 'flags.mod.apiKeys', value: ['[withheld]'] }]);
+    assert.deepEqual(nested.entries[2].changes, [
+      { path: 'flags.mod.speaker.token', value: 'KxeEuSgHRRZueFXj' },
+      { path: 'flags.mod.speaker.accessToken', value: '[withheld]' },
+      { path: 'flags.mod.changes', value: [{ key: 'system.attributes.ac.bonus', value: '2' }] },
+    ]);
 
     // Updates to one document that overlap cannot be matched to their earlier values, so those are left out.
     const overlap = payload(await callTool('foundry_changes')).lastSeq;

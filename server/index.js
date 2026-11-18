@@ -603,7 +603,12 @@ const CHANGES = `
       if (json === undefined) return null;
       return json.length > 2000 ? '[' + (Array.isArray(value) ? 'Array' : 'Object') + ', ' + json.length + ' chars; read the document for it]' : JSON.parse(json);
     };
-    const secret = (path, value) => typeof value === 'string' && value !== '' && credential.test(path.split('.').at(-1));
+    // In document data a field named just "token" or "key" is Foundry's own: a token id (a chat speaker, a target)
+    // or an Active Effect change's attribute path. Names like apiKey or accessToken are still withheld.
+    const secret = (path, value) => {
+      const name = path.split('.').at(-1);
+      return typeof value === 'string' && value !== '' && credential.test(name) && !/^(?:token|key)$/i.test(name);
+    };
     // A change as a list of dot paths. Foundry's deletion operator and the older "-=key" form both read as deleted.
     const paths = (change) => {
       let plain;
@@ -767,7 +772,7 @@ const INSTRUCTIONS =
   'changesSeq to foundry_changes for ones made later. To test automation reproducibly, fix dice with foundry_dice first.';
 
 function buildMcpServer() {
-  const server = new McpServer({ name: 'foundry', version: '0.5.0' }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: 'foundry', version: '0.6.0' }, { instructions: INSTRUCTIONS });
 
   server.registerTool(
     'foundry_status',

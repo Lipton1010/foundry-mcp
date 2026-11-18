@@ -60,7 +60,7 @@ No arguments. Call it first.
     "core": "14.370", "system": "dnd5e", "systemTitle": "Dungeons & Dragons Fifth Edition", "systemVersion": "6.0.6",
     "user": "Gamemaster", "activeScene": "Tavern", "viewedScene": "Tavern",
     "counts": { "actors": 58, "items": 20, "scenes": 49, "macros": 92, "journal": 98 },
-    "activeModules": ["foundry-mcp@0.5.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.11"],
+    "activeModules": ["foundry-mcp@0.6.0", "lib-wrapper@1.13.5.1", "midi-qol@14.6.11"],
     "windowVisibility": "visible"
   },
   "logs": [],
@@ -146,10 +146,13 @@ Lists document changes the GM's tab has seen, from any user or module, newest la
   gives no way to tell which earlier values belong to which update. A field removed with Foundry's deletion operator reads
   `"deleted": true`.
 - A deletion carries the deleted document's data, if it is under 20,000 characters, so it can be created again.
-- Tracking starts with the first call to `foundry_eval` or `foundry_changes` and lasts until the page reloads. The
+- Tracking starts with the first call to `foundry_eval` or `foundry_changes` and lasts until the page reloads.
+  After updating the hub, reload the world so the tab picks up the new tracking code. The
   newest 500 changes are kept, in the browser's memory only; `evicted` counts the rest. Long text values are cut.
 - A text value under a credential-like name (password, secret, api key, a name ending in `token` or `key`, and so
-  on) is `[withheld]`, at any depth inside an object or list, as are the values of settings named that way. This is best effort, as in `foundry_settings`.
+  on) is `[withheld]`, at any depth inside an object or list, as are the values of settings named that way. Fields
+  named just `token` or `key` are Foundry's own (a token id, an Active Effect change's attribute path) and are
+  kept. This is best effort, as in `foundry_settings`.
 
 ### `foundry_dice`
 
@@ -221,7 +224,7 @@ example.
 5. **Install the module.** In Foundry's setup screen choose **Add-on Modules ► Install Module** and paste the
    manifest URL `https://github.com/Lipton1010/foundry-mcp/releases/latest/download/module.json`. The hub is not
    part of the module and comes from this repository; keep the two on the same version (check out the matching
-   tag, for example `git checkout v0.5.0`). To work on the module itself, copy or link the `foundry-mcp` folder
+   tag, for example `git checkout v0.6.0`). To work on the module itself, copy or link the `foundry-mcp` folder
    into Foundry's `Data/modules` folder instead and restart Foundry. On Windows a junction keeps it in step with
    your checkout:
    ```
@@ -366,6 +369,12 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   the code after a timeout, a wrong token is refused, and a hub reached without the bearer token answers 401.
 - A hub whose allowlist does not include the open world refuses its connection, runs nothing and keeps no logs.
 - A clean install from a fresh clone, following the Setup steps, driven from Claude Code.
+- `foundry_changes` and `foundry_dice`, on 17 November 2026: a midi-qol attack with the next d20 forced to 20
+  landed as a critical hit, and the call listed the target's hit points with their earlier value, the chat cards
+  and the flags other modules wrote; a change made after the call returned was found with `changesSeq`; deleted
+  chat messages came back with their data, a credential-like flag withheld and the speaker's token id kept; the
+  first calls on a freshly loaded page listed their changes; seed 42 gave the same d20 rolls twice, matching
+  Foundry's own `MersenneTwister`, and turning it off restored Foundry's functions and random rolls.
 - The code of the three read-only tools, on 15 November 2026, sent through `foundry_eval` rather than by calling
   the tools: the collection and compendium overview (14 collections, 85 packs), a name search, a compendium
   listing, an actor read whole and by field, an embedded item, a compendium document, both error messages, and
@@ -387,15 +396,8 @@ the change tracker and dice control (below).
 
 ### Not tested
 
-- **`foundry_changes` and `foundry_dice` against real Foundry.** In simulation, the tracker records updates with
-  their earlier values, creations, deletions with their data, Foundry's deletion operator and the older `-=key`
-  form, withholds credential-like values at any depth, leaves out earlier values when updates overlap, installs its
-  hooks once, credits a change to its call when the tab's clock runs behind, and never lists one change for two
-  calls, overlapping or not; dice control seeds both `CONFIG.Dice.randomUniform` and Foundry's "Mersenne"
-  fulfillment method, fits queued results to dice, refuses an invalid seed, restores Foundry's own functions, and
-  passes rolls through when another module has wrapped them. Both were written against Foundry 14.370's source, and seeding
-  was checked against its own `MersenneTwister`, but neither has run in a world yet.
-
+- **`foundry_changes` and `foundry_dice` in the edge cases simulation covers:** updates to one document that
+  overlap, evaluations that truly overlap in time, and another module wrapping the dice functions.
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - The read-only tools called by name from a client against a real world (their code has been; see above), and
   installing the module in Foundry through the manifest URL.
