@@ -520,7 +520,7 @@ Tested by the author on one Windows 11 machine on 14 November 2026:
   all 1200 registered settings, of which one text value was withheld and none was unreadable.
 - The [midi-qol demo](docs/demo-midi-qol.md), start to finish.
 
-### Tested in simulation only (`npm test`, 76 checks)
+### Tested in simulation only (`npm test`, 77 checks)
 
 Serialization and its size limits (including replies cut down to valid JSON), the cost of one console line while
 several evaluations run, timeouts and the abort signal, the concurrency caps, flood limits and retention,
