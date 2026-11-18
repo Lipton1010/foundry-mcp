@@ -561,6 +561,10 @@ a dice wrapper put on top without calling another module's function. After the t
   there. Simulation covers both.
 - **`foundry_scene` on a scene with several levels.** The test world has none, so level estimates for lights and
   tokens on multi-level scenes have only been simulated.
+- **Known gaps in `foundry_undo`, left for a later release.** An apply whose save completes but whose reply is lost
+  (the 120-second limit passes, the page reloads, or the connection drops during the one-second watch after the save)
+  leaves the change made with no undo record. With two copies of one world open at one address under different route
+  prefixes, `foundry_undo` without `editId` can pick the other copy's newer edit and refuse it; pass `editId`.
 - **Antigravity** with a hub token. It has only been run against a tokenless hub.
 - Installing the module through Foundry's own Install Module dialog. The v0.6.0 manifest and the zip it points to
   were downloaded and checked as Foundry reads them (module.json at the root, matching version, every script
