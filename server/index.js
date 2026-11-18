@@ -620,7 +620,8 @@ async function runPage(fn, args = {}, { expect, decorate, connection, timeoutMs,
 // Change tracking is installed once per connection (and so once per page) before it is first needed. Every
 // caller waits for that one installation; only one that never got an answer (a timeout, a disconnect) is retried.
 function tracking(connection) {
-  connection.tracking ??= callFoundry(pageCall(page.installChanges), { timeoutMs: 10_000 }).then(
+  // Tied to this connection: if another tab or a reload has replaced it, nothing is run on the new one under its label.
+  connection.tracking ??= Promise.resolve().then(() => callFoundry(pageCall(page.installChanges), { timeoutMs: 10_000, connection })).then(
     (reply) => {
       if (reply.ok && reply.result) {
         connection.seenSeq = Math.max(connection.seenSeq ?? 0, reply.result.seq);
@@ -659,7 +660,7 @@ async function queryChanges(connection, args, deadline) {
     if (timeoutMs < 250) return tooLate;
     let reply;
     try {
-      reply = await callFoundry(pageCall(page.queryChanges, args), { timeoutMs, signal: requestScope.getStore() });
+      reply = await callFoundry(pageCall(page.queryChanges, args), { timeoutMs, signal: requestScope.getStore(), connection });
     } catch (error) {
       return { error: error.message };
     }

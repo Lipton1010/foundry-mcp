@@ -392,6 +392,14 @@ try {
       assert.match(byKey['weather.broken'].unreadable, /not a registered setting/);
       assert.equal(byKey['weather.broken'].name, null);
       assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
+      // Doubly encoded JSON too long to unwrap is withheld whole.
+      const units = settings['weather.units'];
+      settings['weather.units'] = { huge: JSON.stringify(JSON.stringify({ apiKey: 'zz-huge-zz', pad: 'x'.repeat(110_000) })) };
+      try {
+        assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings[0].value, { huge: '[withheld: too long to check for credentials]' });
+      } finally {
+        settings['weather.units'] = units;
+      }
       assert.deepEqual(payload(await callTool('foundry_settings', { contains: 'default token' })).result.settings.map((setting) => setting.key), ['defaultToken']);
       const firstPage = payload(await callTool('foundry_settings', { limit: 2 })).result;
       assert.deepEqual([firstPage.total, firstPage.settings.length, firstPage.nextOffset], [5, 2, 2]);
@@ -946,6 +954,7 @@ try {
   };
   rogue.parent = crypt;
   const stranger = { ...rogue, uuid: 'Scene.s2.Token.t9', name: 'Stranger', parent: { documentName: 'Scene', uuid: 'Scene.s2' } };
+  globalThis.foundryMcpSettleMs = 60; // how long an edit keeps watching after its save; a second in Foundry
   const lookUp = globalThis.fromUuid;
   globalThis.fromUuid = async (uuid) => ({ 'Scene.s1': crypt, 'Scene.s1.AmbientLight.l1': torch, 'Scene.s1.Token.t1': rogue, 'Scene.s2.Token.t9': stranger })[uuid] ?? lookUp(uuid);
 
@@ -1136,6 +1145,16 @@ try {
     assert.equal(healUndo.undone, true);
     assert.match(healUndo.linkedNote, /does not restore/);
     assert.equal(healUndo.notRestoredElsewhere[0].uuid, effect.uuid);
+
+    // A later save of the system's own, to a sibling under the same owner, shortly after the edit's save (dnd5e clears
+    // a favorite when an item's quantity drops): reported with the paths it touched.
+    const sibling = { documentName: 'Item', uuid: torch.uuid + '.Item.pack', name: 'Pack' };
+    torch.prepare = () => setTimeout(() => Hooks.fire('updateItem', sibling, { system: { favorite: false } }, {}, 'gm1'), 20);
+    const favPreview = payload(await update({ set: { 'config.dim': 7 } })).result;
+    const fav = payload(await update({ set: { 'config.dim': 7 }, apply: true, expected: favPreview.expected })).result;
+    torch.prepare = null;
+    assert.deepEqual(fav.linkedChanged, [{ action: 'update', documentName: 'Item', uuid: sibling.uuid, name: 'Pack', paths: ['system.favorite'] }]);
+    assert.equal(payload(await callTool('foundry_undo', { editId: fav.editId })).result.notRestoredElsewhere[0].uuid, sibling.uuid);
 
     // The system removes an embedded effect a moment after the save has returned: the apply says undo covers this
     // document only, and the undo names the effect that is gone.

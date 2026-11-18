@@ -96,7 +96,9 @@ export function readSettings(args) {
   const clean = (value, depth, key = '') => {
     if (typeof value === 'string') {
       if (key && credential.test(key) && value) return '[withheld]';
-      // JSON encoded as a string more than once is unwrapped and cleaned too.
+      // JSON encoded as a string more than once is unwrapped and cleaned too; too long to unwrap and holding an escaped
+      // key, it is withheld.
+      if (/^\s*"/.test(value) && (value.length > 100_000 || depth > 20)) return /\\+"\s*:/.test(value) ? '[withheld: too long to check for credentials]' : value;
       if (/^\s*"/.test(value) && value.length <= 100_000 && depth <= 20) {
         let inner;
         try {
@@ -554,16 +556,24 @@ export async function updateDocument(args, signal) {
     const hookId = Hooks.on(hook, (document, change, options) => {
       if (document === doc && options?.[MARK] === id) changed = change;
     });
-    // Documents linked to this one (embedded in it, or holding it) that change while it is saved: a system can do that
-    // as part of the update (dnd5e removes a character's downed effect when it is healed). Undo cannot put those back,
-    // so they are reported. A save someone else makes to them at the same moment is reported too, to be safe.
+    // Other documents under the same owner (the actor or scene this one belongs to, it, and everything embedded in it)
+    // that change while this is saved and for a moment after: a system can do that because of the update, sometimes in
+    // a later save of its own (dnd5e removes a downed effect on healing, and an Encumbered effect and a favorite when an
+    // item's quantity drops). Undo cannot put those back, so they are reported, with the paths an update touched. A
+    // save someone else makes to them in that time is reported too, to be safe.
+    let top = doc;
+    while (top.parent) top = top.parent;
+    const family = top.uuid;
     const linked = [];
-    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid.startsWith(doc.uuid + '.') || doc.uuid.startsWith(other.uuid + '.'));
-    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other) => {
-      if (related(other)) linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null });
+    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid === family || other.uuid.startsWith(family + '.'));
+    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other, change) => {
+      if (!related(other)) return;
+      linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null, ...(action === 'update' ? { paths: changedPaths(change).slice(0, 20) } : {}) });
     })]));
+    const SETTLE_MS = globalThis.foundryMcpSettleMs ?? 1000; // how long after the save to keep watching
     try {
       const updated = await doc.update(data, { [MARK]: id });
+      if (updated) await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
       return { updated, changed, linked };
     } finally {
       Hooks.off(hook, hookId);
@@ -734,16 +744,24 @@ export async function undoUpdate(args, signal) {
     const hookId = Hooks.on(hook, (document, change, options) => {
       if (document === doc && options?.[MARK] === id) changed = change;
     });
-    // Documents linked to this one (embedded in it, or holding it) that change while it is saved: a system can do that
-    // as part of the update (dnd5e removes a character's downed effect when it is healed). Undo cannot put those back,
-    // so they are reported. A save someone else makes to them at the same moment is reported too, to be safe.
+    // Other documents under the same owner (the actor or scene this one belongs to, it, and everything embedded in it)
+    // that change while this is saved and for a moment after: a system can do that because of the update, sometimes in
+    // a later save of its own (dnd5e removes a downed effect on healing, and an Encumbered effect and a favorite when an
+    // item's quantity drops). Undo cannot put those back, so they are reported, with the paths an update touched. A
+    // save someone else makes to them in that time is reported too, to be safe.
+    let top = doc;
+    while (top.parent) top = top.parent;
+    const family = top.uuid;
     const linked = [];
-    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid.startsWith(doc.uuid + '.') || doc.uuid.startsWith(other.uuid + '.'));
-    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other) => {
-      if (related(other)) linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null });
+    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid === family || other.uuid.startsWith(family + '.'));
+    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other, change) => {
+      if (!related(other)) return;
+      linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null, ...(action === 'update' ? { paths: changedPaths(change).slice(0, 20) } : {}) });
     })]));
+    const SETTLE_MS = globalThis.foundryMcpSettleMs ?? 1000; // how long after the save to keep watching
     try {
       const updated = await doc.update(data, { [MARK]: id });
+      if (updated) await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
       return { updated, changed, linked };
     } finally {
       Hooks.off(hook, hookId);
