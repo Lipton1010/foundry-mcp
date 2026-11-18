@@ -93,7 +93,7 @@ const ALL_TOOLS = [
 const hooks = {};
 const settings = {
   'foundry-mcp.url': 'ws://evil.example:30199/foundry', 'foundry-mcp.token': '', 'foundry-mcp.pairingToken': '', 'foundry-mcp.allowNoToken': true,
-  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/zz-settings-hook-zz', auth: { password: 'zz-settings-pw-zz' }, profile: '{"user":"gm","password":"zz-settings-json-zz"}', room: JSON.stringify(JSON.stringify({ slug: 'table', passcode: 'zz-room-pass-zz' })) },
+  'core.defaultToken': { displayName: 20 }, 'weather.apiKey': 'sk-weather-123', 'weather.units': { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/zz-settings-hook-zz', auth: { password: 'zz-settings-pw-zz' }, profile: '{"user":"gm","password":"zz-settings-json-zz"}', room: JSON.stringify(JSON.stringify({ slug: 'table', passcode: 'zz-room-pass-zz' })), patron: 'gm.player@example.com' },
 };
 // What the read-only tools look at. A Foundry Collection is a Map that iterates its values.
 class Collection extends Map {
@@ -388,7 +388,7 @@ try {
       assert.ok(!JSON.stringify(all).includes('the-hub-token-itself') && !JSON.stringify(all).includes('sk-weather-123'));
       // "Token" is an everyday word in Foundry: a setting that is not text is shown.
       assert.deepEqual(byKey['core.defaultToken'], { namespace: 'core', key: 'defaultToken', scope: 'world', name: 'Default Token', value: { displayName: 20 } });
-      assert.deepEqual(byKey['weather.units'].value, { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/[withheld]', auth: { password: '[withheld]' }, profile: '{"user":"gm","password":"[withheld]"}', room: JSON.stringify(JSON.stringify({ slug: 'table', passcode: '[withheld]' })) }, 'webhook URLs and nested credentials in a value are withheld');
+      assert.deepEqual(byKey['weather.units'].value, { unit: 'metric', hook: 'https://discord.com/api/v10/webhooks/1/[withheld]', auth: { password: '[withheld]' }, profile: '{"user":"gm","password":"[withheld]"}', room: JSON.stringify(JSON.stringify({ slug: 'table', passcode: '[withheld]' })), patron: '[withheld: email]' }, 'webhook URLs and nested credentials in a value are withheld');
       assert.match(byKey['weather.broken'].unreadable, /not a registered setting/);
       assert.equal(byKey['weather.broken'].name, null);
       assert.deepEqual(payload(await callTool('foundry_settings', { namespace: 'weather', contains: 'UNIT' })).result.settings.map((setting) => setting.key), ['units']);
@@ -598,6 +598,8 @@ try {
     // JSON encoded as a string twice over.
     Hooks.fire('updateActor', vault, { flags: { mod: { wrapped: JSON.stringify(JSON.stringify({ password: 'zz-wrapped-zz', user: 'gm' })) } } }, {}, 'gm1');
     // A webhook URL carries its secret in itself, whatever the field is called.
+    // DDB Importer keeps the GM's Patreon email in a world setting.
+    Hooks.fire('updateSetting', { documentName: 'Setting', uuid: 'Setting.s6', key: 'ddb-importer.patreon-user' }, { value: JSON.stringify('zz.patron@example.com') }, {}, 'gm1');
     // dddice keeps a private room's passcode in its settings.
     Hooks.fire('updateSetting', { documentName: 'Setting', uuid: 'Setting.s7', key: 'dddice.room' }, { value: JSON.stringify(JSON.stringify({ slug: 'table', passcode: 'zz-dddice-zz' })) }, {}, 'gm1');
     Hooks.fire('updateActor', vault, { flags: { mod: { history: [{ url: 'https://discord.com/api/webhooks/123456/zz-hook-secret-zz', note: 'kept' }, { url: 'https://discord.com/api/v10/webhooks/123456/zz-hook-v10-zz' }] } } }, {}, 'gm1');
@@ -626,6 +628,8 @@ try {
       { path: 'flags.mod.label', value: '[Homebrew] Sword' },
     ]);
     assert.deepEqual(nested.entries[8].changes, [{ path: 'flags.mod.wrapped', value: JSON.stringify(JSON.stringify({ password: '[withheld]', user: 'gm' })) }]);
+    assert.deepEqual(nested.entries[9].changes, [{ path: 'value', value: JSON.stringify('[withheld: email]') }]);
+    nested.entries.splice(9, 1);
     assert.deepEqual(nested.entries[9].changes, [{ path: 'value', value: JSON.stringify(JSON.stringify({ slug: 'table', passcode: '[withheld]' })) }]);
     nested.entries.splice(9, 1);
     assert.deepEqual(nested.entries[9].changes, [{ path: 'flags.mod.history', value: [{ url: 'https://discord.com/api/webhooks/123456/[withheld]', note: 'kept' }, { url: 'https://discord.com/api/v10/webhooks/123456/[withheld]' }] }]);
@@ -701,7 +705,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 8);
+    assert.equal(globalThis[KEY].version, 9);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -955,6 +959,7 @@ try {
   rogue.parent = crypt;
   const stranger = { ...rogue, uuid: 'Scene.s2.Token.t9', name: 'Stranger', parent: { documentName: 'Scene', uuid: 'Scene.s2' } };
   globalThis.foundryMcpSettleMs = 60; // how long an edit keeps watching after its save; a second in Foundry
+  CONST.ALL_DOCUMENT_TYPES.push('AmbientLight'); // as in Foundry, so the edit's watch sees the light's own saves
   const lookUp = globalThis.fromUuid;
   globalThis.fromUuid = async (uuid) => ({ 'Scene.s1': crypt, 'Scene.s1.AmbientLight.l1': torch, 'Scene.s1.Token.t1': rogue, 'Scene.s2.Token.t9': stranger })[uuid] ?? lookUp(uuid);
 
@@ -1155,6 +1160,15 @@ try {
     torch.prepare = null;
     assert.deepEqual(fav.linkedChanged, [{ action: 'update', documentName: 'Item', uuid: sibling.uuid, name: 'Pack', paths: ['system.favorite'] }]);
     assert.equal(payload(await callTool('foundry_undo', { editId: fav.editId })).result.notRestoredElsewhere[0].uuid, sibling.uuid);
+
+    // The system saves the edited document itself again, separately, right after (dnd5e clears a favorite on the actor):
+    // reported, with the paths, and not taken for part of the edit.
+    torch.prepare = () => setTimeout(() => Hooks.fire('updateAmbientLight', torch, { flags: { favorites: [] } }, {}, 'gm1'), 20);
+    const selfPreview = payload(await update({ set: { 'config.dim': 13 } })).result;
+    const selfEdit = payload(await update({ set: { 'config.dim': 13 }, apply: true, expected: selfPreview.expected })).result;
+    torch.prepare = null;
+    assert.deepEqual(selfEdit.linkedChanged, [{ action: 'update', documentName: 'AmbientLight', uuid: torch.uuid, name: 'Torch', paths: ['flags.favorites'] }]);
+    assert.equal(payload(await callTool('foundry_undo', { editId: selfEdit.editId })).result.notRestoredElsewhere[0].uuid, torch.uuid);
 
     // Someone else saves the same field during the watch after the save: the edit records its own value, so undo sees
     // the later change and refuses rather than overwrite it.

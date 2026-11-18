@@ -120,7 +120,9 @@ export function readSettings(args) {
           return '[withheld: not readable as JSON]';
         }
       }
-      return /:\/\//.test(value) ? url(value) : value;
+      const plainText = /:\/\//.test(value) ? url(value) : value;
+      // An email address is private, wherever a module keeps it (DDB Importer keeps the GM's Patreon email in a setting).
+      return plainText.includes('@') ? plainText.replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[withheld: email]') : plainText;
     }
     if (!value || typeof value !== 'object' || depth > 20) return value;
     if (typeof value.toObject === 'function') {
@@ -167,7 +169,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 8; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
+  const VERSION = 9; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -217,6 +219,8 @@ export function installChanges() {
         .replace(/(:\/\/[^/@\s:"']*:)[^\s/?#"']+@/g, '$1[withheld]@')
         .replace(/([?&](?:token|access_token|api[-_]?key|key|sig|signature|secret|password|auth|code)=)[^&\s"'#]+/gi, '$1[withheld]');
     }
+    // An email address is private, wherever a module keeps it (DDB Importer keeps the GM's Patreon email in a setting).
+    if (typeof value === 'string' && value.includes('@')) value = value.replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '[withheld: email]');
     // JSON encoded as a string more than once (text that is itself a quoted string) is unwrapped, a few levels deep.
     // Too long to unwrap safely, and holding an escaped key: withheld rather than shown cut down.
     if (typeof value === 'string' && /^\s*"/.test(value) && value.length > 100_000) return /\\+"\s*:/.test(value) ? '[withheld: too long to check for credentials]' : value;
@@ -428,7 +432,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 8) return { installed: false }; // the same number as VERSION in installChanges
+  if (t?.version !== 9) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 
@@ -565,9 +569,12 @@ export async function updateDocument(args, signal) {
     while (top.parent) top = top.parent;
     const family = top.uuid;
     const linked = [];
-    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid === family || other.uuid.startsWith(family + '.'));
-    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other, change) => {
+    // The edited document itself counts too: a system can save it again, separately, because of this edit (dnd5e clears
+    // a favorite on the actor after an effect it removed). Only this edit's own save is left out.
+    const related = (other) => other && typeof other.uuid === 'string' && (other.uuid === family || other.uuid.startsWith(family + '.'));
+    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other, change, options) => {
       if (!related(other)) return;
+      if (other === doc && action === 'update' && options?.[MARK] === id) return; // this edit's own save
       linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null, ...(action === 'update' ? { paths: changedPaths(change).slice(0, 20) } : {}) });
     })]));
     const SETTLE_MS = globalThis.foundryMcpSettleMs ?? 1000; // how long after the save to keep watching
@@ -755,9 +762,12 @@ export async function undoUpdate(args, signal) {
     while (top.parent) top = top.parent;
     const family = top.uuid;
     const linked = [];
-    const related = (other) => other && other !== doc && typeof other.uuid === 'string' && (other.uuid === family || other.uuid.startsWith(family + '.'));
-    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other, change) => {
+    // The edited document itself counts too: a system can save it again, separately, because of this edit (dnd5e clears
+    // a favorite on the actor after an effect it removed). Only this edit's own save is left out.
+    const related = (other) => other && typeof other.uuid === 'string' && (other.uuid === family || other.uuid.startsWith(family + '.'));
+    const watchers = (globalThis.CONST?.ALL_DOCUMENT_TYPES ?? []).flatMap((type) => ['create', 'update', 'delete'].map((action) => [action + type, Hooks.on(action + type, (other, change, options) => {
       if (!related(other)) return;
+      if (other === doc && action === 'update' && options?.[MARK] === id) return; // this edit's own save
       linked.push({ action, documentName: type, uuid: other.uuid, name: other.name ?? null, ...(action === 'update' ? { paths: changedPaths(change).slice(0, 20) } : {}) });
     })]));
     const SETTLE_MS = globalThis.foundryMcpSettleMs ?? 1000; // how long after the save to keep watching
