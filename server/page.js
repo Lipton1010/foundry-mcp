@@ -120,7 +120,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 2;
+  const VERSION = 3; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -161,20 +161,19 @@ export function installChanges() {
     if (Array.isArray(value)) return value.map((item, index) => scrub(item, [...segments, String(index)], documentName));
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, scrub(item, [...segments, key], documentName)]));
     if (secret(documentName, segments, value)) return '[withheld]';
-    // Text that holds JSON (a module storing a profile as a string) is read and scrubbed like any object. Text too long
-    // to read safely that looks like it, and text that looks like it but does not parse, is withheld.
+    // Text that holds JSON (a module storing a profile as a string) is read and scrubbed like any object, and given back
+    // re-written from what was read (so a repeated key cannot carry an earlier value through). Text that looks like
+    // JSON (it opens with a bracket and has a quoted key) but is too long to read safely, or does not parse, is withheld.
     if (typeof value === 'string' && /^\s*[[{]/.test(value)) {
-      if (value.length > 100_000) return '[withheld: too long to check for credentials]';
+      const keyed = /"\s*:/.test(value);
+      if (value.length > 100_000) return keyed ? '[withheld: too long to check for credentials]' : value;
       let parsed;
       try {
         parsed = JSON.parse(value);
       } catch {
-        return value.length > VALUE_CHARS ? '[withheld: not readable as JSON]' : value;
+        return keyed ? '[withheld: not readable as JSON]' : value;
       }
-      if (parsed && typeof parsed === 'object') {
-        const clean = scrub(parsed, [], null);
-        return JSON.stringify(clean) === JSON.stringify(parsed) ? value : JSON.stringify(clean);
-      }
+      if (parsed && typeof parsed === 'object') return JSON.stringify(scrub(parsed, [], null));
     }
     return value;
   };
@@ -210,6 +209,7 @@ export function installChanges() {
         for (const key of keys) {
           if (!path && (key === '_id' || key === '_stats')) continue;
           if (key.startsWith('-=')) put((path ? path + '.' : '') + key.slice(2), { deleted: true });
+          else if (key.startsWith('==')) put((path ? path + '.' : '') + key.slice(2), { value: plain(value[key]) }); // older replacement syntax
           else walk(value[key], (path ? path + '.' : '') + key, depth + 1);
           if (more) return;
         }
@@ -245,7 +245,14 @@ export function installChanges() {
       if (path === 'key') return cap(value);
       if (path === 'value') return cap(settingValue(value));
     }
-    return scrub(cap(value), path.split('.'), doc.documentName);
+    // Scrubbed whole, then cut down: cutting first could turn JSON text into something that no longer parses.
+    let plainValue = value;
+    try {
+      plainValue = value === undefined ? null : JSON.parse(JSON.stringify(value));
+    } catch {
+      return '[Unserializable]';
+    }
+    return cap(scrub(plainValue, path.split('.'), doc.documentName));
   };
   const describe = (doc, userId) => ({
     time: new Date().toISOString(), documentName: doc.documentName, uuid: doc.uuid, name: doc.name ?? null,
@@ -349,7 +356,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 2) return { installed: false };
+  if (t?.version !== 3) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 
@@ -448,7 +455,8 @@ export async function updateDocument(args, signal) {
   const paths = [...new Set([...Object.keys(set), ...remove])].sort();
   if (!paths.length) throw new Error('Nothing to change: pass `set` and/or `remove`.');
   for (const path of paths) {
-    if (path === '_id' || path === '_stats' || path.startsWith('_stats.') || path.split('.').some((key) => !key || key.startsWith('-=') || key === '__proto__' || key === 'constructor' || key === 'prototype')) {
+    // "-=" and "==" are Foundry's older deletion and replacement syntax: they would act on another path than the one recorded.
+    if (path === '_id' || path === '_stats' || path.startsWith('_stats.') || path.split('.').some((key) => !key || key.startsWith('-=') || key.startsWith('==') || key === '__proto__' || key === 'constructor' || key === 'prototype')) {
       throw new Error('"' + path + '" cannot be changed with foundry_update.');
     }
   }
@@ -464,7 +472,7 @@ export async function updateDocument(args, signal) {
     const value = getProperty(doc._source, path);
     return value !== null && typeof value === 'object' && !Array.isArray(value) ? 'object' : 'value';
   };
-  const shape = () => Object.fromEntries(paths.map((path) => [path, ancestors(path).map((ancestor) => [ancestor, kind(ancestor)])]));
+  const shape = () => Object.fromEntries([...new Set(paths.flatMap(ancestors))].map((ancestor) => [ancestor, kind(ancestor)]));
   // Writing inside a value that is not an object would replace it, and undo could not tell what it was.
   const checkShape = () => {
     for (const path of paths) for (const ancestor of ancestors(path)) if (kind(ancestor) === 'value') throw new Error('"' + ancestor + '" holds a value, not an object, so "' + path + '" cannot be written inside it. Set "' + ancestor + '" itself.');
@@ -491,7 +499,8 @@ export async function updateDocument(args, signal) {
       return { ...about, valid: false, error: String(error?.message ?? error) };
     }
     const expected = JSON.stringify({ world: game.world.id, uuid: doc.uuid, change: asked, state: state(doc._source) });
-    const size = expected.length + JSON.stringify(proposed).length;
+    // Measured as the reply will carry it: the fingerprint as quoted text, and the current values the hub shows beside it.
+    const size = JSON.stringify({ expected, proposed, current: state(doc._source) }).length;
     if (size > MAX_PREVIEW) return { ...about, valid: false, error: 'This change is too large for foundry_update (' + size + ' characters with its record). Make it with foundry_eval instead.' };
     const unchanged = paths.filter((path) => canon(state(doc._source).find(([p]) => p === path)[2]) === canon(proposed[path]) && !remove.includes(path));
     return { ...about, valid: true, proposed, expected, ...(unchanged.length ? { unchanged } : {}) };
@@ -585,10 +594,12 @@ export async function undoUpdate(args, signal) {
       if (hasProperty(doc._source, path) !== args.exists[path] || canon(read(path)) !== canon(args.after[path])) {
         conflicts.push({ path, expected: args.exists[path] ? args.after[path] : '(absent)', now: hasProperty(doc._source, path) ? read(path) : '(absent)' });
       }
-      // The objects holding the path must be as the edit left them too: one replaced by a value since is a later change.
-      for (const [ancestor, was] of args.shape?.[path] ?? []) {
-        if (kind(ancestor) !== was) conflicts.push({ path: ancestor, expected: '(' + was + ')', now: '(' + kind(ancestor) + ')' });
-      }
+    }
+    // The objects holding the paths must be as the edit left them, and objects: writing through a value (one a module
+    // put there as the edit was saved, say) would replace it, whatever it holds now.
+    for (const [ancestor, was] of Object.entries(args.shape ?? {})) {
+      const now = kind(ancestor);
+      if (now !== was || now === 'value') conflicts.push({ path: ancestor, expected: was === 'value' ? '(an object)' : '(' + was + ')', now: '(' + now + ')' });
     }
     if (conflicts.length) return { undone: false, conflicts, note: 'These paths changed after the update, so nothing was undone.' };
     const data = {};
@@ -606,7 +617,7 @@ export async function undoUpdate(args, signal) {
     for (const [root, inside] of Object.entries(created)) {
       // The whole new part goes if it holds only what the edit put there; otherwise only the edit's own paths do.
       let made = {};
-      for (const path of inside) {
+      for (const path of inside.filter((p) => args.exists[p])) {
         if (path === root) made = args.after[path];
         else setProperty(made, path.slice(root.length + 1), args.after[path]);
       }

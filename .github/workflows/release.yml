@@ -39,7 +39,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         # Only the tag that was tested: it must still exist and still point at this commit.
         run: |
-          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$GITHUB_REF_NAME" --jq .sha)
           if [ "$tagged" != "$GITHUB_SHA" ]; then
             echo "Tag $GITHUB_REF_NAME now points at $tagged, not the tested commit $GITHUB_SHA" >&2
             exit 1

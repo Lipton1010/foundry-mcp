@@ -576,7 +576,8 @@ function fitForward(result, field, offset = 0) {
   if (rows.length === result[field].length) return result;
   const { nextOffset, ...rest } = result;
   const next = offset + rows.length;
-  return { ...rest, [field]: rows, ...(next < result.total ? { nextOffset: next } : {}), shortened: `Only ${rows.length} rows fit in one reply; pass nextOffset as offset for the rest.` };
+  // The cursor before the rows, so a single row too large to send whole cannot push it out of the reply.
+  return { ...(next < result.total ? { nextOffset: next } : {}), shortened: `Only ${rows.length} rows fit in one reply; pass nextOffset as offset for the rest.`, ...rest, [field]: rows };
 }
 function fitBackward(result, field) {
   if (!Array.isArray(result?.[field])) return result;
@@ -953,12 +954,17 @@ function buildMcpServer() {
                 // What the preview was made against, read from the fingerprint itself.
                 const { state } = JSON.parse(shown.expected);
                 const { proposed, expected, unchanged, ...head } = shown;
-                return {
-                  ...head,
+                // `expected` goes first, so it is never what a reply cut short loses; and a preview that would be cut is refused.
+                const preview = {
+                  ...head, expected, world, session,
                   current: Object.fromEntries(state.map(([path, , value]) => [path, value])),
                   exists: Object.fromEntries(state.map(([path, exists]) => [path, exists])),
-                  proposed, ...(unchanged ? { unchanged } : {}), expected, world, session,
+                  proposed, ...(unchanged ? { unchanged } : {}),
                 };
+                if (JSON.stringify({ result: preview }, null, 1).length > MAX_RESULT_CHARS - 2000) {
+                  return { ...head, valid: false, error: 'This change is too large to preview in one reply. Make it with foundry_eval instead.' };
+                }
+                return preview;
               }
               if (!shown.applied || !record) return { ...shown, world, session };
               // The record is kept by the hub for undo. Its paths must be exactly the ones asked for.
@@ -975,7 +981,9 @@ function buildMcpServer() {
               const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, undone: false };
               edits.push(edit);
               if (edits.length > MAX_EDITS) edits.shift();
-              return { ...shown, before: saved.before, after: saved.after, world, session, editId: edit.id };
+              // editId first; the values are left out when they would not fit beside it.
+              const values = JSON.stringify([saved.before, saved.after]).length < 40_000 ? { before: saved.before, after: saved.after } : { values: 'Too large to show here; read the document with foundry_document.' };
+              return { editId: edit.id, ...shown, world, session, ...values };
             },
           });
         return args.apply ? oneAtATime(args.uuid, run) : run();

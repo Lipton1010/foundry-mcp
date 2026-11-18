@@ -544,7 +544,7 @@ applying at once, an edit too large to undo, a token from another scene, and pag
 without skipping rows. After the second review: a reply the module did not sign refused, unproven connections
 refused before the upgrade, a fingerprint for a removal not accepted for a literal value, an overlap hidden by a
 sibling key, a write inside a value that is not an object refused, an undo a hook changed kept as not undone, and
-a dice wrapper put on top without calling another module's function. After the third review: an unsigned welcome refused, an undo refused once the object holding a removed key was replaced by a value, an apply given up on before saving changing nothing, keys added in any order undone cleanly, and credentials inside JSON stored as text withheld.
+a dice wrapper put on top without calling another module's function. After the third review: an unsigned welcome refused, an undo refused once the object holding a removed key was replaced by a value, an apply given up on before saving changing nothing, keys added in any order undone cleanly, and credentials inside JSON stored as text withheld. After the fourth review: malformed JSON text and repeated keys withheld, while ordinary text in brackets is kept; Foundry's older `==` replacement keys refused; undo never writing through a value a module put in place; and a removed absent sibling not leaving an empty object behind.
 
 ### Not tested
 
@@ -579,7 +579,7 @@ a dice wrapper put on top without calling another module's function. After the t
 ## Development
 
 `npm test` in `server` takes about a minute. The code each tool runs in the page is in `server/page.js`, as ordinary
-functions the tests also call directly. `PROTOCOL` in `foundry-mcp/scripts/bridge.js` and `MODULE_PROTOCOL` in
+functions the tests also call directly. When the change tracker's code (`installChanges`) changes, raise its `VERSION` and the matching number in `queryChanges`, so a page that already has the tracker gets the new one without a reload. `PROTOCOL` in `foundry-mcp/scripts/bridge.js` and `MODULE_PROTOCOL` in
 `server/index.js` must be bumped together whenever the messages between them change. CI runs the tests on Linux and
 Windows with Node 20 and 24.
 

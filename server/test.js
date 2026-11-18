@@ -585,6 +585,8 @@ try {
     Hooks.fire('updateChatMessage', message, { speaker: { token: 'zz-not-an-id-zz' } }, {}, 'gm1');
     // A module that keeps a profile as text holding JSON.
     Hooks.fire('updateActor', vault, { flags: { mod: { profile: '{"url":"https://w.example","password":"zz-json-zz"}' } } }, {}, 'gm1');
+    // Malformed JSON (a trailing comma) and a repeated key cannot carry a credential through either.
+    Hooks.fire('updateActor', vault, { flags: { mod: { broken: '{"password":"zz-bad-json-zz",}', twice: '{"password":"zz-first-zz","password":null}', label: '[Homebrew] Sword' } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
     assert.ok(!/zz-|zzSecret/.test(JSON.stringify(nested)), 'no credential is reported at any depth');
     assert.deepEqual(nested.entries[0].changes, [{ path: 'flags.mod.creds', deleted: true, before: { apiKey: '[withheld]', note: 'kept' } }]);
@@ -602,6 +604,11 @@ try {
     ]);
     assert.deepEqual(nested.entries[5].changes, [{ path: 'speaker.token', value: '[withheld]' }]);
     assert.deepEqual(nested.entries[6].changes, [{ path: 'flags.mod.profile', value: '{"url":"https://w.example","password":"[withheld]"}' }]);
+    assert.deepEqual(nested.entries[7].changes, [
+      { path: 'flags.mod.broken', value: '[withheld: not readable as JSON]' },
+      { path: 'flags.mod.twice', value: '{"password":null}' },
+      { path: 'flags.mod.label', value: '[Homebrew] Sword' },
+    ]);
 
     // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
     const shape = { documentName: 'Actor', uuid: 'Actor.s1', name: 'Shape', parent: null, _source: { flags: { mod: { x: 1, y: 2 } } } };
@@ -673,7 +680,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 2);
+    assert.equal(globalThis[KEY].version, 3);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -951,6 +958,8 @@ try {
     assert.match((await update({ set: { 'config.dim': 1, 'config-x': 1, config: {} } })).content[0].text, /overlap/);
     // Writing inside a value that is not an object would replace it.
     assert.match((await update({ set: { 'config.dim.inner': 1 } })).content[0].text, /holds a value, not an object/);
+    // Foundry's older replacement syntax would act on another path than the one recorded.
+    assert.match((await update({ set: { 'flags.==mod': { a: 1 } } })).content[0].text, /cannot be changed/);
     assert.match((await update({ ...change, apply: true, expected: '[]' })).content[0].text, /different change/);
     assert.match((await update({ ...change, apply: true, expected: preview.expected, expectedWorld: 'elsewhere' })).content[0].text, /expected world "elsewhere"/);
     assert.equal(torch._source.config.dim, 20);
@@ -1021,6 +1030,22 @@ try {
     assert.deepEqual(blockedTrim.conflicts, [{ path: 'flags.kit', expected: '(object)', now: '(value)' }]);
     assert.equal(torch._source.flags.kit, 'sold');
     delete torch._source.flags.kit;
+    // Also when a module made it a value as the edit was saved, and it has changed again since.
+    torch._source.flags.kit = { lamp: 'oil', spare: 1 };
+    const hookPreview = payload(await update({ remove: ['flags.kit.spare'] })).result;
+    torch.tamper = (source) => (source.flags.kit = 'traded');
+    const hookEdit = payload(await update({ remove: ['flags.kit.spare'], apply: true, expected: hookPreview.expected })).result;
+    torch.tamper = null;
+    torch._source.flags.kit = 'traded again';
+    assert.equal(payload(await callTool('foundry_undo', { editId: hookEdit.editId })).result.undone, false, 'undo never writes through a value');
+    assert.equal(torch._source.flags.kit, 'traded again');
+    delete torch._source.flags.kit;
+
+    // Setting one new key and removing an absent sibling: undo removes the object it made.
+    const mixPreview = payload(await update({ set: { 'flags.mix.a': 1 }, remove: ['flags.mix.b'] })).result;
+    const mixEdit = payload(await update({ set: { 'flags.mix.a': 1 }, remove: ['flags.mix.b'], apply: true, expected: mixPreview.expected })).result;
+    assert.equal(payload(await callTool('foundry_undo', { editId: mixEdit.editId })).result.undone, true);
+    assert.deepEqual(torch._source.flags, {});
 
     // A call given up on before the save changes nothing, whether waiting for the document or for the lock.
     const lateArgs = { uuid: torch.uuid, set: { 'config.dim': 3 }, apply: true, expected: payload(await update({ set: { 'config.dim': 3 } })).result.expected };
