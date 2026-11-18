@@ -69,7 +69,9 @@ data. What this does not change:
   any depth, on the same best-effort rule as settings. Fields named just `token` or `key` are kept only where
   Foundry itself puts them (a chat speaker's or target's token id, an Active Effect change's attribute path) and
   only when they look like what Foundry puts there. Text that holds JSON (a module keeping a profile as a string)
-  is read and scrubbed the same way; such text too long to read safely is withheld.
+  is read and scrubbed the same way; such text too long to read safely is withheld. A URL that carries its secret
+  in itself (a Discord or Slack webhook, a password in the address, a token in the query) has that part withheld
+  whatever the field is called.
 
 ## The tokens
 

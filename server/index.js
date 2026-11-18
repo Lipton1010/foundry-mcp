@@ -985,10 +985,9 @@ function buildMcpServer() {
                 saved = null;
               }
               const fields = ['before', 'existed', 'after', 'exists'];
-              // Besides the paths asked for, the record holds any the system or a module changed as part of the save.
-              const extra = Array.isArray(saved?.extra) && saved.extra.every((path) => typeof path === 'string' && !requested.includes(path)) ? saved.extra : null;
-              const recorded = extra ? [...requested, ...extra].sort() : null;
-              if (!saved || !recorded || !fields.every((field) => saved[field] && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
+              // The record lists the paths Foundry reported this update changed; every part of it must cover exactly those.
+              const recorded = Array.isArray(saved?.paths) && saved.paths.length && saved.paths.every((path) => typeof path === 'string') ? [...saved.paths].sort() : null;
+              if (!saved || !recorded || !fields.every((field) => saved[field] && typeof saved[field] === 'object' && JSON.stringify(Object.keys(saved[field]).sort()) === JSON.stringify(recorded))) {
                 return { ...shown, world, session, undoable: 'The change was saved, but its undo record did not arrive intact, so it cannot be undone with foundry_undo.' };
               }
               const edit = { id: ++editSeq, world, uuid: shown.uuid, name: shown.name, time: new Date().toISOString(), before: saved.before, existed: saved.existed, after: saved.after, exists: saved.exists, roots: saved.roots ?? {}, shape: saved.shape ?? {}, undone: false };

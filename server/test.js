@@ -589,6 +589,8 @@ try {
     Hooks.fire('updateActor', vault, { flags: { mod: { broken: '{"password":"zz-bad-json-zz",}', twice: '{"password":"zz-first-zz","password":null}', label: '[Homebrew] Sword' } } }, {}, 'gm1');
     // JSON encoded as a string twice over.
     Hooks.fire('updateActor', vault, { flags: { mod: { wrapped: JSON.stringify(JSON.stringify({ password: 'zz-wrapped-zz', user: 'gm' })) } } }, {}, 'gm1');
+    // A webhook URL carries its secret in itself, whatever the field is called.
+    Hooks.fire('updateActor', vault, { flags: { mod: { history: [{ url: 'https://discord.com/api/webhooks/123456/zz-hook-secret-zz', note: 'kept' }] } } }, {}, 'gm1');
     // The same, but far too long to unwrap.
     Hooks.fire('updateActor', vault, { flags: { mod: { bulky: JSON.stringify(JSON.stringify({ apiKey: 'zz-bulky-zz', template: 'x'.repeat(110_000) })) } } }, {}, 'gm1');
     const nested = payload(await callTool('foundry_changes', { since: cursor }));
@@ -614,7 +616,8 @@ try {
       { path: 'flags.mod.label', value: '[Homebrew] Sword' },
     ]);
     assert.deepEqual(nested.entries[8].changes, [{ path: 'flags.mod.wrapped', value: JSON.stringify(JSON.stringify({ password: '[withheld]', user: 'gm' })) }]);
-    assert.deepEqual(nested.entries[9].changes, [{ path: 'flags.mod.bulky', value: '[withheld: too long to check for credentials]' }]);
+    assert.deepEqual(nested.entries[9].changes, [{ path: 'flags.mod.history', value: [{ url: 'https://discord.com/api/webhooks/123456/[withheld]', note: 'kept' }] }]);
+    assert.deepEqual(nested.entries[10].changes, [{ path: 'flags.mod.bulky', value: '[withheld: too long to check for credentials]' }]);
 
     // Earlier values are copied when the update is sent: Foundry changes the source objects in place afterwards.
     const shape = { documentName: 'Actor', uuid: 'Actor.s1', name: 'Shape', parent: null, _source: { flags: { mod: { x: 1, y: 2 } } } };
@@ -686,7 +689,7 @@ try {
     globalThis[KEY] = old;
     const installed = page.installChanges();
     assert.equal(installed.seq, current.seq, 'its numbering continues');
-    assert.equal(globalThis[KEY].version, 5);
+    assert.equal(globalThis[KEY].version, 6);
     // A tracker that kept its hook ids has them removed (here: the one this test replaced).
     for (const [name, id] of current.hookIds) Hooks.off(name, id);
     Hooks.fire('updateActor', globalThis.testHero, { system: { hp: 77 } }, {}, 'gm1');
@@ -1077,6 +1080,37 @@ try {
     assert.equal(torch._source.flags.independent, true, 'the other save is left alone');
     delete torch._source.flags.saves;
     delete torch._source.flags.independent;
+
+    // Merging into an object while someone else saves a sibling inside it: undo puts back only what this edit set.
+    torch._source.flags.profile = { mode: 'a', label: 'x' };
+    const mergePreview = payload(await update({ set: { 'flags.profile': { mode: 'b' } } })).result;
+    torch.slow = 100;
+    setTimeout(() => (torch._source.flags.profile.label = 'y'), 30);
+    const merged2 = payload(await update({ set: { 'flags.profile': { mode: 'b' } }, apply: true, expected: mergePreview.expected })).result;
+    torch.slow = 0;
+    assert.equal(payload(await callTool('foundry_undo', { editId: merged2.editId })).result.undone, true);
+    assert.deepEqual(torch._source.flags.profile, { mode: 'a', label: 'y' }, 'the other save to label stands');
+
+    // A module replaces the whole object while the edit is prepared, dropping a key: undo puts the object back whole.
+    torch._source.flags.profile = { mode: 'a', preset: 'night' };
+    const reshapePreview = payload(await update({ set: { 'flags.profile.mode': 'b' } })).result;
+    torch.prepare = (change) => (change.flags.profile = new ForcedReplacement({ mode: 'b' }));
+    const reshaped = payload(await update({ set: { 'flags.profile.mode': 'b' }, apply: true, expected: reshapePreview.expected })).result;
+    torch.prepare = null;
+    assert.deepEqual(torch._source.flags.profile, { mode: 'b' });
+    assert.equal(payload(await callTool('foundry_undo', { editId: reshaped.editId })).result.undone, true);
+    assert.deepEqual(torch._source.flags.profile, { mode: 'a', preset: 'night' });
+    // And one that sets up an object that was null: undo puts the null back.
+    torch._source.flags.config = null;
+    const initPreview = payload(await update({ set: { 'flags.profile.mode': 'c' } })).result;
+    torch.prepare = (change) => (change.flags.config = {});
+    const inited = payload(await update({ set: { 'flags.profile.mode': 'c' }, apply: true, expected: initPreview.expected })).result;
+    torch.prepare = null;
+    assert.deepEqual(inited.alsoChanged, ['flags.config']);
+    assert.equal(payload(await callTool('foundry_undo', { editId: inited.editId })).result.undone, true);
+    assert.deepEqual([torch._source.flags.config, torch._source.flags.profile.mode], [null, 'a']);
+    delete torch._source.flags.config;
+    delete torch._source.flags.profile;
 
     // A module replaced the object holding the path with a value as the edit was saved: it is reported as not undoable.
     torch._source.flags.kit = { lamp: 'oil' };

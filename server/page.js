@@ -120,7 +120,7 @@ export function readSettings(args) {
  */
 export function installChanges() {
   const KEY = Symbol.for('foundry-mcp.changes');
-  const VERSION = 5; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
+  const VERSION = 6; // raise whenever this code changes, so a page that already has the tracker gets the new one; and in queryChanges
   const old = globalThis[KEY];
   if (old?.version === VERSION) return { seq: old.seq };
   if (typeof Hooks?.on !== 'function' || !Array.isArray(globalThis.CONST?.ALL_DOCUMENT_TYPES)) return null;
@@ -161,6 +161,15 @@ export function installChanges() {
     if (Array.isArray(value)) return value.map((item, index) => scrub(item, [...segments, String(index)], documentName, depth));
     if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, scrub(item, [...segments, key], documentName, depth)]));
     if (secret(documentName, segments, value)) return '[withheld]';
+    // A URL can carry its credential in itself, whatever the field is called: a Discord or Slack webhook, a password
+    // in the address, or a token in the query.
+    if (typeof value === 'string' && /:\/\//.test(value)) {
+      value = value
+        .replace(/(discord(?:app)?\.com\/api\/webhooks\/\d+\/)[\w-]+/gi, '$1[withheld]')
+        .replace(/(hooks\.slack\.com\/(?:services|workflows|triggers)\/)[^\s"'?#]+/gi, '$1[withheld]')
+        .replace(/(:\/\/[^/@\s:"']*:)[^\s/?#"']+@/g, '$1[withheld]@')
+        .replace(/([?&](?:token|access_token|api[-_]?key|key|sig|signature|secret|password|auth|code)=)[^&\s"'#]+/gi, '$1[withheld]');
+    }
     // JSON encoded as a string more than once (text that is itself a quoted string) is unwrapped, a few levels deep.
     // Too long to unwrap safely, and holding an escaped key: withheld rather than shown cut down.
     if (typeof value === 'string' && /^\s*"/.test(value) && value.length > 100_000) return /\\+"\s*:/.test(value) ? '[withheld: too long to check for credentials]' : value;
@@ -372,7 +381,7 @@ export function installChanges() {
 /** foundry_changes and foundry_eval's change list: a query against the installed tracker. */
 export function queryChanges(args) {
   const t = globalThis[Symbol.for('foundry-mcp.changes')];
-  if (t?.version !== 5) return { installed: false }; // the same number as VERSION in installChanges
+  if (t?.version !== 6) return { installed: false }; // the same number as VERSION in installChanges
   return t.query(args);
 }
 
@@ -592,32 +601,27 @@ export async function updateDocument(args, signal) {
       if (exists !== wasThere || canon(value) !== canon(was)) conflicts.push({ path, expected: wasThere ? was : '(absent)', now: exists ? value : '(absent)' });
     });
     if (conflicts.length) return { ...about, applied: false, conflicts, note: 'The document has changed since the preview. Preview again.' };
-    const before = Object.fromEntries(now.map(([path, , value]) => [path, value]));
-    const existed = Object.fromEntries(now.map(([path, exists]) => [path, exists]));
-    // For a path that did not exist, the outermost part of it that did not exist either ("flags.mod" for a new
-    // "flags.mod.note"), so undoing can remove what the edit created rather than leave an empty object behind.
-    const roots = Object.fromEntries(paths.filter((path) => !existed[path]).map((path) => {
-      const keys = path.split('.');
-      for (let i = 1; i <= keys.length; i++) if (!hasProperty(doc._source, keys.slice(0, i).join('.'))) return [path, keys.slice(0, i).join('.')];
-      return [path, path];
-    }));
     const snapshot = deepClone(doc._source);
     const { updated, changed } = await saveAndCapture(change());
     // Foundry resolves to nothing when a hook or the server refused the update.
     if (!updated) return { ...about, applied: false, note: 'Foundry did not save the change: a module hook or the server refused it. Nothing was changed.' };
-    // The game system or a module may have changed more of the document as part of this update. Those paths are
-    // recorded too, so undo puts them back as well, and listed in the reply.
+    // The undo record is made of exactly the paths Foundry reports this one update changed: the leaves an object
+    // merge actually set (not the whole object, so a separate save to a sibling is never reverted), anything the game
+    // system or a module added while preparing it (dnd5e resets death saves when hit points rise from 0), and any
+    // object a module replaced or created whole. If Foundry reported nothing, the requested paths are used.
     const near = (p, q) => p === q || p.startsWith(q + '.') || q.startsWith(p + '.');
-    const extra = changedPaths(changed).filter((p) => !paths.some((q) => near(p, q)));
-    for (const path of extra) {
-      before[path] = read(snapshot, path);
-      existed[path] = hasProperty(snapshot, path);
-      if (!existed[path]) {
-        const keys = path.split('.');
-        for (let i = 1; i <= keys.length; i++) if (!hasProperty(snapshot, keys.slice(0, i).join('.'))) { roots[path] = keys.slice(0, i).join('.'); break; }
-      }
+    const recorded = changed ? changedPaths(changed) : paths;
+    if (!recorded.length) return { ...about, applied: true, note: 'Foundry saved no difference: the document already held these values. Nothing to undo.' };
+    const extra = recorded.filter((p) => !paths.some((q) => near(p, q)));
+    const before = Object.fromEntries(recorded.map((path) => [path, read(snapshot, path)]));
+    const existed = Object.fromEntries(recorded.map((path) => [path, hasProperty(snapshot, path)]));
+    // For a path that did not exist, the outermost part of it that did not exist either (flags.mod for a new
+    // flags.mod.note), so undoing can remove what the edit created rather than leave an empty object behind.
+    const roots = {};
+    for (const path of recorded.filter((p) => !existed[p])) {
+      const keys = path.split('.');
+      for (let i = 1; i <= keys.length; i++) if (!hasProperty(snapshot, keys.slice(0, i).join('.'))) { roots[path] = keys.slice(0, i).join('.'); break; }
     }
-    const recorded = [...paths, ...extra];
     const after = Object.fromEntries(recorded.map((path) => [path, read(doc._source, path)]));
     const exists = Object.fromEntries(recorded.map((path) => [path, hasProperty(doc._source, path)]));
     // A module replaced an object holding one of the paths with a value as this was saved: undo could not write
@@ -625,7 +629,7 @@ export async function updateDocument(args, signal) {
     const replaced = Object.entries(shapeOf(recorded)).filter(([, kind]) => kind === 'value').map(([path]) => path);
     if (replaced.length) return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), undoable: 'As this was saved, something replaced ' + replaced.join(', ') + ' with a value, so this edit cannot be undone with foundry_undo.' };
     // The undo record is the one large field in this reply, so it arrives whole; the hub shows before and after from it.
-    const record = JSON.stringify({ before, existed, after, exists, roots, shape: shapeOf(recorded), extra });
+    const record = JSON.stringify({ paths: recorded, before, existed, after, exists, roots, shape: shapeOf(recorded) });
     if (record.length > MAX_RECORD) return { ...about, applied: true, undoable: 'Foundry saved larger values than were asked for (a module may have added to them), too large to keep a record of, so this edit cannot be undone with foundry_undo.' };
     return { ...about, applied: true, ...(extra.length ? { alsoChanged: extra } : {}), record };
   } finally {
